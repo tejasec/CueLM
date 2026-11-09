@@ -42,6 +42,8 @@ flake.lock
 *.idsig
 *.aab
 *.hprof
+tauri.settings.gradle
+**/tauri.settings.gradle
 
 # Build logs & caches
 *.log
