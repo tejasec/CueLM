@@ -17,6 +17,9 @@ import java.io.File
 
 class MainActivity : TauriActivity() {
   private var webView: WebView? = null
+  private var currentIsDark: Boolean? = null
+  private var currentAccentColor: String? = null
+  private var currentBgColor: String? = null
 
   companion object {
     private const val STORAGE_PERMISSION_REQUEST_CODE = 1001
@@ -143,16 +146,49 @@ class MainActivity : TauriActivity() {
     }
   }
 
-  fun openAudioRecorder(recordingsDir: String? = null) {
+  fun updateAppTheme(isDark: Boolean, accentColor: String?, bgColor: String?) {
+    currentIsDark = isDark
+    currentAccentColor = accentColor
+    currentBgColor = bgColor
+  }
+
+  fun openAudioRecorder(
+    recordingsDir: String? = null,
+    isDark: Boolean? = null,
+    accentColor: String? = null,
+    bgColor: String? = null
+  ) {
+    val dark = isDark ?: currentIsDark
+    val accent = accentColor ?: currentAccentColor
+    val bg = bgColor ?: currentBgColor
+
     try {
-      val intent = Intent().setClassName(packageName, "com.dimowner.audiorecorder.app.main.MainActivity").apply {
+      val intent = Intent().setClassName(packageName, "com.dimowner.audiorecorder.v2.app.HomeActivity").apply {
         if (!recordingsDir.isNullOrBlank()) {
           putExtra("extra_custom_record_dir", recordingsDir)
+        }
+        if (dark != null) {
+          putExtra("extra_is_dark", dark)
+        }
+        if (!accent.isNullOrBlank()) {
+          putExtra("extra_accent_color", accent)
+        }
+        if (!bg.isNullOrBlank()) {
+          putExtra("extra_bg_color", bg)
         }
       }
       startActivity(intent)
     } catch (e: Exception) {
-      android.util.Log.e("CueLM", "Failed to launch AudioRecorder", e)
+      try {
+        val fallback = Intent().setClassName(packageName, "com.dimowner.audiorecorder.app.main.MainActivity").apply {
+          if (!recordingsDir.isNullOrBlank()) {
+            putExtra("extra_custom_record_dir", recordingsDir)
+          }
+        }
+        startActivity(fallback)
+      } catch (err: Exception) {
+        android.util.Log.e("CueLM", "Failed to launch AudioRecorder", err)
+      }
     }
   }
 
@@ -170,9 +206,23 @@ class MainActivity : TauriActivity() {
 
 class StorageBridge(private val activity: MainActivity) {
   @JavascriptInterface
+  fun openAudioRecorder(recordingsDir: String?, isDark: Boolean, accentColor: String?, bgColor: String?) {
+    activity.runOnUiThread {
+      activity.openAudioRecorder(recordingsDir, isDark, accentColor, bgColor)
+    }
+  }
+
+  @JavascriptInterface
   fun openAudioRecorder(recordingsDir: String?) {
     activity.runOnUiThread {
       activity.openAudioRecorder(recordingsDir)
+    }
+  }
+
+  @JavascriptInterface
+  fun setAppTheme(isDark: Boolean, accentColor: String?, bgColor: String?) {
+    activity.runOnUiThread {
+      activity.updateAppTheme(isDark, accentColor, bgColor)
     }
   }
 

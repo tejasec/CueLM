@@ -44,6 +44,13 @@
         </activity>
 
         <activity
+            android:name="com.dimowner.audiorecorder.v2.app.HomeActivity"
+            android:theme="@style/AppTheme"
+            android:launchMode="singleTask"
+            android:exported="true"
+            tools:replace="android:exported,android:theme" />
+
+        <activity
             android:name="com.dimowner.audiorecorder.app.main.MainActivity"
             android:theme="@style/AppTheme"
             android:exported="true"
