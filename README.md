@@ -14,19 +14,6 @@ CueLM provides a unified solution: **at its foundation, it is a complete, distra
 
 ---
 
-## Table of Contents
-
-- [Core Note-Taking System](#core-note-taking-system)
-- [Native Lecture Recording & Audio Engine](#native-lecture-recording--audio-engine)
-- [BharatCode Hackathon Innovation & AI Pipeline](#bharatcode-hackathon-innovation--ai-pipeline)
-- [Technology Breakdown](#technology-breakdown)
-- [Building from Source](#building-from-source)
-- [Project Structure](#project-structure)
-- [Roadmap](#roadmap)
-- [Attributions & Acknowledgments](#attributions--acknowledgments)
-- [License](#license)
-
----
 
 ## Core Note-Taking System
 
@@ -36,10 +23,6 @@ Most of CueLM's codebase and day-to-day functionality provides a local-first, di
 - **Dual-Mode Writing**: Seamlessly switch between rich TipTap v3 editing and raw CodeMirror source mode with full Markdown syntax highlighting.
 - **Slash Commands (`/`)**: Quick-insert blocks for headers, callouts, bullet lists, code blocks, color swatches (`/color`), and timestamps (`/date`, `/time`, `/now`).
 - **External Document Support**: Open and view standalone `.md` files or import them directly into your active vault.
-
-### 🧮 Live KaTeX Math Formula Suite
-- **Interactive Formula Editor**: Type complex mathematical and scientific notation with `/math` (display equations) and `/imath` (inline formulas).
-- **Modal Preview & Editing**: Live modal preview rendering with double-click-to-edit support, powered by KaTeX.
 
 ### 🕸️ Bi-directional `[[Wiki-links]]` & Knowledge Graph
 - **Interconnected Notes**: Link concepts across lectures, subjects, and semesters using standard `[[Note Title]]` syntax.
@@ -57,14 +40,6 @@ Most of CueLM's codebase and day-to-day functionality provides a local-first, di
 - **Structured Hierarchy**: Organize notes into nested notebook trees with drag-and-drop reordering.
 - **Daily Journaling**: Dedicated calendar view for automated daily lecture logs.
 - **Outline & Tag System**: Dynamic table of contents outline panel and tag autocomplete with custom color styling.
-
-### 🔐 Encrypted Secret Blocks & Local Privacy
-- **Client-Side Secret Fences**: Encrypt sensitive data (e.g. personal notes, exam credentials) inside portable `helix-secret` markdown fences via `/secret`.
-- **Pure Local Plain-Text**: All vault documents live on your local filesystem as plain `.md` files—no company cloud, no proprietary database formats.
-
-### 🔄 Decentralized WebDAV Synchronization
-- **Zero Cloud Lock-in**: Sync your vault across devices using standard WebDAV servers (Nextcloud, ownCloud, or personal NAS).
-- **Conflict Handling**: Automatic keep-both conflict resolution prevents data loss during concurrent edits.
 
 ---
 
