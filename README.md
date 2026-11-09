@@ -19,7 +19,7 @@ CueLM provides a unified solution: **at its foundation, it is a complete, distra
 - [Core Note-Taking System](#core-note-taking-system)
 - [Native Lecture Recording & Audio Engine](#native-lecture-recording--audio-engine)
 - [BharatCode Hackathon Innovation & AI Pipeline](#bharatcode-hackathon-innovation--ai-pipeline)
-- [System Architecture](#system-architecture)
+- [Technology Breakdown](#technology-breakdown)
 - [Building from Source](#building-from-source)
 - [Project Structure](#project-structure)
 - [Roadmap](#roadmap)
@@ -111,56 +111,7 @@ CueLM was developed as part of the **BharatCode Build League** hackathon, focusi
 
 ---
 
-## System Architecture
-
-CueLM brings together modern web technologies, a high-performance Rust core, and native Android platform APIs into a unified academic workspace:
-
-```mermaid
-graph TD
-    subgraph NoteTaking ["Core Note-Taking Workspace (SvelteKit)"]
-        SK[Svelte 5 UI Components]
-        TT[TipTap & CodeMirror Markdown Editor]
-        KT[KaTeX Math Engine]
-        TK[Task Aggregator & Calendar Scheduler]
-        SB[Notebook & Recordings Sidebar]
-    end
-
-    subgraph Bridge ["IPC & Native Bridge"]
-        JS[StorageBridge JavaScript Interface]
-        TH[Theme & Intent Synchronizer]
-    end
-
-    subgraph NativeCore ["Rust Native Core (Tauri v2)"]
-        TC[Tauri Async Commands]
-        TV[Tantivy Full-Text Search Engine]
-        VO[Vault Operations & File Watcher]
-    end
-
-    subgraph AndroidHost ["Android Host & Hardware Engine"]
-        MA[MainActivity & CueLMApplication]
-        AR[Embedded AudioRecorder AAR v2.5.0]
-        FGS[Foreground Audio Service & Waveform Engine]
-        RM[Room SQLite Database]
-    end
-
-    subgraph Storage ["Local Filesystem Vault"]
-        MD[Markdown Notes & Tasks]
-        REC["Recordings/ (*.m4a, *.wav)"]
-    end
-
-    SK --> JS
-    JS --> MA
-    MA --> AR
-    AR --> FGS
-    FGS --> REC
-    SK --> TC
-    TC --> VO
-    VO --> MD
-    VO --> REC
-    VO --> TV
-```
-
-### Technology Breakdown
+## Technology Breakdown
 
 | Layer | Technologies | Role |
 | :--- | :--- | :--- |
@@ -172,34 +123,6 @@ graph TD
 
 ---
 
-## Engineering Deep-Dive: AAR & Host Integration
-
-Integrating a full-featured native Android audio recorder (`AudioRecorder-2.5.0`) as an embedded AAR library inside a Tauri v2 WebView host required overcoming several complex runtime and binary compatibility hurdles:
-
-### 1. Room Runtime ABI Alignment
-- **Problem**: Host app startup threw `java.lang.AbstractMethodError: RoomDatabase.createOpenHelper(...)` during database initialization.
-- **Root Cause**: The host resolved Room `2.6.1`, whereas the embedded AAR was compiled against Room `2.8.4`, causing binary incompatibility in the generated open helper.
-- **Fix**: Aligned host dependencies in `app/build.gradle.kts` to `androidx.room:room-runtime:2.8.4`.
-
-### 2. Missing SplashScreen Runtime
-- **Problem**: Launching `HomeActivity` crashed with `NoClassDefFoundError: androidx/core/splashscreen/SplashScreen`.
-- **Root Cause**: Embedding a local AAR does not transitively bundle transitive AndroidX dependencies into the host APK.
-- **Fix**: Added `androidx.core:core-splashscreen:1.2.0` directly to the host application classpath.
-
-### 3. Jetpack Compose Compatibility Suite
-- **Problem**: `NoClassDefFoundError: ComposableLambdaKt` upon composing AudioRecorder v2 UI.
-- **Fix**: Packaged the complete Compose runtime suite into the host APK via `androidx.compose:compose-bom:2025.12.00`, including Foundation, Material 3 (`1.4.0`), and Compose navigation (`2.9.8`).
-
-### 4. Manual Dependency Injection Architecture
-- **Problem**: AudioRecorder v2 originally relied on Hilt (`@HiltViewModel`), failing with `NoSuchMethodException: HomeViewModel.<init> [Application]` when invoked from Tauri's host activity.
-- **Fix**: Implemented `Injector.provideHomeViewModel(Context)` to supply data sources, preferences, audio players, and dispatchers manually via a custom `ViewModelProvider.Factory`.
-
-### 5. Coroutines ABI Compatibility
-- **Problem**: `NoSuchMethodError: Job.cancel$default(...)` occurred inside `DecodeService.onDestroy()`.
-- **Root Cause**: Version skew between host coroutine runtime and AAR compiled bytecode.
-- **Fix**: Standardized dependencies on `kotlinx-coroutines-core:1.11.0` and `kotlinx-coroutines-android:1.11.0`.
-
----
 
 ## Building from Source
 

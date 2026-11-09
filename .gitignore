@@ -73,6 +73,9 @@ local.properties
 **/.cxx/
 .DS_Store
 Thumbs.db
+*.swp
+*.kate-swp
+*~
 
 # Env
 .env
