@@ -156,7 +156,8 @@ class MainActivity : TauriActivity() {
     recordingsDir: String? = null,
     isDark: Boolean? = null,
     accentColor: String? = null,
-    bgColor: String? = null
+    bgColor: String? = null,
+    recordNamePrefix: String? = null
   ) {
     val dark = isDark ?: currentIsDark
     val accent = accentColor ?: currentAccentColor
@@ -176,6 +177,9 @@ class MainActivity : TauriActivity() {
         if (!bg.isNullOrBlank()) {
           putExtra("extra_bg_color", bg)
         }
+        if (!recordNamePrefix.isNullOrBlank()) {
+          putExtra("extra_record_name_prefix", recordNamePrefix)
+        }
       }
       startActivity(intent)
     } catch (e: Exception) {
@@ -189,6 +193,41 @@ class MainActivity : TauriActivity() {
       } catch (err: Exception) {
         android.util.Log.e("CueLM", "Failed to launch AudioRecorder", err)
       }
+    }
+  }
+
+  fun playRecordingInAudioRecorder(
+    recordingsDir: String? = null,
+    filePath: String,
+    isDark: Boolean? = null,
+    accentColor: String? = null,
+    bgColor: String? = null
+  ) {
+    val dark = isDark ?: currentIsDark
+    val accent = accentColor ?: currentAccentColor
+    val bg = bgColor ?: currentBgColor
+
+    try {
+      val intent = Intent().setClassName(packageName, "com.dimowner.audiorecorder.v2.app.HomeActivity").apply {
+        if (!recordingsDir.isNullOrBlank()) {
+          putExtra("extra_custom_record_dir", recordingsDir)
+        }
+        putExtra("extra_play_file_path", filePath)
+        if (dark != null) {
+          putExtra("extra_is_dark", dark)
+        }
+        if (!accent.isNullOrBlank()) {
+          putExtra("extra_accent_color", accent)
+        }
+        if (!bg.isNullOrBlank()) {
+          putExtra("extra_bg_color", bg)
+        }
+        addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP)
+      }
+      startActivity(intent)
+    } catch (e: Exception) {
+      android.util.Log.e("CueLM", "Failed to launch AudioRecorder for play: $filePath", e)
+      openFile(filePath)
     }
   }
 
@@ -206,9 +245,16 @@ class MainActivity : TauriActivity() {
 
 class StorageBridge(private val activity: MainActivity) {
   @JavascriptInterface
+  fun openAudioRecorder(recordingsDir: String?, isDark: Boolean, accentColor: String?, bgColor: String?, recordNamePrefix: String?) {
+    activity.runOnUiThread {
+      activity.openAudioRecorder(recordingsDir, isDark, accentColor, bgColor, recordNamePrefix)
+    }
+  }
+
+  @JavascriptInterface
   fun openAudioRecorder(recordingsDir: String?, isDark: Boolean, accentColor: String?, bgColor: String?) {
     activity.runOnUiThread {
-      activity.openAudioRecorder(recordingsDir, isDark, accentColor, bgColor)
+      activity.openAudioRecorder(recordingsDir, isDark, accentColor, bgColor, null)
     }
   }
 
@@ -216,6 +262,20 @@ class StorageBridge(private val activity: MainActivity) {
   fun openAudioRecorder(recordingsDir: String?) {
     activity.runOnUiThread {
       activity.openAudioRecorder(recordingsDir)
+    }
+  }
+
+  @JavascriptInterface
+  fun playRecordingInAudioRecorder(recordingsDir: String?, filePath: String, isDark: Boolean, accentColor: String?, bgColor: String?) {
+    activity.runOnUiThread {
+      activity.playRecordingInAudioRecorder(recordingsDir, filePath, isDark, accentColor, bgColor)
+    }
+  }
+
+  @JavascriptInterface
+  fun playRecordingInAudioRecorder(recordingsDir: String?, filePath: String) {
+    activity.runOnUiThread {
+      activity.playRecordingInAudioRecorder(recordingsDir, filePath)
     }
   }
 
