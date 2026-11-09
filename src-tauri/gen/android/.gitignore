@@ -1,0 +1,43 @@
+*.iml
+.gradle
+.gradle/
+**/.gradle/
+/local.properties
+local.properties
+key.properties
+keystore.properties
+*.keystore
+*.jks
+
+# IDE
+.idea/
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+
+# Build outputs
+build
+build/
+**/build/
+/captures
+.externalNativeBuild
+.cxx
+**/.cxx/
+*.apk
+*.idsig
+*.aab
+*.hprof
+
+# Build Logs & debug files
+*.log
+crash.log
+.code-review-graph/
+AudioRecorder-2.5.0/
+
+# Tauri generated
+/.tauri
+/tauri.settings.gradle

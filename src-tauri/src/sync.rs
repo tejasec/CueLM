@@ -1,0 +1,1564 @@
+// WebDAV sync provider.
+//
+// Model: the vault stays local; this mirrors it to/from a user-configured WebDAV
+// remote (Nextcloud/ownCloud/NAS). A local manifest (.cuelm/sync_state.json)
+// records what was in sync last time, so we can do a three-way diff (local vs remote
+// vs manifest) and resolve each file as upload/download/delete, with keep-both
+// conflict copies so nothing is ever lost.
+//
+// Synced set: every `*.md` in the vault tree, `.cuelm/attachments/`,
+// `.cuelm/notebook_icons.json`, and `.cuelm/tag_styles.json`. Search indexes,
+// trash, history, other metadata, and the manifest itself remain local-only.
+
+use crate::state::AppState;
+use crate::vault::operations::cuelm_dir;
+use crate::vault::watcher::changed_entry;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::{self, Read};
+use std::path::{Path, PathBuf};
+use tauri::{Emitter, Manager};
+use walkdir::WalkDir;
+
+// ───────────────────────── config ─────────────────────────
+
+pub struct WebdavConfig {
+    pub url: String,
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Default, Clone, Serialize)]
+pub struct SyncSummary {
+    pub uploaded: u32,
+    pub downloaded: u32,
+    pub deleted_local: u32,
+    pub deleted_remote: u32,
+    pub conflicts: u32,
+}
+
+// ───────────────────────── manifest ─────────────────────────
+
+#[derive(Default, Serialize, Deserialize)]
+struct SyncManifest {
+    #[serde(default)]
+    identity: String,
+    files: HashMap<String, ManifestEntry>, // relpath (forward-slash) -> entry
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ManifestEntry {
+    local_hash: String,  // sha256 of local content at last sync
+    remote_etag: String, // strong remote etag at last sync, or empty
+    #[serde(default)]
+    remote_hash: String, // sha256 of remote content when no strong etag is available
+}
+
+fn manifest_path(vault: &str) -> PathBuf {
+    cuelm_dir(vault).join("sync_state.json")
+}
+
+fn load_manifest(vault: &str) -> Result<SyncManifest, String> {
+    match fs::read(manifest_path(vault)) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| format!("Invalid sync manifest; sync stopped to protect your notes: {e}")),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(SyncManifest::default()),
+        Err(error) => Err(format!("Cannot read sync manifest: {error}")),
+    }
+}
+
+fn save_manifest(vault: &str, m: &SyncManifest) -> Result<(), String> {
+    let bytes = serde_json::to_vec(m).map_err(|e| e.to_string())?;
+    let target = manifest_path(vault);
+    fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
+    crate::vault::operations::replace_file_atomically(&target, &bytes)
+}
+
+fn baseline_for_endpoint(manifest: SyncManifest, identity: &str) -> SyncManifest {
+    if manifest.identity == identity {
+        manifest
+    } else {
+        // Legacy manifests without an identity are also untrusted: they may
+        // belong to another server. Reconcile as two independent snapshots.
+        SyncManifest {
+            identity: identity.to_string(),
+            files: HashMap::new(),
+        }
+    }
+}
+
+// ───────────────────────── helpers ─────────────────────────
+
+const HASH_BUFFER_SIZE: usize = 64 * 1024;
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn sha256_reader(
+    reader: &mut impl Read,
+    buffer: &mut [u8; HASH_BUFFER_SIZE],
+) -> io::Result<String> {
+    let mut hasher = Sha256::new();
+    loop {
+        match reader.read(buffer) {
+            Ok(0) => return Ok(format!("{:x}", hasher.finalize())),
+            Ok(count) => hasher.update(&buffer[..count]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn strong_etag(s: &str) -> String {
+    let s = s.trim();
+    if s.starts_with("W/") || s.len() < 2 || !s.starts_with('"') || !s.ends_with('"') {
+        String::new()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Percent-encode each path segment, keeping the `/` separators.
+fn encode_path(relpath: &str) -> String {
+    relpath
+        .split('/')
+        .map(|seg| urlencoding::encode(seg).into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Build the conflict-copy relpath: `dir/Note (conflict <stamp>).md`.
+fn conflict_relpath(relpath: &str, stamp: &str) -> String {
+    let (dir, name) = match relpath.rfind('/') {
+        Some(i) => (&relpath[..=i], &relpath[i + 1..]),
+        None => ("", relpath),
+    };
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) => (&name[..i], &name[i..]),
+        None => (name, ""),
+    };
+    format!("{}{} (conflict {}){}", dir, stem, stamp, ext)
+}
+
+fn write_local(
+    vault: &Path,
+    relpath: &str,
+    bytes: &[u8],
+    changes: &mut HashMap<PathBuf, &'static str>,
+) -> Result<(), String> {
+    let target = vault.join(relpath);
+    if fs::read(&target).is_ok_and(|current| current == bytes) {
+        return Ok(());
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    if matches!(
+        relpath,
+        ".cuelm/notebook_icons.json" | ".cuelm/tag_styles.json"
+    ) {
+        let content = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+        crate::vault::operations::attachment_metadata_references(
+            target.file_name().and_then(|name| name.to_str()).unwrap(),
+            content,
+        )?;
+    }
+    crate::vault::operations::replace_file_atomically(&target, bytes)?;
+    changes.insert(target, "modify");
+    Ok(())
+}
+
+fn require_unchanged_local(path: &Path, expected_hash: Option<&str>) -> Result<(), String> {
+    let actual = match fs::File::open(path) {
+        Ok(mut file) => Some(
+            sha256_reader(&mut file, &mut [0; HASH_BUFFER_SIZE])
+                .map_err(|error| error.to_string())?,
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.to_string()),
+    };
+    if actual.as_deref() != expected_hash {
+        return Err(format!(
+            "Sync stopped because {} changed locally during sync",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn write_local_if_unchanged(
+    write_guard: &tokio::sync::Mutex<()>,
+    vault: &Path,
+    relpath: &str,
+    bytes: &[u8],
+    expected_hash: Option<&str>,
+    changes: &mut HashMap<PathBuf, &'static str>,
+) -> Result<(), String> {
+    let _guard = write_guard.blocking_lock();
+    require_unchanged_local(&vault.join(relpath), expected_hash)?;
+    write_local(vault, relpath, bytes, changes)
+}
+
+struct LocalFile {
+    hash: String,
+    path: PathBuf,
+}
+
+/// The synced set: `*.md` anywhere outside `.cuelm/`, everything under
+/// `.cuelm/attachments/`, plus notebook icon and tag style mappings. Applied to BOTH local
+/// and remote so pointing at a folder with unrelated files never imports them.
+fn is_synced_relpath(rel: &str) -> bool {
+    if rel.starts_with(".cuelm/") {
+        rel.starts_with(".cuelm/attachments/")
+            || rel == ".cuelm/notebook_icons.json"
+            || rel == ".cuelm/tag_styles.json"
+    } else {
+        rel.ends_with(".md")
+    }
+}
+
+fn scan_local(vault: &str) -> Result<HashMap<String, LocalFile>, String> {
+    let vault_path = Path::new(vault);
+    let mut map = HashMap::new();
+    let mut buffer = [0; HASH_BUFFER_SIZE];
+    for entry in WalkDir::new(vault_path) {
+        let entry = entry.map_err(|e| format!("Cannot scan local vault: {e}"))?;
+        let p = entry.path();
+        // WalkDir deliberately does not follow links. A note replaced by a
+        // link (or a linked directory of notes) must not look like a deletion
+        // and authorize a remote DELETE. Do not traverse outside the vault.
+        if entry.file_type().is_symlink() {
+            return Err(format!(
+                "Cannot sync vault containing symbolic link {}",
+                p.display()
+            ));
+        }
+        if entry.file_type().is_dir() {
+            continue;
+        }
+        if !entry.file_type().is_file() {
+            return Err(format!(
+                "Cannot sync unsupported filesystem entry {}",
+                p.display()
+            ));
+        }
+        let rel = p
+            .strip_prefix(vault_path)
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if !is_synced_relpath(&rel) {
+            continue;
+        }
+        let hash = fs::File::open(p)
+            .and_then(|mut file| sha256_reader(&mut file, &mut buffer))
+            .map_err(|e| format!("Cannot read local file {}: {e}", p.display()))?;
+        map.insert(
+            rel,
+            LocalFile {
+                hash,
+                path: p.to_path_buf(),
+            },
+        );
+    }
+    Ok(map)
+}
+
+// ───────────────────────── WebDAV client ─────────────────────────
+
+struct RemoteEntry {
+    relpath: String,
+    etag: String,
+    is_dir: bool,
+}
+
+struct WebdavClient {
+    base: String,      // normalized, no trailing slash
+    base_path: String, // path component of base, no trailing slash (percent-encoded)
+    client: reqwest::blocking::Client,
+    user: String,
+    pass: String,
+}
+
+impl WebdavClient {
+    fn new(cfg: WebdavConfig) -> Result<Self, String> {
+        let mut url =
+            reqwest::Url::parse(cfg.url.trim()).map_err(|e| format!("Invalid WebDAV URL: {e}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err("WebDAV URL must start with http:// or https://".to_string());
+        }
+        if url.query().is_some()
+            || url.fragment().is_some()
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err("WebDAV URL must not contain credentials, query, or fragment".to_string());
+        }
+        let path = url.path().trim_end_matches('/').to_string();
+        url.set_path(if path.is_empty() { "/" } else { &path });
+        let base = url.to_string().trim_end_matches('/').to_string();
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| e.to_string())?;
+        Ok(Self {
+            base,
+            base_path: url.path().trim_end_matches('/').to_string(),
+            client,
+            user: cfg.username,
+            pass: cfg.password,
+        })
+    }
+
+    fn identity(&self) -> String {
+        sha256_hex(format!("{}\n{}", self.base, self.user).as_bytes())
+    }
+
+    fn url_for(&self, relpath: &str) -> String {
+        if relpath.is_empty() {
+            self.base.clone()
+        } else {
+            format!("{}/{}", self.base, encode_path(relpath))
+        }
+    }
+
+    fn propfind(&self, relpath: &str, depth: &str) -> Result<Vec<RemoteEntry>, String> {
+        let method = reqwest::Method::from_bytes(b"PROPFIND").unwrap();
+        let body = r#"<?xml version="1.0" encoding="utf-8"?><d:propfind xmlns:d="DAV:"><d:prop><d:getetag/><d:resourcetype/></d:prop></d:propfind>"#;
+        let resp = self
+            .client
+            .request(method, self.url_for(relpath))
+            .basic_auth(&self.user, Some(&self.pass))
+            .header("Depth", depth)
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .body(body)
+            .send()
+            .map_err(|e| e.to_string())?;
+        let status = resp.status();
+        if status.as_u16() == 401 {
+            return Err("Authentication failed (check username / app password)".to_string());
+        }
+        if status.as_u16() == 404 {
+            return Err("WebDAV path not found (check the URL)".to_string());
+        }
+        if !status.is_success() {
+            return Err(format!("WebDAV PROPFIND failed: HTTP {}", status.as_u16()));
+        }
+        let text = resp.text().map_err(|e| e.to_string())?;
+        parse_multistatus(&text, &self.base_path)
+    }
+
+    /// Recursively list all files (relpath -> etag) by walking collections at Depth 1
+    /// (Depth: infinity is disabled on some servers, so we walk instead).
+    fn list(&self) -> Result<HashMap<String, String>, String> {
+        let mut files = HashMap::new();
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: Vec<String> = vec![String::new()];
+        while let Some(dir) = queue.pop() {
+            if !visited.insert(dir.clone()) {
+                continue;
+            }
+            for e in self.propfind(&dir, "1")? {
+                if e.relpath == dir {
+                    continue; // the collection itself
+                }
+                if e.is_dir {
+                    if !visited.contains(&e.relpath) {
+                        queue.push(e.relpath);
+                    }
+                } else {
+                    files.insert(e.relpath, e.etag);
+                }
+            }
+        }
+        Ok(files)
+    }
+
+    fn get(&self, relpath: &str, expected_etag: &str) -> Result<Vec<u8>, String> {
+        let mut request = self
+            .client
+            .get(self.url_for(relpath))
+            .basic_auth(&self.user, Some(&self.pass));
+        if !expected_etag.is_empty() {
+            request = request.header("If-Match", expected_etag);
+        }
+        let resp = request.send().map_err(|e| e.to_string())?;
+        if resp.status().as_u16() == 412 {
+            return Err(format!(
+                "Remote file {relpath} changed during sync; retry sync"
+            ));
+        }
+        if !resp.status().is_success() {
+            return Err(format!(
+                "GET {relpath} failed: HTTP {}",
+                resp.status().as_u16()
+            ));
+        }
+        let response_etag = resp
+            .headers()
+            .get("etag")
+            .and_then(|h| h.to_str().ok())
+            .map(strong_etag)
+            .unwrap_or_default();
+        if !expected_etag.is_empty() && !response_etag.is_empty() && response_etag != expected_etag
+        {
+            return Err(format!(
+                "Remote file {relpath} changed during sync; retry sync"
+            ));
+        }
+        let bytes = resp.bytes().map_err(|e| e.to_string())?.to_vec();
+        if !expected_etag.is_empty() && self.etag_for(relpath)? != expected_etag {
+            return Err(format!(
+                "Remote file {relpath} changed during sync; retry sync"
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn put(&self, relpath: &str, bytes: &[u8], prior_etag: Option<&str>) -> Result<(), String> {
+        let mut request = self
+            .client
+            .put(self.url_for(relpath))
+            .basic_auth(&self.user, Some(&self.pass))
+            .body(bytes.to_vec());
+        request = match prior_etag {
+            Some(etag) if !etag.is_empty() => request.header("If-Match", etag),
+            Some(_) => {
+                return Err(format!(
+                    "Cannot safely overwrite {relpath}: server provides no strong ETag"
+                ))
+            }
+            None => request.header("If-None-Match", "*"),
+        };
+        let resp = request.send().map_err(|e| e.to_string())?;
+        if resp.status().as_u16() == 412 {
+            return Err(format!(
+                "Remote file {relpath} changed during sync; retry sync"
+            ));
+        }
+        if !resp.status().is_success() {
+            return Err(format!(
+                "PUT {relpath} failed: HTTP {}",
+                resp.status().as_u16()
+            ));
+        }
+        Ok(())
+    }
+
+    fn delete(&self, relpath: &str, etag: &str) -> Result<(), String> {
+        if etag.is_empty() {
+            return Err(format!(
+                "Cannot safely delete {relpath}: server provides no strong ETag"
+            ));
+        }
+        let resp = self
+            .client
+            .delete(self.url_for(relpath))
+            .basic_auth(&self.user, Some(&self.pass))
+            .header("If-Match", etag)
+            .send()
+            .map_err(|e| e.to_string())?;
+        if resp.status().as_u16() == 412 || resp.status().as_u16() == 404 {
+            return Err(format!(
+                "Remote file {relpath} changed during sync; retry sync"
+            ));
+        }
+        if resp.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!(
+                "DELETE {relpath} failed: HTTP {}",
+                resp.status().as_u16()
+            ))
+        }
+    }
+
+    fn mkcol(&self, relpath: &str) -> Result<(), String> {
+        let method = reqwest::Method::from_bytes(b"MKCOL").unwrap();
+        let resp = self
+            .client
+            .request(method, self.url_for(relpath))
+            .basic_auth(&self.user, Some(&self.pass))
+            .send()
+            .map_err(|e| e.to_string())?;
+        let s = resp.status().as_u16();
+        if resp.status().is_success() || s == 405 || s == 301 || s == 403 {
+            Ok(())
+        } else {
+            Err(format!("MKCOL {relpath} failed: HTTP {s}"))
+        }
+    }
+
+    fn ensure_dirs(&self, relpath: &str, created: &mut HashSet<String>) -> Result<(), String> {
+        let parts: Vec<&str> = relpath.split('/').collect();
+        if parts.len() <= 1 {
+            return Ok(());
+        }
+        let mut cur = String::new();
+        for part in &parts[..parts.len() - 1] {
+            if !cur.is_empty() {
+                cur.push('/');
+            }
+            cur.push_str(part);
+            if created.insert(cur.clone()) {
+                self.mkcol(&cur)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn etag_for(&self, relpath: &str) -> Result<String, String> {
+        self.propfind(relpath, "0")?
+            .into_iter()
+            .find(|e| e.relpath == relpath && !e.is_dir)
+            .map(|e| e.etag)
+            .ok_or_else(|| format!("Remote file {relpath} disappeared during sync; retry sync"))
+    }
+
+    fn upload(
+        &self,
+        relpath: &str,
+        bytes: &[u8],
+        prior_etag: Option<&str>,
+        created: &mut HashSet<String>,
+    ) -> Result<String, String> {
+        self.ensure_dirs(relpath, created)?;
+        self.put(relpath, bytes, prior_etag)?;
+        let etag = self.etag_for(relpath)?;
+        if self.get(relpath, &etag)?.as_slice() != bytes {
+            return Err(format!(
+                "Remote file {relpath} changed after upload; retry sync"
+            ));
+        }
+        Ok(etag)
+    }
+}
+
+/// Map a WebDAV `href` to a vault-relative path (forward slash).
+/// `Ok(None)` is the base collection itself. `Err` means the href could not be mapped
+/// (e.g. it does not sit under the configured base path, as some providers like Infomaniak
+/// kDrive return). Callers MUST treat `Err` as a hard failure: silently dropping an
+/// unmappable href makes that file look deleted on the remote, and the reconciler then
+/// wipes the local copy. (issue #102)
+fn href_to_relpath(href: &str, base_path: &str) -> Result<Option<String>, String> {
+    // Pull out just the path component (some servers return absolute-URL hrefs).
+    let raw = if href.starts_with("http://") || href.starts_with("https://") {
+        reqwest::Url::parse(href)
+            .map_err(|e| format!("invalid remote href URL '{href}': {e}"))?
+            .path()
+            .to_string()
+    } else {
+        href.to_string()
+    };
+    // Compare DECODED paths, not the raw percent-encoded strings. Providers differ in how they
+    // encode hrefs: Infomaniak kDrive lowercases the hex (`%5b`/`%5d`) and encodes spaces, while
+    // reqwest emits uppercase hex (`%5B`/`%5D`) for base_path. A raw strip_prefix then spuriously
+    // fails, every remote file looks deleted, and the reconciler wipes the local copies. Decoding
+    // both sides first makes the prefix match encoding-agnostic. (issue #102)
+    let path = urlencoding::decode(raw.trim_end_matches('/'))
+        .map_err(|e| format!("bad percent-encoding in remote path '{raw}': {e}"))?
+        .into_owned();
+    let base = urlencoding::decode(base_path.trim_end_matches('/'))
+        .map_err(|e| format!("bad percent-encoding in WebDAV base path '{base_path}': {e}"))?
+        .into_owned();
+    let rest = match path.strip_prefix(&base) {
+        Some(r) => r.trim_start_matches('/'),
+        None => {
+            return Err(format!(
+                "remote path '{path}' is not under the configured WebDAV folder '{base}'. \
+                 Aborting before deleting anything locally - please report this URL."
+            ))
+        }
+    };
+    if rest.is_empty() {
+        return Ok(None); // the base collection itself
+    }
+    Ok(Some(rest.to_string()))
+}
+
+fn parse_multistatus(xml: &str, base_path: &str) -> Result<Vec<RemoteEntry>, String> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    #[derive(PartialEq)]
+    enum Cap {
+        None,
+        Href,
+        Etag,
+    }
+
+    let mut reader = Reader::from_str(xml);
+    let mut entries = Vec::new();
+    let mut href: Option<String> = None;
+    let mut etag: Option<String> = None;
+    let mut is_dir = false;
+    let mut cap = Cap::None;
+    let mut buf = String::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => match e.local_name().as_ref() {
+                b"response" => {
+                    href = None;
+                    etag = None;
+                    is_dir = false;
+                }
+                b"href" => {
+                    cap = Cap::Href;
+                    buf.clear();
+                }
+                b"getetag" => {
+                    cap = Cap::Etag;
+                    buf.clear();
+                }
+                b"collection" => is_dir = true,
+                _ => {}
+            },
+            Ok(Event::Empty(e)) => {
+                if e.local_name().as_ref() == b"collection" {
+                    is_dir = true;
+                }
+            }
+            Ok(Event::Text(e)) => {
+                if cap != Cap::None {
+                    if let Ok(decoded) = e.decode() {
+                        if let Ok(text) = quick_xml::escape::unescape(&decoded) {
+                            buf.push_str(&text);
+                        }
+                    }
+                }
+            }
+            Ok(Event::End(e)) => match e.local_name().as_ref() {
+                b"href" => {
+                    href = Some(buf.clone());
+                    cap = Cap::None;
+                }
+                b"getetag" => {
+                    etag = Some(buf.clone());
+                    cap = Cap::None;
+                }
+                b"response" => {
+                    if let Some(h) = href.take() {
+                        if let Some(rel) = href_to_relpath(&h, base_path)? {
+                            entries.push(RemoteEntry {
+                                relpath: rel,
+                                etag: etag.take().map(|s| strong_etag(&s)).unwrap_or_default(),
+                                is_dir,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::Eof) => break,
+            Err(e) => return Err(format!("XML parse error: {e}")),
+            _ => {}
+        }
+    }
+    Ok(entries)
+}
+
+// ───────────────────────── sync engine ─────────────────────────
+
+fn read_scanned_local(file: &LocalFile) -> Result<Vec<u8>, String> {
+    let bytes =
+        fs::read(&file.path).map_err(|e| format!("Cannot read {}: {e}", file.path.display()))?;
+    if sha256_hex(&bytes) != file.hash {
+        return Err(format!(
+            "Sync stopped because {} changed locally during sync",
+            file.path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
+fn manifest_entry(hash: String, etag: &str) -> ManifestEntry {
+    ManifestEntry {
+        remote_hash: hash.clone(),
+        local_hash: hash,
+        remote_etag: etag.to_string(),
+    }
+}
+
+fn apply_changes(
+    client: &WebdavClient,
+    vault: &str,
+    local: &HashMap<String, LocalFile>,
+    remote: &HashMap<String, String>,
+    manifest: &SyncManifest,
+    changes: &mut HashMap<PathBuf, &'static str>,
+    write_guard: &tokio::sync::Mutex<()>,
+) -> Result<(SyncManifest, SyncSummary), String> {
+    let vault_path = Path::new(vault);
+    let mut new_m = SyncManifest {
+        identity: client.identity(),
+        files: HashMap::new(),
+    };
+    let mut sum = SyncSummary::default();
+    let mut created: HashSet<String> = HashSet::new();
+    let stamp = chrono::Local::now().format("%Y-%m-%d %H-%M-%S").to_string();
+    let mut keys: HashSet<&String> = HashSet::new();
+    keys.extend(local.keys());
+    keys.extend(remote.keys());
+    keys.extend(manifest.files.keys());
+
+    for key in keys {
+        let l = local.get(key);
+        let r = remote.get(key);
+        let m = manifest.files.get(key);
+        match (l, r) {
+            (Some(lf), Some(etag)) => {
+                // On ETag-less servers, a listing cannot tell us if content changed.
+                // Read every time and compare to the last accepted remote content hash.
+                let remote_bytes =
+                    if etag.is_empty() || m.is_none_or(|old| old.remote_etag != *etag) {
+                        Some(client.get(key, etag)?)
+                    } else {
+                        None
+                    };
+                let remote_hash = remote_bytes.as_ref().map(|bytes| sha256_hex(bytes));
+                let remote_changed = m.is_none_or(|old| {
+                    old.remote_etag != *etag
+                        || (etag.is_empty()
+                            && (old.remote_hash.is_empty()
+                                || remote_hash.as_deref() != Some(old.remote_hash.as_str())))
+                });
+                let local_changed = m.is_none_or(|old| old.local_hash != lf.hash);
+                if !local_changed && !remote_changed {
+                    new_m.files.insert(
+                        key.clone(),
+                        ManifestEntry {
+                            local_hash: lf.hash.clone(),
+                            remote_etag: etag.clone(),
+                            remote_hash: m.unwrap().remote_hash.clone(),
+                        },
+                    );
+                } else if local_changed && !remote_changed {
+                    let bytes = read_scanned_local(lf)?;
+                    let new_etag = client.upload(key, &bytes, Some(etag), &mut created)?;
+                    new_m
+                        .files
+                        .insert(key.clone(), manifest_entry(lf.hash.clone(), &new_etag));
+                    sum.uploaded += 1;
+                } else {
+                    let bytes = match remote_bytes {
+                        Some(bytes) => bytes,
+                        None => client.get(key, etag)?,
+                    };
+                    let hash = remote_hash.unwrap_or_else(|| sha256_hex(&bytes));
+                    if hash == lf.hash {
+                        new_m.files.insert(key.clone(), manifest_entry(hash, etag));
+                    } else if !local_changed {
+                        write_local_if_unchanged(
+                            write_guard,
+                            vault_path,
+                            key,
+                            &bytes,
+                            Some(&lf.hash),
+                            changes,
+                        )?;
+                        new_m.files.insert(key.clone(), manifest_entry(hash, etag));
+                        sum.downloaded += 1;
+                    } else {
+                        // Keep both, but only replace the canonical note after the
+                        // previous local bytes have been safely copied aside.
+                        let ckey = conflict_relpath(key, &stamp);
+                        let lbytes = {
+                            let _guard = write_guard.blocking_lock();
+                            require_unchanged_local(&vault_path.join(&ckey), None)?;
+                            let lbytes = read_scanned_local(lf)?;
+                            write_local(vault_path, &ckey, &lbytes, changes)?;
+                            write_local(vault_path, key, &bytes, changes)?;
+                            lbytes
+                        };
+                        new_m.files.insert(key.clone(), manifest_entry(hash, etag));
+                        let cetag = client.upload(&ckey, &lbytes, None, &mut created)?;
+                        new_m
+                            .files
+                            .insert(ckey, manifest_entry(sha256_hex(&lbytes), &cetag));
+                        sum.conflicts += 1;
+                    }
+                }
+            }
+            (Some(lf), None) => match m {
+                None => {
+                    let bytes = read_scanned_local(lf)?;
+                    let etag = client.upload(key, &bytes, None, &mut created)?;
+                    new_m
+                        .files
+                        .insert(key.clone(), manifest_entry(lf.hash.clone(), &etag));
+                    sum.uploaded += 1;
+                }
+                Some(me) if me.local_hash != lf.hash => {
+                    let bytes = read_scanned_local(lf)?;
+                    let etag = client.upload(key, &bytes, None, &mut created)?;
+                    new_m
+                        .files
+                        .insert(key.clone(), manifest_entry(lf.hash.clone(), &etag));
+                    sum.uploaded += 1;
+                }
+                Some(_) => {
+                    let _guard = write_guard.blocking_lock();
+                    require_unchanged_local(&lf.path, Some(&lf.hash))?;
+                    fs::remove_file(&lf.path).map_err(|e| e.to_string())?;
+                    changes.insert(lf.path.clone(), "remove");
+                    sum.deleted_local += 1;
+                }
+            },
+            (None, Some(etag)) => {
+                let bytes = if etag.is_empty() || m.is_none_or(|old| old.remote_etag != *etag) {
+                    Some(client.get(key, etag)?)
+                } else {
+                    None
+                };
+                let remote_hash = bytes.as_ref().map(|bytes| sha256_hex(bytes));
+                let remote_changed = m.is_none_or(|old| {
+                    old.remote_etag != *etag
+                        || (etag.is_empty()
+                            && (old.remote_hash.is_empty()
+                                || remote_hash.as_deref() != Some(old.remote_hash.as_str())))
+                });
+                if remote_changed {
+                    let bytes = match bytes {
+                        Some(bytes) => bytes,
+                        None => client.get(key, etag)?,
+                    };
+                    write_local_if_unchanged(write_guard, vault_path, key, &bytes, None, changes)?;
+                    new_m.files.insert(
+                        key.clone(),
+                        manifest_entry(remote_hash.unwrap_or_else(|| sha256_hex(&bytes)), etag),
+                    );
+                    sum.downloaded += 1;
+                } else {
+                    client.delete(key, etag)?;
+                    sum.deleted_remote += 1;
+                }
+            }
+            (None, None) => {}
+        }
+    }
+    Ok((new_m, sum))
+}
+
+/// Validate the connection (auth + URL) with a cheap PROPFIND.
+pub fn test_connection(cfg: WebdavConfig) -> Result<String, String> {
+    let client = WebdavClient::new(cfg)?;
+    client.propfind("", "0")?;
+    Ok("Connection successful".to_string())
+}
+
+/// Run a full sync. Mutes the file watcher while applying local writes, then
+/// queues only changed notes for search and publishes their final local state.
+pub fn run_sync(
+    app: tauri::AppHandle,
+    vault: String,
+    cfg: WebdavConfig,
+) -> Result<SyncSummary, String> {
+    use std::sync::atomic::Ordering;
+
+    let state = app.state::<AppState>();
+    let _maintenance = state.vault_maintenance.blocking_lock();
+    // Keep the original vault's index even if the user switches vaults while
+    // WebDAV is working. No config lock is held during network or file I/O.
+    let search = state.vault_snapshot(&vault)?;
+    let client = WebdavClient::new(cfg)?;
+
+    let _ = app.emit(
+        "sync-progress",
+        serde_json::json!({ "vault_path": vault, "status": "listing" }),
+    );
+    let remote: HashMap<String, String> = client
+        .list()?
+        .into_iter()
+        .filter(|(k, _)| is_synced_relpath(k))
+        .collect();
+    let (local, manifest) = {
+        let _guard = state.note_save.blocking_lock();
+        (
+            scan_local(&vault)?,
+            baseline_for_endpoint(load_manifest(&vault)?, &client.identity()),
+        )
+    };
+
+    // Safety guard (issue #102): never treat an empty remote listing as "everything was
+    // deleted remotely". If a prior sync exists (non-empty manifest) but the remote came back
+    // empty, it is almost certainly a listing failure (e.g. a provider whose paths we can't
+    // map), not a real mass-deletion - so abort instead of wiping local notes.
+    if remote.is_empty() && !manifest.files.is_empty() {
+        return Err(
+            "Sync aborted to protect your notes: the WebDAV server returned an empty file list \
+             even though files were synced before, so no local files were deleted. This usually \
+             means the server reports paths in a format the app can't read yet - please report \
+             your WebDAV provider and folder URL."
+                .to_string(),
+        );
+    }
+
+    let _ = app.emit(
+        "sync-progress",
+        serde_json::json!({ "vault_path": vault, "status": "syncing" }),
+    );
+    let mut changes = HashMap::new();
+    // Mute the watcher across local writes; its deferred batch also preserves
+    // external edits that arrive while the network operation is in progress.
+    {
+        let _guard = state.note_save.blocking_lock();
+        state.importing.store(true, Ordering::Release);
+    }
+    let applied = apply_changes(
+        &client,
+        &vault,
+        &local,
+        &remote,
+        &manifest,
+        &mut changes,
+        &state.note_save,
+    );
+    state.importing.store(false, Ordering::Release);
+
+    // Publish even a partial apply: a later network failure must not leave
+    // successfully downloaded/deleted notes absent from search or the UI.
+    let active = state
+        .config
+        .lock()
+        .ok()
+        .is_some_and(|config| config.active_vault.as_deref() == Some(vault.as_str()));
+    let metadata_root = cuelm_dir(&vault);
+    for (path, event_type) in changes {
+        let is_note = path.extension().and_then(|extension| extension.to_str()) == Some("md")
+            && !path.starts_with(&metadata_root);
+        if is_note {
+            if let Some(search) = &search {
+                if let Err(error) = search.queue_index_note(&path.to_string_lossy()) {
+                    log::error!("Could not queue synced note for search: {error}");
+                }
+            }
+        }
+        if !active {
+            continue;
+        }
+        let event = if is_note {
+            changed_entry(path, event_type, Path::new(&vault))
+        } else {
+            crate::types::FileEvent {
+                vault_path: vault.clone(),
+                event_type: event_type.to_string(),
+                path: path.to_string_lossy().to_string(),
+                note: None,
+            }
+        };
+        let _ = app.emit("file-changed", event);
+    }
+
+    let (new_manifest, summary) = applied?;
+    save_manifest(&vault, &new_manifest)?;
+    Ok(summary)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn synced_metadata_waits_for_local_patches_and_never_overwrites_a_newer_style() {
+        use crate::types::TagStyleChange;
+        use crate::vault::operations;
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().to_str().unwrap();
+        operations::ensure_vault_structure(root).unwrap();
+        operations::patch_tag_style(root, "Work", TagStyleChange::Color(Some("#123456".into())))
+            .unwrap();
+        let rel = ".cuelm/tag_styles.json";
+        let path = vault.path().join(rel);
+        let hash = sha256_hex(&fs::read(&path).unwrap());
+        let guard = tokio::sync::Mutex::new(());
+        let held = guard.blocking_lock();
+        std::thread::scope(|scope| {
+            let pending = scope.spawn(|| {
+                let mut changes = HashMap::new();
+                let result = write_local_if_unchanged(
+                    &guard,
+                    vault.path(),
+                    rel,
+                    br##"{"Work":{"color":"#ffffff"}}"##,
+                    Some(&hash),
+                    &mut changes,
+                );
+                assert!(result.is_err());
+                assert!(changes.is_empty());
+            });
+            operations::patch_tag_style(
+                root,
+                "Work",
+                TagStyleChange::Icon(Some("builtin:star".into())),
+            )
+            .unwrap();
+            drop(held);
+            pending.join().unwrap();
+        });
+        let persisted = operations::load_tag_styles(root).unwrap();
+        assert_eq!(persisted["Work"].icon.as_deref(), Some("builtin:star"));
+        assert_eq!(persisted["Work"].color.as_deref(), Some("#123456"));
+
+        let current = fs::read(&path).unwrap();
+        let mut original = fs::File::open(&path).unwrap();
+        let mut changes = HashMap::new();
+        write_local_if_unchanged(
+            &guard,
+            vault.path(),
+            rel,
+            br##"{"Work":{"color":"#abcdef","icon":"builtin:star"}}"##,
+            Some(&sha256_hex(&current)),
+            &mut changes,
+        )
+        .unwrap();
+        let mut old_bytes = Vec::new();
+        original.read_to_end(&mut old_bytes).unwrap();
+        assert_eq!(old_bytes, current);
+        assert_eq!(
+            operations::load_tag_styles(root).unwrap()["Work"]
+                .color
+                .as_deref(),
+            Some("#abcdef")
+        );
+
+        let before = fs::read(&path).unwrap();
+        assert!(write_local_if_unchanged(
+            &guard,
+            vault.path(),
+            rel,
+            b"{broken",
+            Some(&sha256_hex(&before)),
+            &mut HashMap::new()
+        )
+        .is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn streaming_hash_matches_bytes_across_buffer_boundaries() {
+        let mut buffer = [0; HASH_BUFFER_SIZE];
+        for len in [0, 256, HASH_BUFFER_SIZE, HASH_BUFFER_SIZE * 2 + 137] {
+            let bytes: Vec<u8> = (0..len).map(|i| (i % 256) as u8).collect();
+            assert_eq!(
+                sha256_reader(&mut bytes.as_slice(), &mut buffer).unwrap(),
+                sha256_hex(&bytes),
+                "hash mismatch for {len} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn streaming_hash_retries_interruptions_and_accepts_short_reads() {
+        struct InterruptedShortReader<'a> {
+            remaining: &'a [u8],
+            interrupt_next: bool,
+        }
+
+        impl Read for InterruptedShortReader<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                self.interrupt_next = !self.interrupt_next;
+                if self.interrupt_next {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let len = buffer.len().min(7);
+                self.remaining.read(&mut buffer[..len])
+            }
+        }
+
+        let bytes: Vec<u8> = (0..513).map(|i| (i % 256) as u8).collect();
+        let mut reader = InterruptedShortReader {
+            remaining: &bytes,
+            interrupt_next: false,
+        };
+        let mut buffer = [0; HASH_BUFFER_SIZE];
+        assert_eq!(
+            sha256_reader(&mut reader, &mut buffer).unwrap(),
+            sha256_hex(&bytes)
+        );
+    }
+
+    #[test]
+    fn streaming_hash_rejects_partial_content_after_read_error() {
+        struct FailingReader;
+
+        impl Read for FailingReader {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::PermissionDenied.into())
+            }
+        }
+
+        let mut reader = b"partial content".as_slice().chain(FailingReader);
+        let mut buffer = [0; HASH_BUFFER_SIZE];
+        assert_eq!(
+            sha256_reader(&mut reader, &mut buffer).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+    }
+
+    #[test]
+    fn local_scan_hashes_large_attachments_and_independent_files() {
+        let vault = tempfile::tempdir().unwrap();
+        fs::create_dir_all(vault.path().join(".cuelm/attachments")).unwrap();
+        let attachment: Vec<u8> = (0..HASH_BUFFER_SIZE * 2 + 31)
+            .map(|i| (i % 256) as u8)
+            .collect();
+        let files = [
+            (".cuelm/attachments/large.bin", attachment.as_slice()),
+            (
+                ".cuelm/attachments/small.bin",
+                b"\0\xff\x80".as_slice(),
+            ),
+            ("empty.md", b"".as_slice()),
+            ("note.md", b"note content".as_slice()),
+        ];
+        for (relpath, bytes) in files {
+            fs::write(vault.path().join(relpath), bytes).unwrap();
+        }
+        fs::write(vault.path().join("ignored.bin"), b"not synced").unwrap();
+
+        let local = scan_local(vault.path().to_str().unwrap()).unwrap();
+        let actual: HashMap<_, _> = local
+            .into_iter()
+            .map(|(relpath, file)| (relpath, (file.hash, file.path)))
+            .collect();
+        let expected: HashMap<_, _> = files
+            .into_iter()
+            .map(|(relpath, bytes)| {
+                (
+                    relpath.to_string(),
+                    (sha256_hex(bytes), vault.path().join(relpath)),
+                )
+            })
+            .collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn previously_synced_note_replaced_by_link_is_not_scanned_as_deleted() {
+        use std::os::unix::fs::symlink;
+        let vault = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = vault.path().to_str().unwrap();
+        let note = vault.path().join("note.md");
+        fs::write(&note, b"accepted").unwrap();
+        let baseline = scan_local(root).unwrap();
+        assert_eq!(baseline["note.md"].hash, sha256_hex(b"accepted"));
+
+        let external = outside.path().join("outside.md");
+        fs::write(&external, b"external").unwrap();
+        fs::remove_file(&note).unwrap();
+        symlink(&external, &note).unwrap();
+        assert!(scan_local(root).err().unwrap().contains("symbolic link"));
+        assert_eq!(fs::read(&external).unwrap(), b"external");
+
+        fs::remove_file(&note).unwrap();
+        symlink(outside.path().join("missing.md"), &note).unwrap();
+        assert!(scan_local(root).err().unwrap().contains("symbolic link"));
+
+        fs::remove_file(&note).unwrap();
+        fs::create_dir_all(outside.path().join("Notebook")).unwrap();
+        fs::write(outside.path().join("Notebook/note.md"), b"external").unwrap();
+        symlink(
+            outside.path().join("Notebook"),
+            vault.path().join("Notebook"),
+        )
+        .unwrap();
+        assert!(scan_local(root).err().unwrap().contains("symbolic link"));
+        assert_eq!(
+            fs::read(outside.path().join("Notebook/note.md")).unwrap(),
+            b"external"
+        );
+    }
+
+    #[test]
+    fn syncs_notebook_icon_mapping_and_assets_only() {
+        for path in [
+            "Notes/plan.md",
+            ".cuelm/attachments/notebook-icon.png",
+            ".cuelm/notebook_icons.json",
+            ".cuelm/tag_styles.json",
+        ] {
+            assert!(is_synced_relpath(path), "expected {path} to be synced");
+        }
+
+        for path in [
+            "Notes/image.png",
+            ".cuelm/sync_state.json",
+            ".cuelm/notebook_icons.json.bak",
+            ".cuelm/tag_styles.json.bak",
+            ".cuelm/attachments-old/icon.png",
+        ] {
+            assert!(!is_synced_relpath(path), "expected {path} to stay local");
+        }
+    }
+
+    #[test]
+    fn unchanged_sync_has_no_local_mutations() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().join("note.md");
+        fs::write(&path, "unchanged content").unwrap();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let vault_path = vault.path().to_str().unwrap();
+        let local = scan_local(vault_path).unwrap();
+        let remote = HashMap::from([("note.md".to_string(), "\"etag\"".to_string())]);
+        let manifest = SyncManifest {
+            identity: String::new(),
+            files: HashMap::from([(
+                "note.md".to_string(),
+                ManifestEntry {
+                    local_hash: local["note.md"].hash.clone(),
+                    remote_etag: "\"etag\"".to_string(),
+                    remote_hash: String::new(),
+                },
+            )]),
+        };
+        let client = WebdavClient::new(WebdavConfig {
+            url: "http://127.0.0.1:0/".to_string(),
+            username: String::new(),
+            password: String::new(),
+        })
+        .unwrap();
+        let mut changes = HashMap::new();
+        let (next, summary) = apply_changes(
+            &client,
+            vault_path,
+            &local,
+            &remote,
+            &manifest,
+            &mut changes,
+            &tokio::sync::Mutex::new(()),
+        )
+        .unwrap();
+        assert!(changes.is_empty());
+        assert_eq!(summary.uploaded, 0);
+        assert_eq!(summary.downloaded, 0);
+        assert_eq!(summary.deleted_local, 0);
+        assert_eq!(summary.deleted_remote, 0);
+        assert_eq!(summary.conflicts, 0);
+        assert_eq!(next.files["note.md"].local_hash, local["note.md"].hash);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+        assert_eq!(fs::read_to_string(path).unwrap(), "unchanged content");
+    }
+
+    #[test]
+    fn remote_deletion_records_only_the_removed_local_note() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().join("note.md");
+        fs::write(&path, "unchanged content").unwrap();
+        let vault_path = vault.path().to_str().unwrap();
+        let local = scan_local(vault_path).unwrap();
+        let manifest = SyncManifest {
+            identity: String::new(),
+            files: HashMap::from([(
+                "note.md".to_string(),
+                ManifestEntry {
+                    local_hash: local["note.md"].hash.clone(),
+                    remote_etag: "\"etag\"".to_string(),
+                    remote_hash: String::new(),
+                },
+            )]),
+        };
+        let client = WebdavClient::new(WebdavConfig {
+            url: "http://127.0.0.1:0/".to_string(),
+            username: String::new(),
+            password: String::new(),
+        })
+        .unwrap();
+        let mut changes = HashMap::new();
+        let (next, summary) = apply_changes(
+            &client,
+            vault_path,
+            &local,
+            &HashMap::new(),
+            &manifest,
+            &mut changes,
+            &tokio::sync::Mutex::new(()),
+        )
+        .unwrap();
+        assert!(!path.exists());
+        assert!(!next.files.contains_key("note.md"));
+        assert_eq!(summary.deleted_local, 1);
+        assert_eq!(changes, HashMap::from([(path, "remove")]));
+    }
+
+    #[test]
+    fn local_download_journal_ignores_identical_bytes_and_preserves_partial_changes() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().join("Notes/note.md");
+        let mut changes = HashMap::new();
+        write_local(
+            vault.path(),
+            "Notes/note.md",
+            b"first content",
+            &mut changes,
+        )
+        .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"first content");
+        changes.clear();
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        write_local(
+            vault.path(),
+            "Notes/note.md",
+            b"first content",
+            &mut changes,
+        )
+        .unwrap();
+        assert!(changes.is_empty());
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), modified);
+
+        write_local(
+            vault.path(),
+            "Notes/note.md",
+            b"remote content",
+            &mut changes,
+        )
+        .unwrap();
+        fs::write(vault.path().join("blocked"), b"not a directory").unwrap();
+        assert!(write_local(
+            vault.path(),
+            "blocked/note.md",
+            b"cannot write",
+            &mut changes
+        )
+        .is_err());
+        assert_eq!(changes, HashMap::from([(path.clone(), "modify")]));
+        let event = changed_entry(path, "modify", vault.path());
+        assert_eq!(event.note.unwrap().preview, "remote content");
+    }
+    fn webdav_test_client(
+        responses: Vec<(&'static str, &'static str)>,
+    ) -> (WebdavClient, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::Write;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/vault", listener.local_addr().unwrap());
+        let worker = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for (status, body) in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 4096];
+                let header_end = loop {
+                    let len = stream.read(&mut chunk).unwrap();
+                    assert!(len > 0);
+                    request.extend_from_slice(&chunk[..len]);
+                    if let Some(offset) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break offset + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]).into_owned();
+                let content_length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|value| value.trim().parse().ok())
+                    })
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let len = stream.read(&mut chunk).unwrap();
+                    assert!(len > 0);
+                    request.extend_from_slice(&chunk[..len]);
+                }
+                requests.push(headers);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+            requests
+        });
+        (
+            WebdavClient::new(WebdavConfig {
+                url,
+                username: "alice".into(),
+                password: "secret".into(),
+            })
+            .unwrap(),
+            worker,
+        )
+    }
+
+    #[test]
+    fn corrupt_manifest_and_unreadable_vault_stop_without_treating_files_as_deleted() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().to_str().unwrap();
+        fs::create_dir_all(cuelm_dir(root)).unwrap();
+        fs::write(manifest_path(root), b"{invalid").unwrap();
+        assert!(load_manifest(root)
+            .err()
+            .unwrap()
+            .contains("Invalid sync manifest"));
+        fs::write(manifest_path(root), b"{\"files\":{}}").unwrap();
+        assert!(scan_local(&vault.path().join("missing").to_string_lossy()).is_err());
+        fs::write(vault.path().join("note.md"), b"local").unwrap();
+        let old = load_manifest(root).unwrap();
+        let rebased = baseline_for_endpoint(old, "new account");
+        assert!(rebased.files.is_empty());
+        fs::remove_dir_all(cuelm_dir(root)).unwrap();
+        fs::write(cuelm_dir(root), b"not a directory").unwrap();
+        assert!(save_manifest(root, &rebased).is_err());
+        assert_eq!(fs::read(vault.path().join("note.md")).unwrap(), b"local");
+    }
+
+    #[test]
+    fn endpoint_identity_rebases_without_credentials_or_deletion_history() {
+        let first = WebdavClient::new(WebdavConfig {
+            url: "HTTPS://Example.org:443/team/".into(),
+            username: "alice".into(),
+            password: "one".into(),
+        })
+        .unwrap();
+        let same = WebdavClient::new(WebdavConfig {
+            url: "https://example.org/team".into(),
+            username: "alice".into(),
+            password: "other".into(),
+        })
+        .unwrap();
+        let other = WebdavClient::new(WebdavConfig {
+            url: "https://example.org/team".into(),
+            username: "bob".into(),
+            password: "one".into(),
+        })
+        .unwrap();
+        let different_folder = WebdavClient::new(WebdavConfig {
+            url: "https://example.org/another".into(),
+            username: "alice".into(),
+            password: "one".into(),
+        })
+        .unwrap();
+        assert_eq!(first.identity(), same.identity());
+        assert_ne!(same.identity(), other.identity());
+        assert_ne!(same.identity(), different_folder.identity());
+        let manifest = SyncManifest {
+            identity: first.identity(),
+            files: HashMap::from([(
+                "note.md".into(),
+                manifest_entry(sha256_hex(b"old"), "\"old\""),
+            )]),
+        };
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().to_str().unwrap();
+        save_manifest(root, &manifest).unwrap();
+        let persisted = fs::read_to_string(manifest_path(root)).unwrap();
+        assert!(!persisted.contains("one") && !persisted.contains("alice"));
+        assert_eq!(load_manifest(root).unwrap().identity, same.identity());
+        assert_eq!(
+            baseline_for_endpoint(manifest, &other.identity())
+                .files
+                .len(),
+            0
+        );
+        assert!(
+            baseline_for_endpoint(load_manifest(root).unwrap(), &different_folder.identity())
+                .files
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn etagless_remote_content_change_refreshes_local_and_refuses_remote_deletion() {
+        let vault = tempfile::tempdir().unwrap();
+        fs::write(vault.path().join("note.md"), b"old").unwrap();
+        let root = vault.path().to_str().unwrap();
+        let local = scan_local(root).unwrap();
+        let manifest = SyncManifest {
+            identity: String::new(),
+            files: HashMap::from([("note.md".into(), manifest_entry(sha256_hex(b"old"), ""))]),
+        };
+        let (client, requests) = webdav_test_client(vec![("200 OK", "new")]);
+        let mut changes = HashMap::new();
+        let (next, summary) = apply_changes(
+            &client,
+            root,
+            &local,
+            &HashMap::from([("note.md".into(), String::new())]),
+            &manifest,
+            &mut changes,
+            &tokio::sync::Mutex::new(()),
+        )
+        .unwrap();
+        assert_eq!(summary.downloaded, 1);
+        assert_eq!(fs::read(vault.path().join("note.md")).unwrap(), b"new");
+        assert_eq!(next.files["note.md"].remote_hash, sha256_hex(b"new"));
+        assert!(requests.join().unwrap()[0].starts_with("GET /vault/note.md "));
+        let (client, requests) = webdav_test_client(vec![("200 OK", "new")]);
+        let error = apply_changes(
+            &client,
+            root,
+            &HashMap::new(),
+            &HashMap::from([("note.md".into(), String::new())]),
+            &next,
+            &mut HashMap::new(),
+            &tokio::sync::Mutex::new(()),
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("Cannot safely delete"));
+        assert_eq!(requests.join().unwrap().len(), 1); // GET only, never DELETE
+    }
+
+    #[test]
+    fn changed_get_etag_never_installs_stale_snapshot() {
+        let (client, requests) = webdav_test_client(vec![("200 OK\r\nETag: \"new\"", "newer")]);
+        assert!(client
+            .get("note.md", "\"old\"")
+            .unwrap_err()
+            .contains("retry"));
+        let requests = requests.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0]
+            .to_ascii_lowercase()
+            .contains("if-match: \"old\""));
+    }
+
+    #[test]
+    fn conditional_writes_preserve_concurrent_remote_content() {
+        let (client, requests) = webdav_test_client(vec![("412 Precondition Failed", "")]);
+        assert!(client
+            .put("note.md", b"edited", Some("\"old\""))
+            .unwrap_err()
+            .contains("retry"));
+        let requests = requests.join().unwrap();
+        assert!(requests[0]
+            .to_ascii_lowercase()
+            .contains("if-match: \"old\""));
+
+        let (client, requests) = webdav_test_client(vec![("412 Precondition Failed", "")]);
+        assert!(client
+            .delete("note.md", "\"old\"")
+            .unwrap_err()
+            .contains("retry"));
+        assert!(requests.join().unwrap()[0]
+            .to_ascii_lowercase()
+            .contains("if-match: \"old\""));
+
+        let (client, requests) = webdav_test_client(vec![("412 Precondition Failed", "")]);
+        assert!(client
+            .put("new.md", b"new", None)
+            .unwrap_err()
+            .contains("retry"));
+        assert!(requests.join().unwrap()[0]
+            .to_ascii_lowercase()
+            .contains("if-none-match: *"));
+        let (client, requests) = webdav_test_client(vec![]);
+        assert!(client
+            .put("note.md", b"edited", Some(""))
+            .unwrap_err()
+            .contains("no strong ETag"));
+        assert!(client
+            .delete("note.md", "")
+            .unwrap_err()
+            .contains("no strong ETag"));
+        assert!(requests.join().unwrap().is_empty());
+    }
+}

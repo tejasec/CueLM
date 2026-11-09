@@ -1,43 +1,84 @@
-*.iml
-.gradle
-.gradle/
-**/.gradle/
-/local.properties
-local.properties
-key.properties
-keystore.properties
-*.keystore
-*.jks
+node_modules
+node_modules/
 
-# IDE
-.idea/
-/.idea/caches
-/.idea/libraries
-/.idea/modules.xml
-/.idea/workspace.xml
-/.idea/navEditor.xml
-/.idea/assetWizardSettings.xml
-.DS_Store
+# Lockfiles - pnpm-lock.yaml is the only lockfile used
+package-lock.json
+yarn.lock
+bun.lockb
 
-# Build outputs
-build
+# Web build output
+.output
+.vercel
+.netlify
+.wrangler
+/.svelte-kit
+.svelte-kit/
+/build
 build/
 **/build/
-/captures
-.externalNativeBuild
-.cxx
-**/.cxx/
+
+# Tauri build target
+/src-tauri/target
+src-tauri/target/
+
+# Track only Android generation in src-tauri/gen
+/src-tauri/gen/*
+!/src-tauri/gen/android/
+
+# Exclude Apple, Desktop configs & Nix flakes
+src-tauri/plugins/ios-vault-access/
+src-tauri/icons/ios/
+src-tauri/Info.ios.plist
+src-tauri/tauri.ios.conf.json
+src-tauri/tauri.macos.conf.json
+src-tauri/tauri.windows.conf.json
+src-tauri/tauri.linux.conf.json
+flake.nix
+flake.lock
+/result
+
+# Android build outputs & binaries
 *.apk
 *.idsig
 *.aab
 *.hprof
 
-# Build Logs & debug files
+# Build logs & caches
 *.log
 crash.log
 .code-review-graph/
+**/AudioRecorder-2.5.0/
 AudioRecorder-2.5.0/
 
-# Tauri generated
-/.tauri
-/tauri.settings.gradle
+# Signing keys and secrets
+/src-tauri/gen/android/keystore.properties
+/src-tauri/gen/android/key.properties
+keystore.properties
+local.properties
+**/local.properties
+*.keystore
+*.jks
+*.key
+
+# IDE & OS
+.gradle/
+**/.gradle/
+.idea/
+**/.idea/
+*.iml
+**/*.iml
+.cxx/
+**/.cxx/
+.DS_Store
+Thumbs.db
+
+# Env
+.env
+.env.*
+!.env.example
+!.env.test
+
+# Vite & Agent artifacts
+vite.config.js.timestamp-*
+vite.config.ts.timestamp-*
+.claude/
