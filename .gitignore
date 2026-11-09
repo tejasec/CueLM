@@ -1,35 +1,43 @@
-# Gradle files
-.gradle/
-build/
-.kotlin/
-
-# Local configuration file (sdk path, etc)
-local.properties
-
-# Log/OS Files
-*.log
-
-# Android Studio generated files and folders
-captures/
-.externalNativeBuild/
-.cxx/
-*.aab
-*.apk
-output-metadata.json
-
-# IntelliJ
 *.iml
-.idea/
-misc.xml
-deploymentTargetDropDown.xml
-render.experimental.xml
-
-# Keystore files
-*.jks
+.gradle
+.gradle/
+**/.gradle/
+/local.properties
+local.properties
+key.properties
+keystore.properties
 *.keystore
+*.jks
 
-# Google Services (e.g. APIs or Firebase)
-google-services.json
+# IDE
+.idea/
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
 
-# Android Profiling
+# Build outputs
+build
+build/
+**/build/
+/captures
+.externalNativeBuild
+.cxx
+**/.cxx/
+*.apk
+*.idsig
+*.aab
 *.hprof
+
+# Build Logs & debug files
+*.log
+crash.log
+.code-review-graph/
+AudioRecorder-2.5.0/
+
+# Tauri generated
+/.tauri
+/tauri.settings.gradle
