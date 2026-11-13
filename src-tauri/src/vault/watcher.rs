@@ -9,8 +9,11 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::state::AppState;
 use crate::types::FileEvent;
 use crate::vault::operations::{is_hidden, read_note_entry_fast};
+#[cfg(target_os = "linux")]
+use crate::vault::portal_watcher::PortalWatcher;
 
 const IOS_POLL_INTERVAL: Duration = Duration::from_secs(10);
+const FLATPAK_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const NATIVE_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const EVENT_BATCH_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -18,35 +21,48 @@ const EVENT_BATCH_INTERVAL: Duration = Duration::from_millis(50);
 enum WatcherBackend {
     Recommended,
     Poll,
+    #[cfg(target_os = "linux")]
+    Portal,
 }
 
-const fn watcher_backend_for_target(is_ios: bool) -> WatcherBackend {
+const fn watcher_backend_for_target(is_ios: bool, is_flatpak: bool) -> WatcherBackend {
     if is_ios {
         WatcherBackend::Poll
+    } else if is_flatpak {
+        #[cfg(target_os = "linux")]
+        {
+            WatcherBackend::Portal
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            WatcherBackend::Poll
+        }
     } else {
         WatcherBackend::Recommended
     }
 }
 
-const fn poll_interval_for_backend(backend: WatcherBackend) -> Duration {
-    match backend {
-        WatcherBackend::Recommended => NATIVE_POLL_INTERVAL,
-        WatcherBackend::Poll => IOS_POLL_INTERVAL,
+const fn poll_interval_for_target(is_ios: bool, is_flatpak: bool) -> Duration {
+    if is_ios {
+        IOS_POLL_INTERVAL
+    } else if is_flatpak {
+        FLATPAK_POLL_INTERVAL
+    } else {
+        NATIVE_POLL_INTERVAL
     }
 }
 
 pub enum VaultWatcher {
-    Recommended(RecommendedWatcher),
-    Poll(PollWatcher),
-}
-
-impl VaultWatcher {
-    fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> notify::Result<()> {
-        match self {
-            Self::Recommended(watcher) => watcher.watch(path, recursive_mode),
-            Self::Poll(watcher) => watcher.watch(path, recursive_mode),
-        }
-    }
+    Recommended {
+        _watcher: RecommendedWatcher,
+    },
+    Poll {
+        _watcher: PollWatcher,
+    },
+    #[cfg(target_os = "linux")]
+    Portal {
+        _watcher: PortalWatcher,
+    },
 }
 
 fn collect_changes(event: Event, vault_root: &Path, changes: &mut HashMap<PathBuf, &'static str>) {
@@ -115,20 +131,32 @@ pub(crate) fn changed_entry(path: PathBuf, event_type: &str, vault_root: &Path) 
 pub fn start_watcher(app: AppHandle, vault_path: String) -> Result<VaultWatcher, String> {
     let (tx, rx) = mpsc::channel();
 
-    let backend = watcher_backend_for_target(cfg!(target_os = "ios"));
-    let config = Config::default().with_poll_interval(poll_interval_for_backend(backend));
-    let mut watcher = match backend {
-        WatcherBackend::Recommended => VaultWatcher::Recommended(
-            RecommendedWatcher::new(tx, config).map_err(|e| e.to_string())?,
-        ),
-        WatcherBackend::Poll => {
-            VaultWatcher::Poll(PollWatcher::new(tx, config).map_err(|e| e.to_string())?)
+    let is_ios = cfg!(target_os = "ios");
+    // Portal paths do not forward inotify events. Their precise change times
+    // detect external writes even when a sync client preserves modification time.
+    let is_flatpak = option_env!("HELIXNOTES_INSTALL_TYPE") == Some("flatpak");
+    let backend = watcher_backend_for_target(is_ios, is_flatpak);
+    let config = Config::default().with_poll_interval(poll_interval_for_target(is_ios, is_flatpak));
+    let watcher = match backend {
+        WatcherBackend::Recommended => {
+            let mut watcher = RecommendedWatcher::new(tx, config).map_err(|e| e.to_string())?;
+            watcher
+                .watch(Path::new(&vault_path), RecursiveMode::Recursive)
+                .map_err(|e| e.to_string())?;
+            VaultWatcher::Recommended { _watcher: watcher }
         }
+        WatcherBackend::Poll => {
+            let mut watcher = PollWatcher::new(tx, config).map_err(|e| e.to_string())?;
+            watcher
+                .watch(Path::new(&vault_path), RecursiveMode::Recursive)
+                .map_err(|e| e.to_string())?;
+            VaultWatcher::Poll { _watcher: watcher }
+        }
+        #[cfg(target_os = "linux")]
+        WatcherBackend::Portal => VaultWatcher::Portal {
+            _watcher: PortalWatcher::start(PathBuf::from(&vault_path), tx, FLATPAK_POLL_INTERVAL)?,
+        },
     };
-
-    watcher
-        .watch(Path::new(&vault_path), RecursiveMode::Recursive)
-        .map_err(|e| e.to_string())?;
 
     std::thread::spawn(move || {
         let vault_root = Path::new(&vault_path);
@@ -222,25 +250,32 @@ mod tests {
 
     #[test]
     fn ios_uses_polling_backend() {
-        assert_eq!(watcher_backend_for_target(true), WatcherBackend::Poll);
+        assert_eq!(
+            watcher_backend_for_target(true, false),
+            WatcherBackend::Poll
+        );
     }
 
     #[test]
     fn other_platforms_keep_recommended_backend() {
         assert_eq!(
-            watcher_backend_for_target(false),
+            watcher_backend_for_target(false, false),
             WatcherBackend::Recommended
         );
     }
 
     #[test]
-    fn watcher_backends_use_the_expected_intervals() {
+    fn watcher_targets_use_the_expected_intervals() {
         assert_eq!(
-            poll_interval_for_backend(WatcherBackend::Poll),
+            poll_interval_for_target(true, false),
             Duration::from_secs(10)
         );
         assert_eq!(
-            poll_interval_for_backend(WatcherBackend::Recommended),
+            poll_interval_for_target(false, true),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            poll_interval_for_target(false, false),
             Duration::from_secs(1)
         );
     }
@@ -260,7 +295,7 @@ mod tests {
     fn atomic_replace_emits_only_enriched_destination() {
         let vault = tempfile::tempdir().unwrap();
         let target = vault.path().join("Note.md");
-        let temporary = vault.path().join(".cuelm-save-123");
+        let temporary = vault.path().join(".helixnotes-save-123");
         std::fs::write(&target, "---\ntitle: New title\n---\nUpdated preview.").unwrap();
         let events = mapped_events(
             vec![
@@ -269,7 +304,7 @@ mod tests {
                     .add_path(target.clone()),
                 Event::new(EventKind::Remove(RemoveKind::File)).add_path(target.clone()),
                 Event::new(EventKind::Create(CreateKind::File))
-                    .add_path(vault.path().join(".cuelm/history/snapshot.md")),
+                    .add_path(vault.path().join(".helixnotes/history/snapshot.md")),
                 Event::new(EventKind::Create(CreateKind::File))
                     .add_path(vault.path().join(".hidden/secret.md")),
             ],

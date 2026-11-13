@@ -46,6 +46,29 @@ export function assetUrlToLocalPath(source: string): string | null {
 	}
 }
 
+/** The owning configured vault, never the active vault of an unrelated external note. */
+export function noteAssetRoot(notePath: string | null, activeVault: string | null, vaults: readonly string[] = []): string | null {
+	if (!notePath || isPathInDirectory(notePath, activeVault)) return activeVault;
+	return [...vaults].filter(root => isPathInDirectory(notePath, root)).sort((a, b) => b.length - a.length)[0] ?? null;
+}
+
+/** Decode only the URI path, keeping query/fragment data out of filesystem paths. */
+export function resolveFileReference(source: string, notePath: string | null, vaultRoot: string | null): { path: string; suffix: string } {
+	const boundary = source.search(/[?#]/);
+	const encoded = boundary < 0 ? source : source.slice(0, boundary);
+	let path: string;
+	try { path = decodeURIComponent(encoded); } catch { path = encoded; }
+	return { path: resolveVaultFilePath(path, notePath, vaultRoot), suffix: boundary < 0 ? '' : source.slice(boundary) };
+}
+
+/** Percent-encode each path segment for a Markdown destination; a Windows drive prefix stays literal. */
+export function encodeMarkdownPath(path: string): string {
+	const normalized = path.replace(/\\/g, '/');
+	const drive = /^[A-Za-z]:(?=\/|$)/.exec(normalized)?.[0] ?? '';
+	return drive + normalized.slice(drive.length).split('/').map(segment => encodeURIComponent(segment)
+		.replace(/[!'()*]/g, character => `%${character.charCodeAt(0).toString(16).toUpperCase()}`)).join('/');
+}
+
 export function resolveVaultFilePath(
 	targetPath: string,
 	notePath: string | null,
@@ -55,8 +78,11 @@ export function resolveVaultFilePath(
 	if (target.startsWith('/') || /^[A-Za-z]:\//.test(target)) return target;
 
 	const root = vaultRoot?.replace(/\\/g, '/').replace(/\/$/, '') ?? '';
-	if (target.startsWith('.cuelm/') && root) {
-		return resolvePathFromFile(`${root}/.vault-root`, target);
+	if (root) {
+		// Older imported managed links may still contain notebook-depth prefixes.
+		const managed = target.match(/^(?:\.{1,2}\/)*(\.(?:cuelm|helixnotes)\/attachments\/.*)$/);
+		if (managed) return resolvePathFromFile(`${root}/.vault-root`, managed[1]);
+		if (target.startsWith('.cuelm/') || target.startsWith('.helixnotes/')) return resolvePathFromFile(`${root}/.vault-root`, target);
 	}
 	if (notePath) return resolvePathFromFile(notePath, target);
 	if (root) return resolvePathFromFile(`${root}/.vault-root`, target);
@@ -79,14 +105,15 @@ export function assetSourceToMarkdown(
 	const absolutePath = assetUrlToLocalPath(source);
 	if (absolutePath === null) return source;
 
+	const url = new URL(source);
+	const suffix = url.search + url.hash;
 	const normalizedRoot = vaultRoot?.replace(/\\/g, '/').replace(/\/$/, '');
-	if (!normalizedRoot || !absolutePath.startsWith(normalizedRoot + '/')) return absolutePath;
+	if (!normalizedRoot || !isPathInDirectory(absolutePath, normalizedRoot)) return encodeMarkdownPath(absolutePath) + suffix;
 	const vaultRelative = absolutePath.substring(normalizedRoot.length + 1);
-	if (vaultRelative.startsWith('.cuelm/')) return vaultRelative;
-	if (!notePath) return vaultRelative;
+	if (vaultRelative.startsWith('.helixnotes/') || !notePath) return encodeMarkdownPath(vaultRelative) + suffix;
 	const normalizedNotePath = notePath.replace(/\\/g, '/');
 	const noteDirectory = normalizedNotePath.substring(0, normalizedNotePath.lastIndexOf('/'));
-	return relativePath(noteDirectory, absolutePath);
+	return encodeMarkdownPath(relativePath(noteDirectory, absolutePath)) + suffix;
 }
 
 export function resolvePathFromFile(filePath: string, targetPath: string): string {
@@ -139,5 +166,8 @@ export function isPathInDirectory(path: string, directory: string | null): boole
 }
 
 export function isTrashedNote(path: string | null, vaultRoot: string | null | undefined): boolean {
-	return !!path && !!vaultRoot && isPathInDirectory(path, `${vaultRoot}/.cuelm/trash`);
+	return !!path && !!vaultRoot && (
+		isPathInDirectory(path, `${vaultRoot}/.cuelm/trash`) ||
+		isPathInDirectory(path, `${vaultRoot}/.helixnotes/trash`)
+	);
 }

@@ -116,6 +116,9 @@ pub struct VaultConfig {
     pub sync_on_change: bool,
     #[serde(default)]
     pub sync_interval_minutes: u32,
+    /// Folders to list on the server at once; 0 means the default.
+    #[serde(default)]
+    pub sync_folder_requests: u32,
     #[serde(default)]
     pub last_sync_time: Option<String>,
     #[serde(default)]
@@ -160,8 +163,36 @@ pub struct ToolbarLayout {
     pub more: Vec<String>,
 }
 
+/// Keeps the entries of a list that still parse and drops the rest, so one damaged entry (a custom
+/// theme missing a color, say) does not make the whole configuration unreadable.
+fn lenient_list<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let values = Vec::<serde_json::Value>::deserialize(deserializer).unwrap_or_default();
+    Ok(values
+        .into_iter()
+        .filter_map(|value| serde_json::from_value(value).ok())
+        .collect())
+}
+
+/// An optional setting that no longer parses is treated as not set.
+fn lenient_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::de::DeserializeOwned,
+{
+    let value = serde_json::Value::deserialize(deserializer).unwrap_or(serde_json::Value::Null);
+    Ok(serde_json::from_value(value).ok())
+}
+
+// Missing keys take their default: a configuration written by an older version, or edited by
+// hand, must still load instead of being replaced by a blank one.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
+    #[serde(deserialize_with = "lenient_list")]
     pub vaults: Vec<VaultConfig>,
     pub active_vault: Option<String>,
     #[serde(default)]
@@ -177,9 +208,13 @@ pub struct AppConfig {
     pub accent_color: Option<String>,
     #[serde(default)]
     pub font_size: Option<u32>,
+    /// The size chosen in Appearance. Zooming changes `font_size` only, and resetting the zoom
+    /// returns to this.
+    #[serde(default)]
+    pub preferred_font_size: Option<u32>,
     #[serde(default = "default_true")]
     pub scroll_to_change_font_size: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_option")]
     pub toolbar_layout: Option<ToolbarLayout>,
     #[serde(default)]
     pub font_family: Option<String>,
@@ -288,7 +323,7 @@ pub struct AppConfig {
     pub sync_interval_minutes: u32,
     #[serde(default)]
     pub last_sync_time: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_list")]
     pub custom_themes: Vec<CustomTheme>,
 }
 
@@ -351,6 +386,7 @@ impl Default for AppConfig {
             system_dark_theme: default_system_dark_theme(),
             accent_color: None,
             font_size: None,
+            preferred_font_size: None,
             scroll_to_change_font_size: true,
             toolbar_layout: None,
             font_family: None,
@@ -549,6 +585,9 @@ pub struct BackupEntry {
     pub path: String,
     pub size: u64,
     pub created: String,
+    /// The archive was made from a different vault folder. All vaults share one backup folder.
+    #[serde(default)]
+    pub other_vault: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

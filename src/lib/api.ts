@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { ExternalNoteReference } from "./editor/externalNote";
 import type {
   AppConfig,
   CustomTheme,
@@ -80,8 +81,9 @@ export async function importCustomThemes(path: string): Promise<CustomTheme[]> {
   return invoke("import_custom_themes", { path });
 }
 
-export async function setFontSize(size: number): Promise<void> {
-  return invoke("set_font_size", { size });
+/** `preferred` marks a choice made in Appearance, which is what resetting the zoom returns to. */
+export async function setFontSize(size: number, preferred = false): Promise<void> {
+  return invoke("set_font_size", { size, preferred });
 }
 
 export async function setScrollToChangeFontSize(enabled: boolean): Promise<void> {
@@ -162,6 +164,16 @@ export async function saveNote(
   expectedRaw: string,
 ): Promise<NoteContent> {
   return invoke("save_note", { vaultPath, path, meta, body, expectedRaw });
+}
+
+export async function importNote(
+  vaultPath: string,
+  sourcePath: string,
+  notebookRelative: string | null,
+  expectedRaw: string,
+  references: ExternalNoteReference[],
+): Promise<NoteContent> {
+  return invoke("import_note", { vaultPath, sourcePath, notebookRelative, expectedRaw, references });
 }
 
 export async function createNote(
@@ -268,6 +280,15 @@ export async function copyTextToClipboard(text: string): Promise<void> {
 
 export async function readClipboardImage(): Promise<number[]> {
   return invoke("read_clipboard_image");
+}
+
+export interface ClipboardContents {
+  text: string | null;
+  html: string | null;
+}
+
+export async function readClipboardContents(): Promise<ClipboardContents> {
+  return invoke("read_clipboard_contents");
 }
 
 export async function copyImageToClipboard(path: string): Promise<void> {
@@ -612,8 +633,9 @@ export async function setSyncSettings(
   syncOnOpen: boolean,
   syncOnChange: boolean,
   syncIntervalMinutes: number,
+  syncFolderRequests: number,
 ): Promise<void> {
-  return invoke("set_sync_settings", { provider, url, username, password, syncOnOpen, syncOnChange, syncIntervalMinutes });
+  return invoke("set_sync_settings", { provider, url, username, password, syncOnOpen, syncOnChange, syncIntervalMinutes, syncFolderRequests });
 }
 
 export async function testSyncConnection(): Promise<void> {

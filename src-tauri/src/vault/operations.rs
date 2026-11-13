@@ -1,5 +1,6 @@
 use crate::types::{
-    NoteContent, NoteEntry, NoteMeta, NoteTitleEntry, NotebookEntry, RecordingEntry, TagStyle, TagStyleChange,
+    RecordingEntry,
+    NoteContent, NoteEntry, NoteMeta, NoteTitleEntry, NotebookEntry, TagStyle, TagStyleChange,
     TrashContents, TrashNotebookEntry, VaultState,
 };
 use crate::vault::frontmatter;
@@ -15,6 +16,10 @@ use walkdir::WalkDir;
 
 pub fn cuelm_dir(vault_path: &str) -> PathBuf {
     Path::new(vault_path).join(".cuelm")
+}
+
+pub fn helixnotes_dir(vault_path: &str) -> PathBuf {
+    cuelm_dir(vault_path)
 }
 
 fn canonicalize_path(path: &Path, label: &str) -> Result<PathBuf, String> {
@@ -87,7 +92,7 @@ fn ensure_notebook_path(vault_path: &str, requested_path: &Path) -> Result<PathB
 }
 
 fn ensure_trash_entry(vault_path: &str, requested_path: &Path) -> Result<PathBuf, String> {
-    let trash = canonicalize_path(&cuelm_dir(vault_path).join("trash"), "trash path")?;
+    let trash = canonicalize_path(&helixnotes_dir(vault_path).join("trash"), "trash path")?;
     let requested = canonicalize_path(requested_path, "trash item path")?;
     if requested == trash || !requested.starts_with(&trash) {
         return Err("Path must be an item inside the active vault trash".to_string());
@@ -121,7 +126,7 @@ fn safe_child_name(name: &str) -> Result<&str, String> {
 // A normal rename can replace an existing file (or an empty directory).
 // Use the OS's exclusive rename primitive instead; checking exists first is racy.
 #[cfg(target_os = "linux")]
-fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
+fn rename_exclusive_native(src: &Path, dest: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     unsafe extern "C" {
@@ -146,7 +151,7 @@ fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "android")]
-fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
+fn rename_exclusive_native(src: &Path, dest: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let old = CString::new(src.as_os_str().as_bytes())
@@ -174,7 +179,7 @@ fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
-fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
+fn rename_exclusive_native(src: &Path, dest: &Path) -> std::io::Result<()> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     unsafe extern "C" {
@@ -199,7 +204,7 @@ fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
+fn rename_exclusive_native(src: &Path, dest: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
     #[link(name = "Kernel32")]
     unsafe extern "system" {
@@ -211,6 +216,58 @@ fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
         Ok(())
     } else {
         Err(std::io::Error::last_os_error())
+    }
+}
+
+// exFAT on macOS and some FUSE mounts have no exclusive rename and reject the request outright.
+// Without a fallback, trash, move, attachments, history and backups all fail on such a volume.
+fn exclusive_rename_unsupported(error: &std::io::Error) -> bool {
+    // EINVAL, ENOSYS, ENOTSUP and EOPNOTSUPP. Rust reports some of them as "uncategorized".
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    const UNSUPPORTED: [i32; 4] = [22, 78, 45, 102];
+    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+    const UNSUPPORTED: [i32; 3] = [22, 38, 95];
+    cfg!(unix)
+        && error
+            .raw_os_error()
+            .is_some_and(|code| UNSUPPORTED.contains(&code))
+}
+
+// The best such a volume allows: refuse an existing target, then rename. The check and the
+// rename are two steps, which is why this is only used where the single step does not exist.
+fn rename_after_checking(src: &Path, dest: &Path) -> std::io::Result<()> {
+    if dest.symlink_metadata().is_ok() {
+        return Err(std::io::ErrorKind::AlreadyExists.into());
+    }
+    fs::rename(src, dest)
+}
+
+fn rename_exclusive(src: &Path, dest: &Path) -> std::io::Result<()> {
+    match rename_exclusive_native(src, dest) {
+        Err(error) if exclusive_rename_unsupported(&error) => rename_after_checking(src, dest),
+        result => result,
+    }
+}
+
+/// Publish a temporary file under a name that must not exist yet, also on volumes without an
+/// exclusive rename.
+pub(crate) fn persist_without_replacing(
+    temporary: tempfile::NamedTempFile,
+    dest: impl AsRef<Path>,
+) -> Result<(), tempfile::PersistError> {
+    let dest = dest.as_ref();
+    match temporary.persist_noclobber(dest) {
+        Ok(_) => Ok(()),
+        Err(error) if exclusive_rename_unsupported(&error.error) => {
+            if dest.symlink_metadata().is_ok() {
+                return Err(tempfile::PersistError {
+                    error: std::io::ErrorKind::AlreadyExists.into(),
+                    file: error.file,
+                });
+            }
+            error.file.persist(dest).map(|_| ())
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -281,7 +338,7 @@ fn original_trash_name(name: &str) -> &str {
 }
 
 pub fn ensure_vault_structure(vault_path: &str) -> Result<(), String> {
-    let hn_dir = cuelm_dir(vault_path);
+    let hn_dir = helixnotes_dir(vault_path);
     fs::create_dir_all(hn_dir.join("trash")).map_err(|e| e.to_string())?;
     fs::create_dir_all(hn_dir.join("attachments")).map_err(|e| e.to_string())?;
 
@@ -370,6 +427,129 @@ pub fn scan_notebooks(vault_path: &str) -> Result<Vec<NotebookEntry>, String> {
         return Err("Vault path does not exist".to_string());
     }
     Ok(scan_dir_recursive(root, vault_path))
+}
+
+fn scan_dir_recursive(dir: &Path, vault_root: &str) -> Vec<NotebookEntry> {
+    let root = Path::new(vault_root);
+
+    let Ok(read_dir) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+
+    // Collect subdirs (root level only lists directories, note counts come from scan_dir_with_count)
+    let mut dirs: Vec<_> = read_dir
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
+                && !is_hidden(&e.path())
+                && e.file_name().to_string_lossy() != "Daily"
+        })
+        .collect();
+
+    dirs.sort_by(|a, b| {
+        compare_natural_names(
+            &a.file_name().to_string_lossy(),
+            &b.file_name().to_string_lossy(),
+        )
+    });
+
+    // Scan sibling notebooks in parallel: each subtree is independent, so
+    // overlapping the per-directory read_dir calls hides FUSE latency on Android.
+    // par_iter().collect() preserves the (already-sorted) order.
+    let paths: Vec<PathBuf> = dirs.iter().map(|e| e.path()).collect();
+    paths
+        .par_iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            let (children, child_note_count) = scan_dir_with_count(path, vault_root);
+            NotebookEntry {
+                name,
+                path: path.to_string_lossy().to_string(),
+                relative_path: relative,
+                children,
+                note_count: child_note_count,
+            }
+        })
+        .collect()
+}
+
+/// Combined scan: returns (children, note_count) in a single read_dir pass.
+fn scan_dir_with_count(dir: &Path, vault_root: &str) -> (Vec<NotebookEntry>, usize) {
+    let root = Path::new(vault_root);
+
+    let Ok(read_dir) = fs::read_dir(dir) else {
+        return (Vec::new(), 0);
+    };
+
+    let mut subdirs = Vec::new();
+    let mut note_count = 0usize;
+    for entry in read_dir.filter_map(|e| e.ok()) {
+        let ft = match entry.file_type() {
+            Ok(ft) => ft,
+            Err(_) => continue,
+        };
+        if ft.is_dir() && !is_hidden(&entry.path()) {
+            subdirs.push(entry);
+        } else if ft.is_file() && entry.path().extension().and_then(|x| x.to_str()) == Some("md") {
+            note_count += 1;
+        }
+    }
+
+    subdirs.sort_by(|a, b| {
+        compare_natural_names(
+            &a.file_name().to_string_lossy(),
+            &b.file_name().to_string_lossy(),
+        )
+    });
+
+    let paths: Vec<PathBuf> = subdirs.iter().map(|e| e.path()).collect();
+    let entries: Vec<NotebookEntry> = paths
+        .par_iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .to_string();
+            let (children, child_note_count) = scan_dir_with_count(path, vault_root);
+            NotebookEntry {
+                name,
+                path: path.to_string_lossy().to_string(),
+                relative_path: relative,
+                children,
+                note_count: child_note_count,
+            }
+        })
+        .collect();
+
+    (entries, note_count)
+}
+
+pub(crate) fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| {
+            n.starts_with('.')
+                || matches!(
+                    n,
+                    "_res" | "_resources" | "_attachments" | "_assets" | "assets" | "node_modules"
+                )
+        })
+        .unwrap_or(false)
 }
 
 pub fn scan_recordings(vault_path: &str) -> Result<Vec<RecordingEntry>, String> {
@@ -549,128 +729,6 @@ pub fn delete_recording(vault_path: &str, file_path: &str) -> Result<(), String>
     Ok(())
 }
 
-fn scan_dir_recursive(dir: &Path, vault_root: &str) -> Vec<NotebookEntry> {
-    let root = Path::new(vault_root);
-
-    let Ok(read_dir) = fs::read_dir(dir) else {
-        return Vec::new();
-    };
-
-    // Collect subdirs (root level only lists directories, note counts come from scan_dir_with_count)
-    let mut dirs: Vec<_> = read_dir
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_type().map(|ft| ft.is_dir()).unwrap_or(false)
-                && !is_hidden(&e.path())
-                && e.file_name().to_string_lossy() != "Daily"
-        })
-        .collect();
-
-    dirs.sort_by(|a, b| {
-        compare_natural_names(
-            &a.file_name().to_string_lossy(),
-            &b.file_name().to_string_lossy(),
-        )
-    });
-
-    // Scan sibling notebooks in parallel: each subtree is independent, so
-    // overlapping the per-directory read_dir calls hides FUSE latency on Android.
-    // par_iter().collect() preserves the (already-sorted) order.
-    let paths: Vec<PathBuf> = dirs.iter().map(|e| e.path()).collect();
-    paths
-        .par_iter()
-        .map(|path| {
-            let name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let relative = path
-                .strip_prefix(root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_string();
-            let (children, child_note_count) = scan_dir_with_count(path, vault_root);
-            NotebookEntry {
-                name,
-                path: path.to_string_lossy().to_string(),
-                relative_path: relative,
-                children,
-                note_count: child_note_count,
-            }
-        })
-        .collect()
-}
-
-/// Combined scan: returns (children, note_count) in a single read_dir pass.
-fn scan_dir_with_count(dir: &Path, vault_root: &str) -> (Vec<NotebookEntry>, usize) {
-    let root = Path::new(vault_root);
-
-    let Ok(read_dir) = fs::read_dir(dir) else {
-        return (Vec::new(), 0);
-    };
-
-    let mut subdirs = Vec::new();
-    let mut note_count = 0usize;
-    for entry in read_dir.filter_map(|e| e.ok()) {
-        let ft = match entry.file_type() {
-            Ok(ft) => ft,
-            Err(_) => continue,
-        };
-        if ft.is_dir() && !is_hidden(&entry.path()) {
-            subdirs.push(entry);
-        } else if ft.is_file() && entry.path().extension().and_then(|x| x.to_str()) == Some("md") {
-            note_count += 1;
-        }
-    }
-
-    subdirs.sort_by(|a, b| {
-        compare_natural_names(
-            &a.file_name().to_string_lossy(),
-            &b.file_name().to_string_lossy(),
-        )
-    });
-
-    let paths: Vec<PathBuf> = subdirs.iter().map(|e| e.path()).collect();
-    let entries: Vec<NotebookEntry> = paths
-        .par_iter()
-        .map(|path| {
-            let name = path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let relative = path
-                .strip_prefix(root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .to_string();
-            let (children, child_note_count) = scan_dir_with_count(path, vault_root);
-            NotebookEntry {
-                name,
-                path: path.to_string_lossy().to_string(),
-                relative_path: relative,
-                children,
-                note_count: child_note_count,
-            }
-        })
-        .collect();
-
-    (entries, note_count)
-}
-
-pub(crate) fn is_hidden(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .map(|n| {
-            n.starts_with('.')
-                || matches!(
-                    n,
-                    "_res" | "_resources" | "_attachments" | "_assets" | "assets" | "node_modules"
-                )
-        })
-        .unwrap_or(false)
-}
 
 pub fn count_root_notes(vault_path: &str) -> Result<usize, String> {
     let root = Path::new(vault_path);
@@ -722,11 +780,13 @@ pub fn scan_notes(vault_path: &str, notebook_path: Option<&str>) -> Result<Vec<N
                 Err(_) => Vec::new(),
             }
         } else {
-            let hn_dir = cuelm_dir(vault_path);
+            let hn_dir = helixnotes_dir(vault_path);
             WalkDir::new(root)
                 .into_iter()
                 // filter_entry skips descending into hidden dirs (unlike filter)
-                .filter_entry(|e| !is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
+                .filter_entry(|e| {
+                    e.depth() == 0 || (!is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
+                })
                 .filter_map(|e| e.ok())
                 .map(|e| e.path().to_path_buf())
                 .filter(|p| p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("md"))
@@ -756,7 +816,9 @@ pub fn scan_notes(vault_path: &str, notebook_path: Option<&str>) -> Result<Vec<N
             WalkDir::new(root)
                 .into_iter()
                 .filter_entry(|e| {
-                    !is_hidden(e.path()) && !e.path().starts_with(cuelm_dir(vault_path))
+                    e.depth() == 0
+                        || (!is_hidden(e.path())
+                            && !e.path().starts_with(helixnotes_dir(vault_path)))
                 })
                 .filter_map(|e| e.ok())
                 .map(|e| e.path().to_path_buf())
@@ -783,12 +845,7 @@ fn read_note_entry(path: &Path, vault_root: &Path) -> Result<NoteEntry, String> 
 /// Persisted creation dates survive atomic file replacement.
 #[cfg(any(mobile, test))]
 fn read_note_entry_metadata_only(path: &Path, vault_root: &Path) -> Result<NoteEntry, String> {
-    // Read first 2KB - enough for frontmatter with tags, title, pinned
-    let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut buf = vec![0u8; 2048];
-    let bytes_read = file.read(&mut buf).map_err(|e| e.to_string())?;
-    buf.truncate(bytes_read);
-    let raw = String::from_utf8_lossy(&buf);
+    let raw = read_note_head(path)?;
 
     let filename = path
         .file_name()
@@ -826,13 +883,54 @@ fn read_note_entry_metadata_only(path: &Path, vault_root: &Path) -> Result<NoteE
     })
 }
 
-/// Fast version: reads only the first ~2KB of the file (enough for frontmatter + preview).
-pub(crate) fn read_note_entry_fast(path: &Path, vault_root: &Path) -> Result<NoteEntry, String> {
+const NOTE_HEAD_BLOCK: usize = 2048;
+const NOTE_HEAD_LIMIT: usize = 256 * 1024;
+
+/// Where the YAML frontmatter stands within a partially read note: `None` when the note has
+/// none, `Some(None)` while the closing delimiter is still unread, else the offset after it.
+fn frontmatter_state(head: &[u8]) -> Option<Option<usize>> {
+    let rest = head.strip_prefix(b"---")?;
+    if !matches!(rest.first(), None | Some(b'\n' | b'\r')) {
+        return None;
+    }
+    let mut offset = 3;
+    for line in head[3..].split_inclusive(|byte| *byte == b'\n') {
+        offset += line.len();
+        if line.ends_with(b"\n") && line.trim_ascii_end() == b"---" {
+            return Some(Some(offset));
+        }
+    }
+    Some(None)
+}
+
+/// Reads the start of a note: its whole frontmatter plus a block of body for previews, instead
+/// of a fixed prefix that truncates long frontmatter and loses its title and tags.
+pub(crate) fn read_note_head(path: &Path) -> Result<String, String> {
     let mut file = fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut buf = vec![0u8; 2048];
-    let bytes_read = file.read(&mut buf).map_err(|e| e.to_string())?;
-    buf.truncate(bytes_read);
-    let raw = String::from_utf8_lossy(&buf);
+    let mut head = Vec::with_capacity(NOTE_HEAD_BLOCK);
+    let mut target = NOTE_HEAD_BLOCK;
+    loop {
+        let wanted = target - head.len();
+        (&mut file)
+            .take(wanted as u64)
+            .read_to_end(&mut head)
+            .map_err(|e| e.to_string())?;
+        if head.len() < target || head.len() >= NOTE_HEAD_LIMIT {
+            break;
+        }
+        target = match frontmatter_state(&head) {
+            None => break,
+            Some(None) => (head.len() * 2).min(NOTE_HEAD_LIMIT),
+            Some(Some(end)) if head.len() >= end + NOTE_HEAD_BLOCK => break,
+            Some(Some(end)) => end + NOTE_HEAD_BLOCK,
+        };
+    }
+    Ok(String::from_utf8_lossy(&head).into_owned())
+}
+
+/// Fast version: reads the frontmatter and the start of the body (enough for a preview).
+pub(crate) fn read_note_entry_fast(path: &Path, vault_root: &Path) -> Result<NoteEntry, String> {
+    let raw = read_note_head(path)?;
     read_note_entry_from_str(&raw, path, vault_root)
 }
 
@@ -891,7 +989,10 @@ pub fn read_vault_note(vault_path: &str, path: &str) -> Result<NoteContent, Stri
     read_note_content(&validated, path)
 }
 
-fn read_note_content(validated: &Path, reported_path: &str) -> Result<NoteContent, String> {
+pub(crate) fn read_note_content(
+    validated: &Path,
+    reported_path: &str,
+) -> Result<NoteContent, String> {
     let p = validated;
     let raw = fs::read_to_string(p).map_err(|e| e.to_string())?;
     let filename = p
@@ -974,7 +1075,9 @@ pub fn save_note(
     }
 
     updated_meta.modified = Utc::now();
-    let raw = frontmatter::merge_frontmatter(&existing.raw, &updated_meta, body);
+    // The heading that carried the old title follows the title.
+    let body = retitle_leading_heading(body, &existing.meta.title, &updated_meta.title);
+    let raw = frontmatter::merge_frontmatter(&existing.raw, &updated_meta, &body);
     replace_file_atomically(&target, raw.as_bytes())?;
 
     Ok(Some(SavedNote {
@@ -1109,7 +1212,7 @@ pub fn duplicate_note(path: &str, vault_path: &str) -> Result<NoteEntry, String>
     read_note_entry(&copy_path, Path::new(vault_path))
 }
 
-fn retitle_leading_heading(body: &str, old_title: &str, new_title: &str) -> String {
+pub(crate) fn retitle_leading_heading(body: &str, old_title: &str, new_title: &str) -> String {
     let trimmed = body.trim_start();
     let leading_len = body.len() - trimmed.len();
     let first_line_end = trimmed.find('\n').unwrap_or(trimmed.len());
@@ -1314,7 +1417,7 @@ pub fn delete_note(vault_path: &str, note_path: &str) -> Result<(), String> {
     let validated = ensure_note_path(vault_path, Path::new(note_path))?;
     let src = validated.as_path();
 
-    let trash_dir = cuelm_dir(vault_path).join("trash");
+    let trash_dir = helixnotes_dir(vault_path).join("trash");
     fs::create_dir_all(&trash_dir).map_err(|e| e.to_string())?;
 
     let filename = src
@@ -1338,7 +1441,7 @@ pub fn delete_notebook(vault_path: &str, notebook_path: &str) -> Result<(), Stri
     let validated = ensure_notebook_path(vault_path, Path::new(notebook_path))?;
     let src = validated.as_path();
 
-    let trash_dir = cuelm_dir(vault_path).join("trash");
+    let trash_dir = helixnotes_dir(vault_path).join("trash");
     fs::create_dir_all(&trash_dir).map_err(|e| e.to_string())?;
 
     let dirname = src
@@ -1390,6 +1493,21 @@ pub struct RenamedNote {
     pub new_raw: String,
     pub old_title: String,
     pub new_title: String,
+    pub links: LinkRewrite,
+}
+
+/// A note whose links were updated because the note they point to was renamed.
+pub struct RewrittenNote {
+    pub path: String,
+    pub old_raw: String,
+    pub new_raw: String,
+}
+
+/// What a rename or move changed in the notes that link to the moved ones.
+pub struct LinkRewrite {
+    /// The changes the notes were rewritten for, so open editors can apply them to unsaved edits.
+    pub renames: Vec<LinkRename>,
+    pub notes: Vec<RewrittenNote>,
 }
 
 pub fn rename_note(path: &str, new_title: &str, vault_path: &str) -> Result<RenamedNote, String> {
@@ -1405,6 +1523,16 @@ pub fn rename_note(path: &str, new_title: &str, vault_path: &str) -> Result<Rena
         .to_string();
     let (mut meta, content) = frontmatter::parse_note(&raw, &filename);
     let old_title = meta.title.clone();
+    // The title field saves the new title before the file is renamed, so the title on disk can
+    // already be the new one. Links were written with the name the note had, which is its file name.
+    let link_title = if old_title == new_title {
+        Path::new(&filename)
+            .file_stem()
+            .map(|stem| stem.to_string_lossy().into_owned())
+            .unwrap_or_else(|| old_title.clone())
+    } else {
+        old_title.clone()
+    };
     let old_path_str = src.to_string_lossy().to_string();
 
     // Update frontmatter
@@ -1413,6 +1541,8 @@ pub fn rename_note(path: &str, new_title: &str, vault_path: &str) -> Result<Rena
     if meta.id.is_empty() {
         meta.id = Uuid::new_v4().to_string();
     }
+    // The heading that carried the old title follows the rename.
+    let content = retitle_leading_heading(&content, &old_title, new_title);
     let updated = frontmatter::merge_frontmatter(&raw, &meta, &content);
 
     // Rename file
@@ -1446,11 +1576,11 @@ pub fn rename_note(path: &str, new_title: &str, vault_path: &str) -> Result<Rena
     let new_path_str = new_path.to_string_lossy().to_string();
 
     // Update wikilinks in other notes that reference this note
-    update_wikilinks_after_rename(
+    let links = update_wikilinks_after_rename(
         vault_path,
         &old_path_str,
         &new_path_str,
-        &old_title,
+        &link_title,
         new_title,
     );
 
@@ -1458,144 +1588,699 @@ pub fn rename_note(path: &str, new_title: &str, vault_path: &str) -> Result<Rena
         path: new_path_str,
         old_raw: raw,
         new_raw: updated,
-        old_title,
+        old_title: link_title,
         new_title: meta.title,
+        links,
     })
 }
 
-/// Walk all .md files in the vault and update wikilink references after a note rename.
-/// Updates both HTML data-attributes (data-path, data-title) and raw [[old_title]] references.
+/// One note whose name or folder changes, as links see it. Mirrored for open editors in
+/// `src/lib/editor/renamedLinks.ts`; both are checked against `tests/fixtures/renamed-links.json`.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct LinkRename {
+    /// Vault-relative path of the note without `.md`, before and after.
+    pub old_ref: String,
+    pub new_ref: String,
+    pub old_title: String,
+    pub new_title: String,
+    /// Links written with the title follow (the title changed and no other note has it).
+    pub title_rules: bool,
+    /// No other note has this file name, so a bare file name or top-level path means this note.
+    pub file_rules: bool,
+}
+
+/// The renamed or moved notes, looked up by their old path.
+pub(crate) struct LinkRenames {
+    list: Vec<LinkRename>,
+    by_old_ref: std::collections::HashMap<String, usize>,
+}
+
+impl LinkRenames {
+    pub(crate) fn new(list: Vec<LinkRename>) -> Self {
+        let by_old_ref = list
+            .iter()
+            .enumerate()
+            .map(|(index, rename)| (rename.old_ref.to_lowercase(), index))
+            .collect();
+        Self { list, by_old_ref }
+    }
+
+    fn by_path(&self, reference: &str) -> Option<&LinkRename> {
+        self.by_old_ref
+            .get(&reference.to_lowercase())
+            .map(|index| &self.list[*index])
+    }
+}
+
+fn split_ref(reference: &str) -> (&str, &str) {
+    reference.rsplit_once('/').unwrap_or(("", reference))
+}
+
+fn join_ref(dir: &str, name: &str) -> String {
+    if dir.is_empty() {
+        name.to_string()
+    } else {
+        format!("{dir}/{name}")
+    }
+}
+
+/// Resolve `.` and `..` in a slash path; `None` when it climbs out of the vault.
+fn normalize_link_dir(path: &str) -> Option<String> {
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            _ => parts.push(part),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+/// The `../`-style prefix that leads from folder `from` to folder `to`, ending in `/` unless empty.
+fn relative_link_dir(from: &str, to: &str) -> String {
+    let from: Vec<&str> = from.split('/').filter(|part| !part.is_empty()).collect();
+    let to: Vec<&str> = to.split('/').filter(|part| !part.is_empty()).collect();
+    let common = from.iter().zip(&to).take_while(|(a, b)| a == b).count();
+    let mut out = "../".repeat(from.len() - common);
+    for part in &to[common..] {
+        out.push_str(part);
+        out.push('/');
+    }
+    out
+}
+
+/// Characters a link destination without `<>` cannot hold as they are.
+fn encode_link_file_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if matches!(c, '%' | ' ' | '\t' | '(' | ')' | '<' | '>' | '#') {
+            out.push_str(&format!("%{:02X}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn encode_link_path(path: &str, angled: bool) -> String {
+    if angled {
+        return path.to_string();
+    }
+    path.split('/')
+        .map(encode_link_file_name)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn decode_link(value: &str) -> String {
+    urlencoding::decode(value)
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| value.to_string())
+}
+
+/// `name` without a trailing `.md` (any capitals), and that extension as written.
+fn split_md_ext(name: &str) -> (&str, &str) {
+    let at = name.len().saturating_sub(3);
+    if name.len() >= 3 && name.is_char_boundary(at) && name[at..].eq_ignore_ascii_case(".md") {
+        name.split_at(at)
+    } else {
+        (name, "")
+    }
+}
+
+/// The wiki link target and display after the renames, or `None` when the link is not affected.
+/// The target may carry a heading or block (`Note#Part`, `Note^id`) and a `.md` extension.
+fn renamed_wiki_link(
+    reference: &str,
+    display: Option<&str>,
+    renames: &LinkRenames,
+) -> Option<(String, Option<String>)> {
+    let anchor_at = reference.find(['#', '^']).unwrap_or(reference.len());
+    let (name, anchor) = reference.split_at(anchor_at);
+    let (base, ext) = split_md_ext(name);
+    let lower = base.to_lowercase();
+    let (rename, next) = if let Some(rename) = renames
+        .list
+        .iter()
+        .find(|rename| rename.title_rules && rename.old_title.to_lowercase() == lower)
+    {
+        (rename, rename.new_title.as_str())
+    } else {
+        let rename = renames.by_path(&base.replace('\\', "/"))?;
+        let stem_changes = split_ref(&rename.old_ref).1 != split_ref(&rename.new_ref).1;
+        // At the top of the vault the path is the bare name, as unsure as a title link.
+        if rename.old_ref == rename.new_ref
+            || !(rename.old_ref.contains('/') || (rename.file_rules && stem_changes))
+        {
+            return None;
+        }
+        (rename, rename.new_ref.as_str())
+    };
+    let follows_title =
+        display == Some(rename.old_title.as_str()) && rename.old_title != rename.new_title;
+    let display = if follows_title {
+        Some(rename.new_title.clone())
+    } else {
+        display.map(str::to_string)
+    };
+    Some((format!("{next}{ext}{anchor}"), display))
+}
+
+/// A link destination split into what the renames look at.
+struct LinkDestination<'a> {
+    angled: bool,
+    /// Path before any `#` part, still encoded.
+    path: &'a str,
+    anchor: &'a str,
+}
+
+fn link_destination(href: &str) -> Option<LinkDestination<'_>> {
+    let angled = href.len() >= 2 && href.starts_with('<') && href.ends_with('>');
+    let dest = if angled {
+        &href[1..href.len() - 1]
+    } else {
+        href
+    };
+    let has_scheme = dest.split_once(':').is_some_and(|(scheme, _)| {
+        scheme
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '.' | '-'))
+    });
+    if has_scheme || dest.is_empty() || dest.starts_with('#') {
+        return None;
+    }
+    let (path, anchor) = dest.split_at(dest.find('#').unwrap_or(dest.len()));
+    Some(LinkDestination {
+        angled,
+        path,
+        anchor,
+    })
+}
+
+fn wrap_destination(angled: bool, path: String, anchor: &str) -> String {
+    if angled {
+        format!("<{path}{anchor}>")
+    } else {
+        format!("{path}{anchor}")
+    }
+}
+
+/// A Markdown link destination after the renames, or `None` when it does not point at a renamed
+/// note. `note_dir` is the vault-relative folder of the note holding the link. The link keeps its
+/// form: relative stays relative, from the vault root stays so, and a bare name stays bare when it
+/// still finds the note.
+fn renamed_href(href: &str, note_dir: &str, renames: &LinkRenames) -> Option<String> {
+    let LinkDestination {
+        angled,
+        path,
+        anchor,
+    } = link_destination(href)?;
+    let (raw_dir, raw_file) = match path.rfind('/') {
+        Some(slash) => (&path[..=slash], &path[slash + 1..]),
+        None => ("", path),
+    };
+    let (_, ext) = split_md_ext(raw_file);
+    if ext.is_empty() {
+        return None;
+    }
+    let file = decode_link(raw_file);
+    let stem = split_md_ext(&file).0;
+    let dir = decode_link(raw_dir).replace('\\', "/");
+    enum Form {
+        Bare,
+        Relative,
+        Root,
+    }
+    let found = if dir.is_empty() {
+        renames
+            .by_path(&join_ref(note_dir, stem))
+            .map(|rename| (rename, Form::Relative))
+            .or_else(|| {
+                // A bare name from another folder finds the note by its unique file name.
+                renames
+                    .list
+                    .iter()
+                    .find(|rename| {
+                        let (_, old_stem) = split_ref(&rename.old_ref);
+                        rename.file_rules
+                            && old_stem.to_lowercase() == stem.to_lowercase()
+                            && old_stem != split_ref(&rename.new_ref).1
+                    })
+                    .map(|rename| (rename, Form::Bare))
+            })
+    } else {
+        let relative = (!dir.starts_with('/'))
+            .then(|| normalize_link_dir(&format!("{note_dir}/{dir}")))
+            .flatten()
+            .and_then(|resolved| renames.by_path(&join_ref(&resolved, stem)))
+            .map(|rename| (rename, Form::Relative));
+        relative.or_else(|| {
+            normalize_link_dir(&dir)
+                .and_then(|resolved| renames.by_path(&join_ref(&resolved, stem)))
+                .map(|rename| (rename, Form::Root))
+        })
+    };
+    let (rename, form) = found?;
+    if rename.old_ref == rename.new_ref {
+        return None;
+    }
+    let (old_dir, _) = split_ref(&rename.old_ref);
+    let (new_dir, new_stem) = split_ref(&rename.new_ref);
+    let file = encode_link_path(&format!("{new_stem}{ext}"), angled);
+    let prefix = if old_dir.to_lowercase() == new_dir.to_lowercase() {
+        raw_dir.to_string()
+    } else {
+        match form {
+            Form::Bare => String::new(),
+            Form::Relative => encode_link_path(&relative_link_dir(note_dir, new_dir), angled),
+            Form::Root => {
+                let lead = if dir.starts_with('/') { "/" } else { "" };
+                let rest = if new_dir.is_empty() {
+                    String::new()
+                } else {
+                    format!("{}/", encode_link_path(new_dir, angled))
+                };
+                format!("{lead}{rest}")
+            }
+        }
+    };
+    Some(wrap_destination(angled, format!("{prefix}{file}"), anchor))
+}
+
+/// A relative link in a note that moved from `old_dir` to `new_dir`, pointed from the new folder at
+/// what it reached from the old one (which may have moved too). Links that did not reach an
+/// existing file, managed attachments and links from the vault root are left alone.
+fn relinked_href(
+    href: &str,
+    old_dir: &str,
+    new_dir: &str,
+    renames: &LinkRenames,
+    exists: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    let LinkDestination {
+        angled,
+        path,
+        anchor,
+    } = link_destination(href)?;
+    let decoded = decode_link(path).replace('\\', "/");
+    if decoded.starts_with('/')
+        || decoded
+            .trim_start_matches("./")
+            .trim_start_matches("../")
+            .starts_with(".cuelm/")
+        || decoded.contains("/.cuelm/")
+    {
+        return None;
+    }
+    // Written from the vault root, the link still works from the new folder.
+    if normalize_link_dir(&decoded).is_some_and(|root| exists(&root)) {
+        return None;
+    }
+    let target = normalize_link_dir(&format!("{old_dir}/{decoded}"))?;
+    let (base, ext) = split_md_ext(&target);
+    let target = match renames.by_path(base) {
+        Some(rename) if !ext.is_empty() => format!("{}{ext}", rename.new_ref),
+        _ => target.clone(),
+    };
+    if !exists(&target) {
+        return None;
+    }
+    let (target_dir, target_file) = split_ref(&target);
+    let next = format!(
+        "{}{}",
+        encode_link_path(&relative_link_dir(new_dir, target_dir), angled),
+        encode_link_path(target_file, angled)
+    );
+    let next = wrap_destination(angled, next, anchor);
+    (next != href).then_some(next)
+}
+
+/// Byte ranges of `text` outside fenced code blocks and inline code, where links are links.
+fn link_prose_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut fence: Option<(u8, usize)> = None;
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let start = offset;
+        offset += line.len();
+        let content = line.trim_end_matches(['\n', '\r']);
+        let trimmed = content.trim_start_matches(' ');
+        let opening = (content.len() - trimmed.len() <= 3)
+            .then(|| trimmed.as_bytes().first().copied())
+            .flatten()
+            .filter(|c| *c == b'`' || *c == b'~')
+            .map(|c| (c, trimmed.bytes().take_while(|b| *b == c).count()))
+            .filter(|(_, run)| *run >= 3);
+        if let Some((char, length)) = fence {
+            if let Some((c, run)) = opening {
+                if c == char && run >= length && trimmed[run..].trim().is_empty() {
+                    fence = None;
+                }
+            }
+            continue;
+        }
+        if let Some((c, run)) = opening {
+            if !(c == b'`' && trimmed[run..].contains('`')) {
+                fence = Some((c, run));
+                continue;
+            }
+        }
+        let bytes = line.as_bytes();
+        let mut from = start;
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] != b'`' {
+                i += 1;
+                continue;
+            }
+            let run = bytes[i..].iter().take_while(|b| **b == b'`').count();
+            let mut j = i + run;
+            let mut close = None;
+            while j < bytes.len() {
+                if bytes[j] == b'`' {
+                    let other = bytes[j..].iter().take_while(|b| **b == b'`').count();
+                    if other == run {
+                        close = Some(j + other);
+                        break;
+                    }
+                    j += other;
+                } else {
+                    j += 1;
+                }
+            }
+            match close {
+                Some(end) => {
+                    ranges.push((from, start + i));
+                    from = start + end;
+                    i = end;
+                }
+                None => i += run,
+            }
+        }
+        ranges.push((from, offset));
+    }
+    ranges
+}
+
+fn wiki_link_pattern() -> &'static regex::Regex {
+    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    PATTERN.get_or_init(|| regex::Regex::new(r"\[\[([^\[\]\n]+?)\]\]").unwrap())
+}
+
+fn markdown_link_pattern() -> &'static regex::Regex {
+    static PATTERN: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    PATTERN.get_or_init(|| {
+        regex::Regex::new(
+            r"\[([^\[\]\n]*)\]\((<[^<>\n]*>|(?:[^\s()<>]|\([^\s()<>]*\))+)([^)\n]*)\)",
+        )
+        .unwrap()
+    })
+}
+
+/// Where a note's own relative Markdown links are fixed after the note itself moved.
+pub(crate) struct MovedFrom<'a> {
+    pub old_dir: &'a str,
+    pub exists: &'a dyn Fn(&str) -> bool,
+}
+
+/// `text` with its links to renamed or moved notes brought in line. A note that moved itself
+/// passes `moved`, so its relative Markdown links are pointed from its new folder.
+pub(crate) fn rewrite_renamed_links(
+    text: &str,
+    renames: &LinkRenames,
+    note_dir: &str,
+    moved: Option<&MovedFrom>,
+) -> String {
+    let mut changes: Vec<(usize, usize, String)> = Vec::new();
+    for (from, to) in link_prose_ranges(text) {
+        let prose = &text[from..to];
+        for found in wiki_link_pattern().captures_iter(prose) {
+            let whole = found.get(0).unwrap();
+            let inner = &found[1];
+            // In a table cell the alias separator is written `\|`, since a bare `|` ends the cell.
+            let (reference, separator, display) = match inner.find('|') {
+                Some(bar) if bar > 0 && inner.as_bytes()[bar - 1] == b'\\' => {
+                    (&inner[..bar - 1], "\\|", Some(&inner[bar + 1..]))
+                }
+                Some(bar) => (&inner[..bar], "|", Some(&inner[bar + 1..])),
+                None => (inner, "|", None),
+            };
+            let Some((next, display)) = renamed_wiki_link(reference, display, renames) else {
+                continue;
+            };
+            let insert = match display {
+                Some(display) => format!("[[{next}{separator}{display}]]"),
+                None => format!("[[{next}]]"),
+            };
+            if insert != whole.as_str() {
+                changes.push((from + whole.start(), from + whole.end(), insert));
+            }
+        }
+        for found in markdown_link_pattern().captures_iter(prose) {
+            let whole = found.get(0).unwrap();
+            let (href, label) = match moved {
+                Some(moved) => (
+                    relinked_href(&found[2], moved.old_dir, note_dir, renames, moved.exists),
+                    &found[1],
+                ),
+                None => {
+                    let href = renamed_href(&found[2], note_dir, renames);
+                    // Link text that was the old title follows the new one.
+                    let label = renames
+                        .list
+                        .iter()
+                        .find(|rename| {
+                            rename.old_title == found[1] && rename.old_title != rename.new_title
+                        })
+                        .filter(|_| href.is_some())
+                        .map_or(&found[1], |rename| rename.new_title.as_str());
+                    (href, label)
+                }
+            };
+            let Some(href) = href else {
+                continue;
+            };
+            let insert = format!("[{label}]({href}{})", &found[3]);
+            if insert != whole.as_str() {
+                changes.push((from + whole.start(), from + whole.end(), insert));
+            }
+        }
+    }
+    if changes.is_empty() {
+        return text.to_string();
+    }
+    changes.sort_by_key(|change| change.0);
+    let mut result = String::with_capacity(text.len());
+    let mut at = 0;
+    for (start, end, insert) in changes {
+        if start < at {
+            continue;
+        }
+        result.push_str(&text[at..start]);
+        result.push_str(&insert);
+        at = end;
+    }
+    result.push_str(&text[at..]);
+    result
+}
+
+fn vault_notes(vault_path: &str) -> impl Iterator<Item = walkdir::DirEntry> {
+    let vault = Path::new(vault_path).to_path_buf();
+    let hn_dir = helixnotes_dir(vault_path);
+    WalkDir::new(vault.clone())
+        .into_iter()
+        .filter_entry(move |e| {
+            e.depth() == 0 || (!is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
+        })
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path().is_file() && e.path().extension().and_then(|ext| ext.to_str()) == Some("md")
+        })
+}
+
+/// Vault-relative path with forward slashes and without `.md`.
+fn vault_ref(vault_path: &str, path: &Path) -> String {
+    let rel = path
+        .strip_prefix(vault_path)
+        .map(|r| r.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string_lossy().into_owned())
+        .replace('\\', "/");
+    split_md_ext(&rel).0.to_string()
+}
+
+/// How many notes in the vault have each file name, ignoring capitals.
+fn note_name_counts(vault_path: &str) -> std::collections::HashMap<String, usize> {
+    let mut counts = std::collections::HashMap::new();
+    for entry in vault_notes(vault_path) {
+        if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+            *counts.entry(stem.to_lowercase()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Rewrite the links in every note of the vault after notes were renamed or moved. `moved` lists
+/// notes that changed folder (new path, old vault-relative folder); their own relative links are
+/// fixed too. `skip` is left alone entirely. Code blocks and inline code are left as written.
+fn rewrite_links_in_vault(
+    vault_path: &str,
+    renames: Vec<LinkRename>,
+    moved: &[(PathBuf, String)],
+    skip: Option<&str>,
+) -> LinkRewrite {
+    let vault = Path::new(vault_path);
+    let renames = LinkRenames::new(renames);
+    let exists = |rel: &str| vault.join(rel).is_file();
+    let mut notes = Vec::new();
+    for entry in vault_notes(vault_path) {
+        let path = entry.path();
+        let path_str = path.to_string_lossy();
+        if skip == Some(path_str.as_ref()) {
+            continue;
+        }
+        let content = match fs::read_to_string(path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        let note_dir = split_ref(&vault_ref(vault_path, path)).0.to_string();
+        let moved_from =
+            moved
+                .iter()
+                .find(|(moved_path, _)| moved_path == path)
+                .map(|(_, old_dir)| MovedFrom {
+                    old_dir,
+                    exists: &exists,
+                });
+        let result = rewrite_renamed_links(&content, &renames, &note_dir, moved_from.as_ref());
+
+        if result != content {
+            // Replace the file in one step: a plain write truncates first, so a crash or a full
+            // disk here could leave a note that merely links to the renamed one empty.
+            match replace_file_atomically(path, result.as_bytes()) {
+                Ok(()) => notes.push(RewrittenNote {
+                    path: path_str.into_owned(),
+                    old_raw: content,
+                    new_raw: result,
+                }),
+                Err(error) => log::error!(
+                    "Could not update links in {} after a rename or move: {error}",
+                    path.display()
+                ),
+            }
+        }
+    }
+    LinkRewrite {
+        renames: renames.list,
+        notes,
+    }
+}
+
+/// Update the links to a note after it was renamed in its folder: wiki links by title or path
+/// (with headings, blocks, any capitals or `.md`) and Markdown links to the file.
 fn update_wikilinks_after_rename(
     vault_path: &str,
     old_path: &str,
     new_path: &str,
     old_title: &str,
     new_title: &str,
-) {
-    let vault = Path::new(vault_path);
-    let hn_dir = cuelm_dir(vault_path);
-
-    // Vault-relative path ref (without .md), normalized to forward slashes so it
-    // matches [[folder/note]] wikilinks on Windows (OS paths use backslashes there).
-    let rel_ref = |p: &str| -> String {
-        let rel = Path::new(p)
-            .strip_prefix(vault)
-            .map(|r| r.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| p.to_string())
-            .replace('\\', "/");
-        rel.strip_suffix(".md").unwrap_or(&rel).to_string()
+) -> LinkRewrite {
+    let old_ref = vault_ref(vault_path, Path::new(old_path));
+    let new_ref = vault_ref(vault_path, Path::new(new_path));
+    let old_stem = split_ref(&old_ref).1.to_lowercase();
+    let new_stem = split_ref(&new_ref).1.to_lowercase();
+    // When another note has the old title or file name, links by title (or by bare file name)
+    // can't be told apart from links to that note, so they are left alone. Paths are unique.
+    let counts = note_name_counts(vault_path);
+    let others = |name: &str| {
+        let name = name.to_lowercase();
+        counts.get(&name).copied().unwrap_or(0) - usize::from(name == new_stem)
     };
-    let old_rel_ref = rel_ref(old_path);
-    let new_rel_ref = rel_ref(new_path);
-
-    // Check if another note with the same old_title exists in the vault.
-    // If so, title-based replacements (rules 1-3) are ambiguous and must be skipped,
-    // because we can't tell which [[Old Title]] ref points to the renamed note
-    // vs. the other note with the same title.
-    let title_is_unique = !WalkDir::new(vault)
-        .into_iter()
-        .filter_entry(|e| !is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
-        .filter_map(|e| e.ok())
-        .any(|e| {
-            let p = e.path();
-            if !p.is_file() || p.to_string_lossy().as_ref() == new_path {
-                return false;
-            }
-            if p.extension().and_then(|ext| ext.to_str()) != Some("md") {
-                return false;
-            }
-            // Check if this note's filename (without .md) matches the old title
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s.eq_ignore_ascii_case(old_title))
-                .unwrap_or(false)
-        });
-
-    for entry in WalkDir::new(vault)
-        .into_iter()
-        .filter_entry(|e| !is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
-        .filter_map(|e| e.ok())
-    {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let path_str = path.to_string_lossy();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        // Skip the renamed note itself
-        if *path_str == *new_path {
-            continue;
-        }
-
-        let content = match fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-
-        let mut result = content.clone();
-
-        // Notes are saved as markdown with [[ref]] or [[ref|display]] syntax.
-        // Update all wikilink forms that reference the renamed note:
-
-        // Title-based rules only apply when the old title is unique in the vault.
-        // If another note shares the same title, these would be ambiguous.
-        if old_title != new_title && title_is_unique {
-            // 1. Short title ref: [[Old Title]] → [[New Title]]
-            result = result.replace(&format!("[[{}]]", old_title), &format!("[[{}]]", new_title));
-
-            // 2. Short title with alias: [[Old Title|display]] → [[New Title|display]]
-            result = result.replace(&format!("[[{}|", old_title), &format!("[[{}|", new_title));
-
-            // 3. Short title as alias display: [[ref|Old Title]] → [[ref|New Title]]
-            result = result.replace(&format!("|{}]]", old_title), &format!("|{}]]", new_title));
-        }
-
-        // Path-based rules are always safe (paths are unique).
-        if old_rel_ref != new_rel_ref {
-            // 4. Path-based ref: [[folder/Old Name]] → [[folder/New Name]]
-            result = result.replace(
-                &format!("[[{}]]", old_rel_ref),
-                &format!("[[{}]]", new_rel_ref),
-            );
-
-            // 5. Path-based ref with alias: [[folder/Old Name|display]] → [[folder/New Name|display]]
-            //    Also update the alias if it matches the old title.
-            //    e.g. [[folder/Old Name|Old Title]] → [[folder/New Name|New Title]]
-            if old_title != new_title {
-                result = result.replace(
-                    &format!("[[{}|{}]]", old_rel_ref, old_title),
-                    &format!("[[{}|{}]]", new_rel_ref, new_title),
-                );
-            }
-            // For aliases that DON'T match the old title, just update the ref part
-            result = result.replace(
-                &format!("[[{}|", old_rel_ref),
-                &format!("[[{}|", new_rel_ref),
-            );
-        }
-
-        if result != content {
-            let _ = fs::write(path, &result);
-        }
-    }
+    let rename = LinkRename {
+        title_rules: old_title != new_title && others(old_title) == 0,
+        file_rules: others(&old_stem) == 0,
+        old_ref,
+        new_ref,
+        old_title: old_title.to_string(),
+        new_title: new_title.to_string(),
+    };
+    rewrite_links_in_vault(vault_path, vec![rename], &[], Some(new_path))
 }
 
-pub fn rename_notebook(vault_path: &str, path: &str, new_name: &str) -> Result<String, String> {
+/// Update links after notes changed folder: `moves` pairs each moved note's old path with its new
+/// one. Titles do not change, so only links written with a path follow.
+fn update_links_after_moves(vault_path: &str, moves: &[(PathBuf, PathBuf)]) -> LinkRewrite {
+    let counts = note_name_counts(vault_path);
+    let mut renames = Vec::new();
+    let mut moved = Vec::new();
+    for (old_path, new_path) in moves {
+        let old_ref = vault_ref(vault_path, old_path);
+        let new_ref = vault_ref(vault_path, new_path);
+        let stem = split_ref(&new_ref).1.to_lowercase();
+        let title = split_ref(&new_ref).1.to_string();
+        moved.push((new_path.clone(), split_ref(&old_ref).0.to_string()));
+        renames.push(LinkRename {
+            file_rules: counts.get(&stem).copied().unwrap_or(0) == 1,
+            old_ref,
+            new_ref,
+            old_title: title.clone(),
+            new_title: title,
+            title_rules: false,
+        });
+    }
+    rewrite_links_in_vault(vault_path, renames, &moved, None)
+}
+
+/// Every note under `new_dir` with the path it had under `old_dir`.
+fn notes_moved_with_notebook(old_dir: &Path, new_dir: &Path) -> Vec<(PathBuf, PathBuf)> {
+    WalkDir::new(new_dir)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.path().is_file() && e.path().extension().and_then(|ext| ext.to_str()) == Some("md")
+        })
+        .filter_map(|e| {
+            let suffix = e.path().strip_prefix(new_dir).ok()?;
+            Some((old_dir.join(suffix), e.path().to_path_buf()))
+        })
+        .collect()
+}
+
+pub fn rename_notebook(
+    vault_path: &str,
+    path: &str,
+    new_name: &str,
+) -> Result<(String, LinkRewrite), String> {
     let validated = ensure_notebook_path(vault_path, Path::new(path))?;
     let src = validated.as_path();
 
     let new_path = src.parent().unwrap().join(safe_child_name(new_name)?);
     if src == new_path {
-        return Ok(path.to_string());
+        return Ok((
+            path.to_string(),
+            LinkRewrite {
+                renames: Vec::new(),
+                notes: Vec::new(),
+            },
+        ));
     }
 
     move_notebook_with_icons(vault_path, src, &new_path)?;
-    Ok(new_path.to_string_lossy().to_string())
+    let links = update_links_after_moves(vault_path, &notes_moved_with_notebook(src, &new_path));
+    Ok((new_path.to_string_lossy().to_string(), links))
 }
 
-pub fn move_note(vault_path: &str, note_path: &str, dest_notebook: &str) -> Result<String, String> {
+pub fn move_note(
+    vault_path: &str,
+    note_path: &str,
+    dest_notebook: &str,
+) -> Result<(String, LinkRewrite), String> {
     let validated = ensure_note_path(vault_path, Path::new(note_path))?;
     let src = validated.as_path();
 
@@ -1609,14 +2294,22 @@ pub fn move_note(vault_path: &str, note_path: &str, dest_notebook: &str) -> Resu
     let dest = dest_dir.join(filename);
 
     move_note_with_quick_access(vault_path, src, &dest)?;
-    Ok(dest.to_string_lossy().to_string())
+    let links = if dest == src {
+        LinkRewrite {
+            renames: Vec::new(),
+            notes: Vec::new(),
+        }
+    } else {
+        update_links_after_moves(vault_path, &[(src.to_path_buf(), dest.clone())])
+    };
+    Ok((dest.to_string_lossy().to_string(), links))
 }
 
 pub fn move_notebook(
     vault_path: &str,
     notebook_path: &str,
     dest_parent: &str,
-) -> Result<String, String> {
+) -> Result<(String, LinkRewrite), String> {
     let validated = ensure_notebook_path(vault_path, Path::new(notebook_path))?;
     let src = validated.as_path();
 
@@ -1642,12 +2335,13 @@ pub fn move_notebook(
     // Destination reservation is performed atomically by move_notebook_with_icons.
 
     move_notebook_with_icons(vault_path, src, &dest)?;
-    Ok(dest.to_string_lossy().to_string())
+    let links = update_links_after_moves(vault_path, &notes_moved_with_notebook(src, &dest));
+    Ok((dest.to_string_lossy().to_string(), links))
 }
 
 /// Remove a directory inside trash if it's empty (after restoring/deleting its last note).
 fn cleanup_empty_trash_dir(vault_path: &str, dir: Option<&Path>) {
-    let trash_dir = cuelm_dir(vault_path).join("trash");
+    let trash_dir = helixnotes_dir(vault_path).join("trash");
     if let Some(d) = dir {
         if d != trash_dir && d.starts_with(&trash_dir) {
             if let Ok(mut entries) = fs::read_dir(d) {
@@ -1660,7 +2354,7 @@ fn cleanup_empty_trash_dir(vault_path: &str, dir: Option<&Path>) {
 }
 
 pub fn get_trash_contents(vault_path: &str) -> Result<TrashContents, String> {
-    let trash_dir = cuelm_dir(vault_path).join("trash");
+    let trash_dir = helixnotes_dir(vault_path).join("trash");
     if !trash_dir.exists() {
         return Ok(TrashContents {
             notes: Vec::new(),
@@ -1812,7 +2506,7 @@ pub fn permanent_delete(vault_path: &str, path: &str) -> Result<(), String> {
 }
 
 pub fn empty_trash(vault_path: &str) -> Result<(), String> {
-    let trash_dir = cuelm_dir(vault_path).join("trash");
+    let trash_dir = helixnotes_dir(vault_path).join("trash");
     if trash_dir.exists() {
         fs::remove_dir_all(&trash_dir).map_err(|e| e.to_string())?;
         fs::create_dir_all(&trash_dir).map_err(|e| e.to_string())?;
@@ -1821,7 +2515,7 @@ pub fn empty_trash(vault_path: &str) -> Result<(), String> {
 }
 
 pub fn load_vault_state(vault_path: &str) -> Result<VaultState, String> {
-    let state_path = cuelm_dir(vault_path).join("state.json");
+    let state_path = helixnotes_dir(vault_path).join("state.json");
     if state_path.exists() {
         let data = fs::read_to_string(&state_path).map_err(|e| e.to_string())?;
         serde_json::from_str(&data).map_err(|e| e.to_string())
@@ -1831,35 +2525,29 @@ pub fn load_vault_state(vault_path: &str) -> Result<VaultState, String> {
 }
 
 pub fn save_vault_state(vault_path: &str, state: &VaultState) -> Result<(), String> {
-    let state_path = cuelm_dir(vault_path).join("state.json");
+    let state_path = helixnotes_dir(vault_path).join("state.json");
     let data = serde_json::to_string_pretty(state).map_err(|e| e.to_string())?;
     replace_file_atomically(&state_path, data.as_bytes())
 }
 
 pub fn get_all_tags(vault_path: &str) -> Result<Vec<(String, usize)>, String> {
-    let hn_dir = cuelm_dir(vault_path);
+    let hn_dir = helixnotes_dir(vault_path);
     let md_files: Vec<PathBuf> = WalkDir::new(vault_path)
         .into_iter()
+        .filter_entry(|entry| entry.depth() == 0 || entry.path() != hn_dir.as_path())
         .filter_map(|e| e.ok())
         .filter(|e| {
             let p = e.path();
-            p.is_file()
-                && p.extension().and_then(|x| x.to_str()) == Some("md")
-                && !is_hidden(p)
-                && !p.starts_with(&hn_dir)
+            p.is_file() && p.extension().and_then(|x| x.to_str()) == Some("md") && !is_hidden(p)
         })
         .map(|e| e.path().to_path_buf())
         .collect();
 
-    // Read frontmatter in parallel (only need tags, so partial read is fine)
+    // Read frontmatter in parallel (only need tags, so the body is not read)
     let all_tags: Vec<Vec<String>> = md_files
         .par_iter()
         .filter_map(|path| {
-            let mut file = fs::File::open(path).ok()?;
-            let mut buf = vec![0u8; 1024]; // Tags are in frontmatter, 1KB is plenty
-            let n = file.read(&mut buf).ok()?;
-            buf.truncate(n);
-            let raw = String::from_utf8_lossy(&buf);
+            let raw = read_note_head(path).ok()?;
             let filename = path.file_name()?.to_string_lossy().to_string();
             let (meta, _) = frontmatter::parse_note(&raw, &filename);
             Some(meta.tags)
@@ -1883,7 +2571,7 @@ pub fn save_image(vault_path: &str, name: &str, data: &[u8]) -> Result<String, S
 }
 
 pub fn save_attachment(vault_path: &str, name: &str, data: &[u8]) -> Result<String, String> {
-    let attachments_dir = cuelm_dir(vault_path).join("attachments");
+    let attachments_dir = helixnotes_dir(vault_path).join("attachments");
     fs::create_dir_all(&attachments_dir).map_err(|e| e.to_string())?;
 
     let safe_name = sanitize_filename(name);
@@ -1901,7 +2589,7 @@ pub fn save_attachment(vault_path: &str, name: &str, data: &[u8]) -> Result<Stri
         .map_err(|error| error.to_string())?;
     loop {
         let filename = format!("{}_{}", Uuid::new_v4(), safe_name);
-        match temporary.persist_noclobber(attachments_dir.join(&filename)) {
+        match persist_without_replacing(temporary, attachments_dir.join(&filename)) {
             Ok(_) => return Ok(format!(".cuelm/attachments/{filename}")),
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
                 temporary = error.file;
@@ -1911,6 +2599,256 @@ pub fn save_attachment(vault_path: &str, name: &str, data: &[u8]) -> Result<Stri
     }
 }
 
+#[derive(Debug, serde::Deserialize)]
+pub struct ExternalNoteReference {
+    pub from: usize,
+    pub to: usize,
+    pub href: String,
+    pub html: bool,
+    #[serde(default)]
+    pub pdf: bool,
+}
+
+/// Import an accepted Markdown snapshot and its scoped relative attachments without overwriting files.
+pub fn import_note(
+    vault_path: &str,
+    source_path: &str,
+    source_root: &Path,
+    notebook_relative: Option<&str>,
+    expected_raw: &str,
+    mut references: Vec<ExternalNoteReference>,
+    authorize: impl Fn(&Path) -> Result<(), String>,
+) -> Result<NoteContent, String> {
+    let source = canonicalize_path(Path::new(source_path), "source note")?;
+    authorize(&source)?;
+    if !source.is_file() || source.extension().and_then(|ext| ext.to_str()) != Some("md") {
+        return Err("Import source must be a Markdown file".into());
+    }
+    let source_root = canonicalize_path(source_root, "source attachment root")?;
+    if !source.starts_with(&source_root) {
+        return Err("Source attachment root does not own the note".into());
+    }
+    let source_attachments = source_root.join(".cuelm/attachments");
+    let raw = fs::read_to_string(&source).map_err(|error| error.to_string())?;
+    if raw != expected_raw {
+        return Err("The source note changed on disk. Reopen it before importing.".into());
+    }
+    let relative = notebook_relative.map(safe_relative_path).transpose()?;
+    let directory = Path::new(vault_path).join(relative.unwrap_or(Path::new("")));
+    ensure_vault_content_dir(vault_path, &directory)?;
+    let vault = canonicalize_path(Path::new(vault_path), "vault path")?;
+    let canonical_directory = canonicalize_path(&directory, "import destination")?;
+    if canonical_directory != vault.join(relative.unwrap_or(Path::new(""))) {
+        return Err("Import destination must not use symbolic links".into());
+    }
+    let attachments = helixnotes_dir(vault_path).join("attachments");
+    references.sort_by_key(|reference| reference.from);
+    let mut previous = 0;
+    let mut targets = Vec::new();
+    // Validate every range and permission before publishing any attachment.
+    for reference in &references {
+        if reference.from < previous
+            || reference.from >= reference.to
+            || raw.get(reference.from..reference.to).is_none()
+        {
+            return Err("Invalid attachment reference range".into());
+        }
+        previous = reference.to;
+        let (path, suffix) = reference
+            .href
+            .find(['#', '?'])
+            .map(|index| reference.href.split_at(index))
+            .unwrap_or((&reference.href, ""));
+        let decoded = urlencoding::decode(path)
+            .map_err(|error| error.to_string())?
+            .replace('\\', "/");
+        let path = Path::new(&decoded);
+        if decoded.is_empty()
+            || decoded.contains(':')
+            || path.is_absolute()
+            || path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+        {
+            return Err("Import attachments must be relative non-Markdown files".into());
+        }
+        let base = if decoded.starts_with(".cuelm/attachments/") || reference.pdf {
+            source_root.as_path()
+        } else {
+            source.parent().ok_or("Source note has no parent")?
+        };
+        let target = canonicalize_path(&base.join(path), "attachment")?;
+        authorize(&target)?;
+        let relative_target = if let Ok(relative) = target.strip_prefix(&source_attachments) {
+            relative
+        } else {
+            target.strip_prefix(source.parent().ok_or("Source note has no parent")?)
+                .map_err(|_| "Attachments must stay inside the source note's folder or managed attachment root")?
+        };
+        let components: Vec<_> = relative_target.components().collect();
+        let helix_attachment = components
+            .first()
+            .is_some_and(|part| part.as_os_str() == ".cuelm")
+            && components
+                .get(1)
+                .is_some_and(|part| part.as_os_str() == "attachments");
+        if components.iter().enumerate().any(|(index, part)| {
+            part.as_os_str().to_string_lossy().starts_with('.') && !(helix_attachment && index == 0)
+        }) {
+            return Err("Hidden metadata is not imported as an attachment".into());
+        }
+        if !target.is_file() {
+            return Err("Attachment reference must point to a file".into());
+        }
+        targets.push((target, suffix.to_string()));
+    }
+    if !references.is_empty() {
+        fs::create_dir_all(&attachments).map_err(|error| error.to_string())?;
+        if canonicalize_path(&attachments, "attachment destination")?
+            != vault.join(".cuelm/attachments")
+        {
+            return Err("Attachment destination must not use symbolic links".into());
+        }
+    }
+    let mut created = Vec::new();
+    let result = (|| {
+        let mut copied = std::collections::HashMap::<PathBuf, String>::new();
+        let mut rewritten = String::with_capacity(raw.len());
+        let mut previous = 0;
+        for (reference, (target, suffix)) in references.iter().zip(targets) {
+            let relative = if let Some(relative) = copied.get(&target) {
+                relative.clone()
+            } else {
+                let name = sanitize_filename(
+                    &target
+                        .file_name()
+                        .ok_or("Attachment has no filename")?
+                        .to_string_lossy(),
+                );
+                let mut temporary = tempfile::Builder::new()
+                    .prefix(".cuelm-import-")
+                    .tempfile_in(&attachments)
+                    .map_err(|error| error.to_string())?;
+                let mut file = fs::File::open(&target).map_err(|error| error.to_string())?;
+                let before = file.metadata().map_err(|error| error.to_string())?;
+                let bytes = std::io::copy(&mut file, temporary.as_file_mut())
+                    .map_err(|error| error.to_string())?;
+                let after = file.metadata().map_err(|error| error.to_string())?;
+                if bytes != before.len()
+                    || before.len() != after.len()
+                    || before.modified().ok() != after.modified().ok()
+                {
+                    return Err("An attachment changed while importing. Retry the import.".into());
+                }
+                temporary
+                    .as_file()
+                    .sync_all()
+                    .map_err(|error| error.to_string())?;
+                let filename = loop {
+                    let filename = format!("{}_{}", Uuid::new_v4(), name);
+                    let destination = attachments.join(&filename);
+                    match persist_without_replacing(temporary, &destination) {
+                        Ok(_) => {
+                            created.push(destination);
+                            break filename;
+                        }
+                        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            temporary = error.file
+                        }
+                        Err(error) => return Err(error.error.to_string()),
+                    }
+                };
+                let relative =
+                    format!(".cuelm/attachments/{}", urlencoding::encode(&filename));
+                copied.insert(target, relative.clone());
+                relative
+            };
+            // Use the same stable vault-root convention as normal attachment insertion/saving.
+            let mut href = format!("{relative}{suffix}");
+            if reference.html {
+                href = href
+                    .replace('&', "&amp;")
+                    .replace('"', "&quot;")
+                    .replace('\'', "&#39;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;");
+            } else {
+                href = href
+                    .replace(' ', "%20")
+                    .replace('"', "%22")
+                    .replace('<', "%3C")
+                    .replace('>', "%3E");
+            }
+            rewritten.push_str(&raw[previous..reference.from]);
+            rewritten.push_str(&href);
+            previous = reference.to;
+        }
+        rewritten.push_str(&raw[previous..]);
+        let filename = source.file_name().ok_or("Source note has no filename")?;
+        let mut temporary = tempfile::Builder::new()
+            .prefix(".cuelm-import-")
+            .tempfile_in(&directory)
+            .map_err(|error| error.to_string())?;
+        temporary
+            .write_all(rewritten.as_bytes())
+            .map_err(|error| error.to_string())?;
+        temporary
+            .as_file()
+            .sync_all()
+            .map_err(|error| error.to_string())?;
+        let mut destination = directory.join(filename);
+        let mut suffix = 2;
+        loop {
+            match persist_without_replacing(temporary, &destination) {
+                Ok(_) => break,
+                Err(error)
+                    if error.error.kind() == std::io::ErrorKind::AlreadyExists && suffix <= 100 =>
+                {
+                    temporary = error.file;
+                    destination = directory.join(format!(
+                        "{} ({suffix}).md",
+                        source.file_stem().unwrap_or_default().to_string_lossy()
+                    ));
+                    suffix += 1;
+                }
+                Err(error) => return Err(error.error.to_string()),
+            }
+        }
+        let (meta, content) = frontmatter::parse_note(
+            &rewritten,
+            &destination
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
+        );
+        Ok(NoteContent {
+            path: destination.to_string_lossy().into_owned(),
+            meta,
+            content,
+            raw: rewritten,
+        })
+    })();
+    if let Err(error) = result {
+        let mut failed_cleanup = Vec::new();
+        for path in created {
+            if let Err(cleanup) = fs::remove_file(&path) {
+                if cleanup.kind() != std::io::ErrorKind::NotFound {
+                    failed_cleanup.push(format!("{}: {cleanup}", path.display()));
+                }
+            }
+        }
+        if !failed_cleanup.is_empty() {
+            return Err(format!(
+                "{error}; could not remove unused attachments: {}",
+                failed_cleanup.join("; ")
+            ));
+        }
+        return Err(error);
+    }
+    result
+}
+
 pub(crate) fn normalize_notebook_icon_key(path: &str) -> String {
     path.replace('\\', "/")
 }
@@ -1918,7 +2856,7 @@ pub(crate) fn normalize_notebook_icon_key(path: &str) -> String {
 pub fn load_notebook_icons(
     vault_path: &str,
 ) -> Result<std::collections::HashMap<String, String>, String> {
-    let icons_path = cuelm_dir(vault_path).join("notebook_icons.json");
+    let icons_path = helixnotes_dir(vault_path).join("notebook_icons.json");
     let data = match fs::read_to_string(&icons_path) {
         Ok(data) => data,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1956,7 +2894,7 @@ fn save_notebook_icons(
     vault_path: &str,
     icons: &std::collections::HashMap<String, String>,
 ) -> Result<(), String> {
-    let dir = cuelm_dir(vault_path);
+    let dir = helixnotes_dir(vault_path);
     fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
     let data = serde_json::to_vec_pretty(icons).map_err(|error| error.to_string())?;
     replace_file_atomically(&dir.join("notebook_icons.json"), &data)
@@ -2065,7 +3003,7 @@ pub fn import_tag_icon(
 }
 
 fn tag_styles_path(vault_path: &str) -> PathBuf {
-    cuelm_dir(vault_path).join("tag_styles.json")
+    helixnotes_dir(vault_path).join("tag_styles.json")
 }
 
 fn normalize_tag_style_key(tag: &str) -> String {
@@ -2153,7 +3091,7 @@ pub fn patch_tag_style(
         styles.insert(stored_key, style.clone());
     }
 
-    let dir = cuelm_dir(vault_path);
+    let dir = helixnotes_dir(vault_path);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let data = serde_json::to_string_pretty(&styles).map_err(|e| e.to_string())?;
     replace_file_atomically(&tag_styles_path(vault_path), data.as_bytes())?;
@@ -2253,7 +3191,7 @@ fn move_note_with_quick_access(
 }
 
 pub fn load_quick_access(vault_path: &str) -> Result<Vec<String>, String> {
-    let qa_path = cuelm_dir(vault_path).join("quick_access.json");
+    let qa_path = helixnotes_dir(vault_path).join("quick_access.json");
     if qa_path.exists() {
         let data = fs::read_to_string(&qa_path).map_err(|e| e.to_string())?;
         serde_json::from_str(&data).map_err(|e| e.to_string())
@@ -2263,7 +3201,7 @@ pub fn load_quick_access(vault_path: &str) -> Result<Vec<String>, String> {
 }
 
 pub fn save_quick_access(vault_path: &str, paths: &[String]) -> Result<(), String> {
-    let qa_path = cuelm_dir(vault_path).join("quick_access.json");
+    let qa_path = helixnotes_dir(vault_path).join("quick_access.json");
     let data = serde_json::to_string_pretty(paths).map_err(|e| e.to_string())?;
     replace_file_atomically(&qa_path, data.as_bytes())
 }
@@ -2366,16 +3304,467 @@ pub fn sanitize_filename(name: &str) -> String {
 }
 
 #[cfg(test)]
+mod rename_link_tests {
+    use super::*;
+
+    #[test]
+    fn renaming_and_retitling_keep_a_single_title_heading() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().to_str().unwrap();
+        let note = vault.path().join("Alpha.md");
+        fs::write(
+            &note,
+            "---\nid: the-id\ntitle: Alpha\n---\n# Alpha\n\nText.\n",
+        )
+        .unwrap();
+
+        // Renamed twice from the sidebar: the heading follows, nothing stacks.
+        let renamed = rename_note(note.to_str().unwrap(), "Beta", root).unwrap();
+        let renamed = rename_note(&renamed.path, "Gamma", root).unwrap();
+        let raw = fs::read_to_string(&renamed.path).unwrap();
+        assert!(raw.trim_end().ends_with("---\n# Gamma\n\nText."), "{raw}");
+        assert_eq!(raw.matches("\n# ").count(), 1, "{raw}");
+
+        // A heading the user worded differently is theirs and stays.
+        let other = vault.path().join("Other.md");
+        fs::write(
+            &other,
+            "---\nid: other\ntitle: Other\n---\n# My own heading\n\nText.\n",
+        )
+        .unwrap();
+        let renamed = rename_note(other.to_str().unwrap(), "Renamed", root).unwrap();
+        let raw = fs::read_to_string(&renamed.path).unwrap();
+        assert!(
+            raw.trim_end().ends_with("---\n# My own heading\n\nText."),
+            "{raw}"
+        );
+
+        // The save path: a body still carrying the old title's heading is retitled with the title.
+        assert_eq!(
+            retitle_leading_heading("# Gamma\n\nText.\n", "Gamma", "Delta"),
+            "# Delta\n\nText.\n"
+        );
+        assert_eq!(
+            retitle_leading_heading("# Gamma\n\nText.\n", "Gamma", "Gamma"),
+            "# Gamma\n\nText.\n"
+        );
+        assert_eq!(
+            retitle_leading_heading("# Mine\n\nText.\n", "Gamma", "Delta"),
+            "# Mine\n\nText.\n"
+        );
+    }
+
+    // The same cases are checked against the editor's copy of these rules in renamedLinks.ts.
+    #[test]
+    fn shared_rename_cases_rewrite_links_like_the_editor() {
+        let fixtures: Vec<serde_json::Value> =
+            serde_json::from_str(include_str!("../../../tests/fixtures/renamed-links.json"))
+                .unwrap();
+        assert!(!fixtures.is_empty());
+        for fixture in fixtures {
+            let list = match fixture.get("renames") {
+                Some(list) => list.as_array().unwrap().clone(),
+                None => vec![fixture["rename"].clone()],
+            };
+            let rules = super::LinkRenames::new(
+                list.iter()
+                    .map(|rename| {
+                        let text = |key: &str| rename[key].as_str().unwrap().to_string();
+                        super::LinkRename {
+                            old_ref: text("old_ref"),
+                            new_ref: text("new_ref"),
+                            old_title: text("old_title"),
+                            new_title: text("new_title"),
+                            title_rules: rename["title_rules"].as_bool().unwrap(),
+                            file_rules: rename["file_rules"].as_bool().unwrap_or(false),
+                        }
+                    })
+                    .collect(),
+            );
+            assert_eq!(
+                super::rewrite_renamed_links(
+                    fixture["input"].as_str().unwrap(),
+                    &rules,
+                    fixture["note_dir"].as_str().unwrap(),
+                    None
+                ),
+                fixture["expected"].as_str().unwrap(),
+                "{}",
+                fixture["name"]
+            );
+        }
+    }
+
+    #[test]
+    fn moving_notes_and_notebooks_keeps_path_links_working() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        let vault_path = root.to_str().unwrap();
+        for dir in ["Work", "Other", "Archive"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let write = |rel: &str, body: &str| fs::write(root.join(rel), body).unwrap();
+        let read = |rel: &str| fs::read_to_string(root.join(rel)).unwrap();
+        write(
+            "Work/Plan.md",
+            "# Plan\n[s](Sibling.md) [o](../Other/Linking.md#Top) ![](../.cuelm/attachments/a.png) [w](https://example.com/x.md) [gone](Missing.md)\n",
+        );
+        write(
+            "Work/Sibling.md",
+            "# Sibling\n[p](Plan.md) [[Work/Plan]] [[Plan]]\n",
+        );
+        write(
+            "Other/Linking.md",
+            "# Linking\n[[Work/Plan#Goals|g]] [a](../Work/Plan.md) [b](Plan.md) [r](/Work/Plan.md) `[[Work/Plan]]`\n",
+        );
+
+        let (moved, links) = super::move_note(
+            vault_path,
+            root.join("Work/Plan.md").to_str().unwrap(),
+            root.join("Archive").to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(moved.ends_with("Archive/Plan.md"));
+        assert_eq!(links.notes.len(), 3);
+        // The moved note's own relative links point from its new folder; the rest stays.
+        assert_eq!(
+            read("Archive/Plan.md"),
+            "# Plan\n[s](../Work/Sibling.md) [o](../Other/Linking.md#Top) ![](../.cuelm/attachments/a.png) [w](https://example.com/x.md) [gone](Missing.md)\n"
+        );
+        // A bare name in the old folder becomes a path; title links still find the note.
+        assert_eq!(
+            read("Work/Sibling.md"),
+            "# Sibling\n[p](../Archive/Plan.md) [[Archive/Plan]] [[Plan]]\n"
+        );
+        assert_eq!(
+            read("Other/Linking.md"),
+            "# Linking\n[[Archive/Plan#Goals|g]] [a](../Archive/Plan.md) [b](Plan.md) [r](/Archive/Plan.md) `[[Work/Plan]]`\n"
+        );
+
+        let (renamed, links) =
+            super::rename_notebook(vault_path, root.join("Work").to_str().unwrap(), "Projects")
+                .unwrap();
+        assert!(renamed.ends_with("Projects"));
+        assert_eq!(links.renames.len(), 1);
+        assert_eq!(
+            read("Archive/Plan.md"),
+            "# Plan\n[s](../Projects/Sibling.md) [o](../Other/Linking.md#Top) ![](../.cuelm/attachments/a.png) [w](https://example.com/x.md) [gone](Missing.md)\n"
+        );
+        // Links between notes that moved together still work as they are.
+        assert_eq!(
+            read("Projects/Sibling.md"),
+            "# Sibling\n[p](../Archive/Plan.md) [[Archive/Plan]] [[Plan]]\n"
+        );
+
+        fs::create_dir_all(root.join("Group")).unwrap();
+        write(
+            "Other/Index.md",
+            "[[Projects/Sibling]] [s](../Projects/Sibling.md)\n",
+        );
+        super::move_notebook(
+            vault_path,
+            root.join("Projects").to_str().unwrap(),
+            root.join("Group").to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            read("Other/Index.md"),
+            "[[Group/Projects/Sibling]] [s](../Group/Projects/Sibling.md)\n"
+        );
+        assert_eq!(
+            read("Group/Projects/Sibling.md"),
+            "# Sibling\n[p](../../Archive/Plan.md) [[Archive/Plan]] [[Plan]]\n"
+        );
+    }
+
+    // Renaming through the title field saves the new title first and renames the file after.
+    #[test]
+    fn a_rename_after_the_title_was_saved_still_updates_links_by_the_old_name() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        let old_path = root.join("Old Plan.md");
+        fs::write(&old_path, "---\ntitle: New Plan\n---\n# New Plan\n").unwrap();
+        let linking = root.join("Linking.md");
+        fs::write(
+            &linking,
+            "[[Old Plan]] [[Old Plan#Goals|Old Plan]] [a](Old%20Plan.md)\n",
+        )
+        .unwrap();
+        let renamed = super::rename_note(
+            old_path.to_str().unwrap(),
+            "New Plan",
+            root.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(renamed.old_title, "Old Plan");
+        assert_eq!(
+            fs::read_to_string(&linking).unwrap(),
+            "[[New Plan]] [[New Plan#Goals|New Plan]] [a](New%20Plan.md)\n"
+        );
+    }
+
+    #[test]
+    fn a_rename_reaches_links_in_other_folders_and_leaves_lookalikes() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        fs::create_dir_all(root.join("Work")).unwrap();
+        fs::create_dir_all(root.join("Other")).unwrap();
+        let old_path = root.join("Work/Old Plan.md");
+        fs::write(&old_path, "---\ntitle: Old Plan\n---\n# Old Plan\n").unwrap();
+        let linking = root.join("Other/Linking.md");
+        fs::write(
+            &linking,
+            "[[Old Plan#Goals]] [[old plan]] [a](../Work/Old%20Plan.md) [b](Old%20Plan.md)\n`[[Old Plan]]`\n",
+        )
+        .unwrap();
+        let renamed = super::rename_note(
+            old_path.to_str().unwrap(),
+            "New Plan",
+            root.to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(renamed.links.renames[0].title_rules && renamed.links.renames[0].file_rules);
+        assert_eq!(
+            fs::read_to_string(&linking).unwrap(),
+            "[[New Plan#Goals]] [[New Plan]] [a](../Work/New%20Plan.md) [b](New%20Plan.md)\n`[[Old Plan]]`\n"
+        );
+
+        // Another note with the same name elsewhere: only links with a path follow.
+        fs::write(root.join("Other/Plan B.md"), "# Plan B\n").unwrap();
+        fs::write(root.join("Plan B.md"), "# Plan B\n").unwrap();
+        fs::write(
+            &linking,
+            "[[Plan B]] [a](Plan%20B.md) [b](../Plan%20B.md)\n",
+        )
+        .unwrap();
+        let renamed = super::rename_note(
+            root.join("Plan B.md").to_str().unwrap(),
+            "Plan C",
+            root.to_str().unwrap(),
+        )
+        .unwrap();
+        assert!(!renamed.links.renames[0].title_rules && !renamed.links.renames[0].file_rules);
+        assert_eq!(
+            fs::read_to_string(&linking).unwrap(),
+            "[[Plan B]] [a](Plan%20B.md) [b](../Plan%20C.md)\n"
+        );
+    }
+
+    #[test]
+    fn a_rename_updates_links_to_the_note_and_leaves_other_aliases_alone() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path().to_str().unwrap();
+        let linking = vault.path().join("Linking.md");
+        fs::write(
+            &linking,
+            "See [[Home]], [[Home|the start page]] and [[Home|Home]].\nAlso [[Index|Home]] and [[Notes/Home|Home]].\n\n| a | b |\n| --- | --- |\n| [[Home\\|Home]] | [[Home\\|start]] and [[Index\\|Home]] |\n",
+        )
+        .unwrap();
+        let untouched = vault.path().join("Untouched.md");
+        fs::write(&untouched, "No links here.\n").unwrap();
+        let before = fs::metadata(&untouched).unwrap().modified().unwrap();
+        let new_path = vault.path().join("Start.md");
+        fs::write(&new_path, "# Start\n").unwrap();
+
+        let original = fs::read_to_string(&linking).unwrap();
+        let rewrite = update_wikilinks_after_rename(
+            root,
+            vault.path().join("Home.md").to_str().unwrap(),
+            new_path.to_str().unwrap(),
+            "Home",
+            "Start",
+        );
+        // Only the note that changed is reported, with what it held before and after.
+        assert_eq!(rewrite.notes.len(), 1);
+        assert_eq!(rewrite.notes[0].path, linking.to_str().unwrap());
+        assert_eq!(rewrite.notes[0].old_raw, original);
+        assert_eq!(
+            rewrite.notes[0].new_raw,
+            fs::read_to_string(&linking).unwrap()
+        );
+        assert!(rewrite.renames[0].title_rules);
+        assert_eq!(
+            (
+                rewrite.renames[0].old_ref.as_str(),
+                rewrite.renames[0].new_ref.as_str()
+            ),
+            ("Home", "Start")
+        );
+
+        assert_eq!(
+            fs::read_to_string(&linking).unwrap(),
+            // The alias on the link to Index, and on the link to another note called Home in a
+            // folder, is not this note's title and stays.
+            "See [[Start]], [[Start|the start page]] and [[Start|Start]].\nAlso [[Index|Home]] and [[Notes/Home|Home]].\n\n| a | b |\n| --- | --- |\n| [[Start\\|Start]] | [[Start\\|start]] and [[Index\\|Home]] |\n"
+        );
+        assert_eq!(
+            fs::metadata(&untouched).unwrap().modified().unwrap(),
+            before
+        );
+        // Nothing is left behind by the one-step replacement.
+        let names: Vec<_> = fs::read_dir(vault.path())
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names.len(), 3, "{names:?}");
+    }
+}
+
+#[cfg(test)]
+mod exclusive_rename_fallback_tests {
+    use super::{
+        exclusive_rename_unsupported, persist_without_replacing, rename_after_checking,
+        rename_exclusive,
+    };
+    use std::fs;
+    use std::io::{Error, ErrorKind, Write};
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_missing_exclusive_rename_counts_as_unsupported() {
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let (unsupported, exists) = (45, 17);
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        let (unsupported, exists) = (95, 17);
+        assert!(exclusive_rename_unsupported(&Error::from_raw_os_error(
+            unsupported
+        )));
+        assert!(exclusive_rename_unsupported(&Error::from_raw_os_error(22)));
+        assert!(!exclusive_rename_unsupported(&Error::from_raw_os_error(
+            exists
+        )));
+        assert!(!exclusive_rename_unsupported(&Error::from_raw_os_error(13)));
+        // An error that did not come from the system, such as a path with a NUL byte.
+        assert!(!exclusive_rename_unsupported(&Error::from(
+            ErrorKind::InvalidInput
+        )));
+    }
+
+    #[test]
+    fn the_fallback_moves_a_file_but_never_onto_an_existing_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, c) = (
+            dir.path().join("a"),
+            dir.path().join("b"),
+            dir.path().join("c"),
+        );
+        fs::write(&a, "a").unwrap();
+        fs::write(&b, "b").unwrap();
+        let refused = rename_after_checking(&a, &b).unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&b).unwrap(), "b");
+        rename_after_checking(&a, &c).unwrap();
+        assert!(!a.exists());
+        assert_eq!(fs::read_to_string(&c).unwrap(), "a");
+        // A folder moves the same way.
+        let (folder, moved) = (dir.path().join("folder"), dir.path().join("moved"));
+        fs::create_dir(&folder).unwrap();
+        fs::write(folder.join("note.md"), "x").unwrap();
+        rename_after_checking(&folder, &moved).unwrap();
+        assert_eq!(fs::read_to_string(moved.join("note.md")).unwrap(), "x");
+    }
+
+    #[test]
+    fn publishing_and_renaming_still_refuse_an_existing_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("kept.md");
+        fs::write(&target, "kept").unwrap();
+        let mut temporary = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+        temporary.write_all(b"new").unwrap();
+        let error = persist_without_replacing(temporary, &target).unwrap_err();
+        assert_eq!(error.error.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "kept");
+        persist_without_replacing(error.file, dir.path().join("new.md")).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("new.md")).unwrap(),
+            "new"
+        );
+
+        let source = dir.path().join("source.md");
+        fs::write(&source, "source").unwrap();
+        let refused = rename_exclusive(&source, &target).unwrap_err();
+        assert_eq!(refused.kind(), ErrorKind::AlreadyExists);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "kept");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         compare_natural_names, create_notebook, duplicate_note, get_note_switcher_titles,
-        cuelm_dir, load_notebook_icons, load_tag_styles, patch_tag_style, permanent_delete,
+        helixnotes_dir, load_notebook_icons, load_tag_styles, patch_tag_style, permanent_delete,
         read_note, replace_file_atomically, restore_notebook, save_note, scan_notebooks,
         set_notebook_icon,
     };
     use crate::types::{TagStyle, TagStyleChange};
     use std::fs;
     use std::io::Read;
+
+    #[test]
+    fn all_tags_excludes_only_root_metadata_subtree_and_hidden_filenames() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join(".cuelm");
+        let fixtures = [
+            ("Root.md", "root"),
+            (".cuelm/history/Stored.md", "excluded"),
+            ("Notebook/.cuelm/Nested.md", "nested"),
+            (".cuelm-other/Visible.md", "similar"),
+            (".obsidian/Visible.md", "obsidian"),
+            ("assets/Visible.md", "assets"),
+            (".other/Visible.md", "other"),
+            ("Notebook/.Hidden.md", "hidden"),
+            ("Notebook/Upper.MD", "uppercase"),
+            ("Notebook/other.txt", "text"),
+        ];
+        for (relative, tag) in fixtures {
+            let path = root.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, format!("---\ntags: [{tag}]\n---\n# Note")).unwrap();
+        }
+
+        assert_eq!(
+            super::get_all_tags(root.to_str().unwrap()).unwrap(),
+            vec![
+                ("assets".to_string(), 1),
+                ("nested".to_string(), 1),
+                ("obsidian".to_string(), 1),
+                ("other".to_string(), 1),
+                ("root".to_string(), 1),
+                ("similar".to_string(), 1),
+            ]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn all_tags_keeps_file_symlinks_without_following_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+        let vault = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(
+            outside.path().join("External.md"),
+            "---\ntags: [linked]\n---\n# Note",
+        )
+        .unwrap();
+        symlink(
+            outside.path().join("External.md"),
+            vault.path().join("Linked.md"),
+        )
+        .unwrap();
+        symlink(outside.path(), vault.path().join("Directory")).unwrap();
+        fs::create_dir(vault.path().join(".cuelm")).unwrap();
+        symlink(
+            outside.path().join("External.md"),
+            vault.path().join(".cuelm/Excluded.md"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            super::get_all_tags(vault.path().to_str().unwrap()).unwrap(),
+            vec![("linked".to_string(), 1)]
+        );
+    }
 
     #[test]
     fn same_named_attachment_writes_never_replace_each_other() {
@@ -2411,8 +3800,8 @@ mod tests {
         super::ensure_vault_structure(path).unwrap();
         set_notebook_icon(path, "Book", Some("builtin:folder")).unwrap();
         patch_tag_style(path, "Work", TagStyleChange::Color(Some("#123456".into()))).unwrap();
-        let icons_path = cuelm_dir(path).join("notebook_icons.json");
-        let styles_path = cuelm_dir(path).join("tag_styles.json");
+        let icons_path = helixnotes_dir(path).join("notebook_icons.json");
+        let styles_path = helixnotes_dir(path).join("tag_styles.json");
         let icons_before = fs::read(&icons_path).unwrap();
         let styles_before = fs::read(&styles_path).unwrap();
         let mut icons_reader = fs::File::open(&icons_path).unwrap();
@@ -2447,7 +3836,7 @@ mod tests {
             let path = vault.path().to_str().unwrap();
             super::ensure_vault_structure(path).unwrap();
             let original = super::save_attachment(path, "same.png", b"keep").unwrap();
-            fs::write(cuelm_dir(path).join(mapping), b"{broken").unwrap();
+            fs::write(helixnotes_dir(path).join(mapping), b"{broken").unwrap();
             let result = if mapping == "notebook_icons.json" {
                 super::import_notebook_icon(path, "Book", "same.png", b"reject")
             } else {
@@ -2456,13 +3845,13 @@ mod tests {
             };
             assert!(result.is_err());
             assert_eq!(fs::read(vault.path().join(&original)).unwrap(), b"keep");
-            let remaining: Vec<_> = fs::read_dir(cuelm_dir(path).join("attachments"))
+            let remaining: Vec<_> = fs::read_dir(helixnotes_dir(path).join("attachments"))
                 .unwrap()
                 .map(|entry| entry.unwrap().path())
                 .collect();
             assert_eq!(remaining, vec![vault.path().join(original)]);
             assert_eq!(
-                fs::read(cuelm_dir(path).join(mapping)).unwrap(),
+                fs::read(helixnotes_dir(path).join(mapping)).unwrap(),
                 b"{broken"
             );
         }
@@ -2477,7 +3866,7 @@ mod tests {
         let note = super::create_note(path, Some("Book"), "Keep").unwrap();
         let before = fs::read(&note.path).unwrap();
         let destination = create_notebook(path, None, "Archive").unwrap();
-        fs::write(cuelm_dir(path).join("notebook_icons.json"), b"{broken").unwrap();
+        fs::write(helixnotes_dir(path).join("notebook_icons.json"), b"{broken").unwrap();
         assert!(super::rename_notebook(path, &notebook.path, "Renamed").is_err());
         assert!(super::move_notebook(path, &notebook.path, &destination.path).is_err());
         assert_eq!(fs::read(&note.path).unwrap(), before);
@@ -2494,7 +3883,7 @@ mod tests {
         super::ensure_vault_structure(path).unwrap();
         let notebook = create_notebook(path, None, "Book").unwrap();
         set_notebook_icon(path, "Book", Some("builtin:folder")).unwrap();
-        let mapping = cuelm_dir(path).join("notebook_icons.json");
+        let mapping = helixnotes_dir(path).join("notebook_icons.json");
         let before = fs::read(&mapping).unwrap();
         fs::set_permissions(&mapping, fs::Permissions::from_mode(0o440)).unwrap();
         assert!(set_notebook_icon(path, "Book", Some("builtin:star")).is_err());
@@ -2519,7 +3908,7 @@ mod tests {
     #[test]
     fn sorts_notebooks_with_numeric_names_naturally() {
         let vault =
-            std::env::temp_dir().join(format!("cuelm-natural-sort-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("helixnotes-natural-sort-test-{}", Uuid::new_v4()));
         let nested = vault.join("Classes");
         fs::create_dir_all(&nested).unwrap();
         let expected = ["5g", "6g", "7g", "8g", "9g", "10g", "11g", "12g"];
@@ -2551,13 +3940,13 @@ mod tests {
     #[test]
     fn persists_and_removes_builtin_notebook_icons() {
         let vault =
-            std::env::temp_dir().join(format!("cuelm-notebook-icon-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("helixnotes-notebook-icon-test-{}", Uuid::new_v4()));
         let vault_path = vault.to_string_lossy();
-        fs::create_dir_all(cuelm_dir(&vault_path)).unwrap();
+        fs::create_dir_all(helixnotes_dir(&vault_path)).unwrap();
 
         set_notebook_icon(&vault_path, r"Projects\Client", Some("builtin:briefcase")).unwrap();
         let stored: std::collections::HashMap<String, String> = serde_json::from_str(
-            &fs::read_to_string(cuelm_dir(&vault_path).join("notebook_icons.json")).unwrap(),
+            &fs::read_to_string(helixnotes_dir(&vault_path).join("notebook_icons.json")).unwrap(),
         )
         .unwrap();
         assert!(stored.contains_key("Projects/Client"));
@@ -2578,10 +3967,10 @@ mod tests {
     #[test]
     fn normalizes_legacy_notebook_icon_keys_when_loading() {
         let vault =
-            std::env::temp_dir().join(format!("cuelm-notebook-icon-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("helixnotes-notebook-icon-test-{}", Uuid::new_v4()));
         let vault_path = vault.to_string_lossy();
-        let icons_path = cuelm_dir(&vault_path).join("notebook_icons.json");
-        fs::create_dir_all(cuelm_dir(&vault_path)).unwrap();
+        let icons_path = helixnotes_dir(&vault_path).join("notebook_icons.json");
+        fs::create_dir_all(helixnotes_dir(&vault_path)).unwrap();
         fs::write(&icons_path, r#"{"Projects\\Client":"builtin:folder"}"#).unwrap();
 
         let icons = load_notebook_icons(&vault_path).unwrap();
@@ -2596,7 +3985,7 @@ mod tests {
     #[test]
     fn persists_and_removes_tag_styles() {
         let vault =
-            std::env::temp_dir().join(format!("cuelm-tag-style-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("helixnotes-tag-style-test-{}", Uuid::new_v4()));
         let vault_path = vault.to_string_lossy();
 
         patch_tag_style(
@@ -2613,7 +4002,7 @@ mod tests {
         .unwrap();
 
         let stored: std::collections::HashMap<String, TagStyle> = serde_json::from_str(
-            &fs::read_to_string(cuelm_dir(&vault_path).join("tag_styles.json")).unwrap(),
+            &fs::read_to_string(helixnotes_dir(&vault_path).join("tag_styles.json")).unwrap(),
         )
         .unwrap();
         assert!(stored.contains_key("Work"));
@@ -2633,7 +4022,7 @@ mod tests {
     #[test]
     fn resetting_tag_style_is_case_insensitive() {
         let vault =
-            std::env::temp_dir().join(format!("cuelm-tag-style-case-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("helixnotes-tag-style-case-test-{}", Uuid::new_v4()));
         let vault_path = vault.to_string_lossy();
 
         patch_tag_style(
@@ -2652,7 +4041,7 @@ mod tests {
         patch_tag_style(&vault_path, "work", TagStyleChange::Reset).unwrap();
 
         let stored: serde_json::Value = serde_json::from_str(
-            &fs::read_to_string(cuelm_dir(&vault_path).join("tag_styles.json")).unwrap(),
+            &fs::read_to_string(helixnotes_dir(&vault_path).join("tag_styles.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(stored, serde_json::json!({}));
@@ -2664,13 +4053,13 @@ mod tests {
     #[test]
     fn load_collapses_case_variant_tag_style_keys() {
         let vault = std::env::temp_dir().join(format!(
-            "cuelm-tag-style-collapse-test-{}",
+            "helixnotes-tag-style-collapse-test-{}",
             Uuid::new_v4()
         ));
         let vault_path = vault.to_string_lossy();
-        fs::create_dir_all(cuelm_dir(&vault_path)).unwrap();
+        fs::create_dir_all(helixnotes_dir(&vault_path)).unwrap();
         fs::write(
-            cuelm_dir(&vault_path).join("tag_styles.json"),
+            helixnotes_dir(&vault_path).join("tag_styles.json"),
             r##"{"Work":{"icon":"builtin:briefcase"},"work":{"color":"#e11d48"}}"##,
         )
         .unwrap();
@@ -2687,7 +4076,7 @@ mod tests {
     #[test]
     fn rejects_invalid_tag_color() {
         let vault = std::env::temp_dir().join(format!(
-            "cuelm-tag-style-color-test-{}",
+            "helixnotes-tag-style-color-test-{}",
             Uuid::new_v4()
         ));
         let vault_path = vault.to_string_lossy();
@@ -2706,7 +4095,7 @@ mod tests {
     #[test]
     fn clearing_empty_tag_style_removes_entry() {
         let vault = std::env::temp_dir().join(format!(
-            "cuelm-tag-style-clear-test-{}",
+            "helixnotes-tag-style-clear-test-{}",
             Uuid::new_v4()
         ));
         let vault_path = vault.to_string_lossy();
@@ -2726,7 +4115,7 @@ mod tests {
     #[test]
     fn loads_only_requested_note_switcher_titles() {
         let vault =
-            std::env::temp_dir().join(format!("cuelm-note-switcher-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("helixnotes-note-switcher-test-{}", Uuid::new_v4()));
         fs::create_dir_all(&vault).unwrap();
 
         let mut note_paths = Vec::new();
@@ -2746,7 +4135,7 @@ mod tests {
         .unwrap();
 
         let outside =
-            std::env::temp_dir().join(format!("cuelm-outside-note-{}.md", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("helixnotes-outside-note-{}.md", Uuid::new_v4()));
         fs::write(&outside, "---\ntitle: Outside\n---\n").unwrap();
 
         let requested = vec![
@@ -2790,9 +4179,9 @@ mod tests {
     #[test]
     fn reads_markdown_notes_from_trash_without_allowing_external_files() {
         let test_root =
-            std::env::temp_dir().join(format!("cuelm-path-security-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("helixnotes-path-security-test-{}", Uuid::new_v4()));
         let vault = test_root.join("vault");
-        let trash = cuelm_dir(&vault.to_string_lossy()).join("trash");
+        let trash = helixnotes_dir(&vault.to_string_lossy()).join("trash");
         let trashed_note = trash.join("20240101000000000_Note.md");
         let outside = test_root.join("outside.md");
         fs::create_dir_all(&trash).unwrap();
@@ -2808,10 +4197,10 @@ mod tests {
     #[test]
     fn rejects_permanent_deletion_outside_trash() {
         let test_root =
-            std::env::temp_dir().join(format!("cuelm-path-security-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("helixnotes-path-security-test-{}", Uuid::new_v4()));
         let vault = test_root.join("vault");
         let outside = test_root.join("outside.md");
-        fs::create_dir_all(cuelm_dir(&vault.to_string_lossy()).join("trash")).unwrap();
+        fs::create_dir_all(helixnotes_dir(&vault.to_string_lossy()).join("trash")).unwrap();
         fs::write(&outside, "must survive").unwrap();
 
         let result = permanent_delete(&vault.to_string_lossy(), &outside.to_string_lossy());
@@ -2824,7 +4213,7 @@ mod tests {
     #[test]
     fn rejects_notebook_creation_outside_vault() {
         let test_root =
-            std::env::temp_dir().join(format!("cuelm-path-security-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("helixnotes-path-security-test-{}", Uuid::new_v4()));
         let vault = test_root.join("vault");
         fs::create_dir_all(&vault).unwrap();
 
@@ -2838,9 +4227,9 @@ mod tests {
     #[test]
     fn rejects_traversal_in_restored_notebook_metadata() {
         let test_root =
-            std::env::temp_dir().join(format!("cuelm-path-security-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("helixnotes-path-security-test-{}", Uuid::new_v4()));
         let vault = test_root.join("vault");
-        let trash = cuelm_dir(&vault.to_string_lossy()).join("trash");
+        let trash = helixnotes_dir(&vault.to_string_lossy()).join("trash");
         let trashed_notebook = trash.join("20240101000000000_Notebook");
         fs::create_dir_all(&trashed_notebook).unwrap();
         fs::write(trash.join("20240101000000000_Notebook.meta"), "../escaped").unwrap();
@@ -2859,7 +4248,7 @@ mod tests {
     #[test]
     fn duplicates_note_content_and_assigns_unique_identity_and_name() {
         let vault =
-            std::env::temp_dir().join(format!("cuelm-duplicate-note-test-{}", Uuid::new_v4()));
+            std::env::temp_dir().join(format!("helixnotes-duplicate-note-test-{}", Uuid::new_v4()));
         let notebook = vault.join("Projects");
         fs::create_dir_all(&notebook).unwrap();
         let source_path = notebook.join("Project.md");
@@ -2992,7 +4381,8 @@ mod tests {
         assert_eq!(saved.meta.id, first.id);
         assert_eq!(saved.meta.created, meta.created);
         assert!(saved.content.contains("Second change."));
-        let parsed = gray_matter::Matter::<gray_matter::engine::YAML>::new().parse(&saved.raw);
+        let parsed =
+            gray_matter::Matter::<crate::vault::frontmatter::BoundedYaml>::new().parse(&saved.raw);
         let fields: serde_yaml::Value = parsed.data.unwrap().deserialize().unwrap();
         assert_eq!(fields["aliases"][0].as_str(), Some("Legacy"));
     }
@@ -3124,7 +4514,8 @@ mod tests {
             &renamed.path,
             root.join("Archive").to_str().unwrap(),
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert_eq!(
             super::load_quick_access(vault_path).unwrap()[0],
             "Archive/Second.md"
@@ -3146,7 +4537,8 @@ mod tests {
             root.join("Archive").to_str().unwrap(),
             "Journal",
         )
-        .unwrap();
+        .unwrap()
+        .0;
         assert_eq!(
             super::load_quick_access(vault_path).unwrap(),
             [
@@ -3193,7 +4585,7 @@ mod tests {
         let original = "---\ntitle: Note\n---\noriginal";
         fs::write(&note, original).unwrap();
         super::save_quick_access(vault_path, &["Book/Note.md".into()]).unwrap();
-        let favorites = cuelm_dir(vault_path).join("quick_access.json");
+        let favorites = helixnotes_dir(vault_path).join("quick_access.json");
         let before = fs::read(&favorites).unwrap();
         fs::set_permissions(&favorites, fs::Permissions::from_mode(0o440)).unwrap();
 
@@ -3361,7 +4753,7 @@ mod tests {
         let vault = tempfile::tempdir().unwrap();
         let vault_path = vault.path().to_str().unwrap();
         super::ensure_vault_structure(vault_path).unwrap();
-        let trash = cuelm_dir(vault_path).join("trash");
+        let trash = helixnotes_dir(vault_path).join("trash");
         let old_note = trash.join("20260101000000_Old.md");
         fs::write(&old_note, "---\ntitle: Old\n---\nlegacy note").unwrap();
         let restored_note =
@@ -3410,7 +4802,7 @@ mod tests {
             "outside"
         );
 
-        let trash = cuelm_dir(vault_path).join("trash");
+        let trash = helixnotes_dir(vault_path).join("trash");
         let notebook = trash.join("20260101000000000_Stashed");
         fs::create_dir(&notebook).unwrap();
         fs::write(notebook.join("Keep.md"), "safe").unwrap();
@@ -3426,11 +4818,119 @@ mod tests {
     }
 
     #[test]
+    fn header_reads_keep_metadata_when_frontmatter_exceeds_the_first_block() {
+        let vault = tempfile::tempdir().unwrap();
+        let tags: Vec<String> = (0..120)
+            .map(|index| format!("long-tag-name-{index}"))
+            .collect();
+        let raw = format!(
+            "---\nid: existing\ntitle: Long Frontmatter\ntags: [{}]\n---\n# Long Frontmatter\n\nBody.\n",
+            tags.join(", ")
+        );
+        assert!(raw.find("\n---\n#").unwrap() > 2048);
+        fs::write(vault.path().join("Long.md"), raw).unwrap();
+
+        let entry =
+            super::read_note_entry_fast(&vault.path().join("Long.md"), vault.path()).unwrap();
+        assert_eq!(entry.meta.title, "Long Frontmatter");
+        assert_eq!(entry.meta.tags, tags);
+        let counted = super::get_all_tags(vault.path().to_str().unwrap()).unwrap();
+        assert_eq!(counted.len(), tags.len());
+    }
+
+    #[test]
+    fn note_head_stops_after_frontmatter_and_one_body_block() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().join("Note.md");
+        let tags = (0..400)
+            .map(|i| format!("tag-{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for newline in ["\n", "\r\n"] {
+            let body = "x".repeat(100_000);
+            let raw = format!("---{newline}tags: [{tags}]{newline}---{newline}{body}");
+            fs::write(&path, &raw).unwrap();
+            let head = super::read_note_head(&path).unwrap();
+            let end = raw.find(&format!("{newline}---{newline}")).unwrap() + newline.len() * 2 + 3;
+            assert!(head.len() >= end + 2048 && head.len() < end + 2 * 2048);
+            assert!(raw.starts_with(&head));
+        }
+    }
+
+    #[test]
+    fn note_head_without_frontmatter_reads_one_block_and_unterminated_is_capped() {
+        let vault = tempfile::tempdir().unwrap();
+        let path = vault.path().join("Note.md");
+        fs::write(&path, "# Title\n".to_string() + &"y".repeat(50_000)).unwrap();
+        assert_eq!(super::read_note_head(&path).unwrap().len(), 2048);
+        fs::write(
+            &path,
+            "---\ntitle: Open\n".to_string() + &"z\n".repeat(300_000),
+        )
+        .unwrap();
+        assert_eq!(super::read_note_head(&path).unwrap().len(), 256 * 1024);
+        fs::write(
+            &path,
+            "---not frontmatter\n".to_string() + &"y".repeat(50_000),
+        )
+        .unwrap();
+        assert_eq!(super::read_note_head(&path).unwrap().len(), 2048);
+        fs::write(&path, "---\n---\nShort").unwrap();
+        assert_eq!(super::read_note_head(&path).unwrap(), "---\n---\nShort");
+    }
+
+    #[test]
+    fn dot_named_vault_folder_is_still_scanned_and_renames_update_links() {
+        // tempdir() names its folder ".tmpXXXX", like a vault kept in ~/.notes.
+        let vault = tempfile::tempdir().unwrap();
+        assert!(vault
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with('.'));
+        let vault_path = vault.path().to_str().unwrap();
+        fs::write(vault.path().join("Old.md"), "---\ntitle: Old\n---\n# Old\n").unwrap();
+        let other = vault.path().join("Other.md");
+        fs::write(&other, "---\ntitle: Other\n---\nSee [[Old]].\n").unwrap();
+
+        assert_eq!(super::scan_notes(vault_path, None).unwrap().len(), 2);
+        fs::create_dir(vault.path().join("Notebook")).unwrap();
+        fs::write(
+            vault.path().join("Notebook/Tagged.md"),
+            "---\ntags: [work]\n---\n# Tagged\n",
+        )
+        .unwrap();
+        assert_eq!(super::scan_notebooks(vault_path).unwrap().len(), 1);
+        assert_eq!(
+            super::get_all_tags(vault_path).unwrap(),
+            [("work".to_string(), 1)]
+        );
+        assert_eq!(
+            super::scan_notes(
+                vault_path,
+                Some(vault.path().join("Notebook").to_str().unwrap())
+            )
+            .unwrap()
+            .len(),
+            1
+        );
+
+        super::rename_note(
+            vault.path().join("Old.md").to_str().unwrap(),
+            "Renamed",
+            vault_path,
+        )
+        .unwrap();
+        assert!(fs::read_to_string(other).unwrap().contains("Renamed"));
+    }
+
+    #[test]
     fn vault_state_save_replaces_file_without_truncating_open_reader() {
         let vault = tempfile::tempdir().unwrap();
         let vault_path = vault.path().to_str().unwrap();
         super::ensure_vault_structure(vault_path).unwrap();
-        let state = cuelm_dir(vault_path).join("state.json");
+        let state = helixnotes_dir(vault_path).join("state.json");
         fs::write(&state, b"old vault state").unwrap();
         let mut reader = fs::File::open(&state).unwrap();
         let new_state = crate::types::VaultState {

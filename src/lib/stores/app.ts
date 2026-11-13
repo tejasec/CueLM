@@ -122,9 +122,23 @@ export const resolvedTheme = derived(
 
 // Sync (WebDAV) - global status so the top-bar button reflects any sync,
 // whoever triggered it (manual button, settings, interval, on-change).
-export const syncState = writable<{ running: boolean; error: string | null }>({
+export interface SyncSummary {
+  uploaded?: number;
+  downloaded?: number;
+  deleted_local?: number;
+  deleted_remote?: number;
+  conflicts?: number;
+}
+// `result` is what the last finished sync did, so Settings reports the same outcome for every
+// way a sync can start.
+export const syncState = writable<{
+  running: boolean;
+  error: string | null;
+  result: { vault: string; summary: SyncSummary } | null;
+}>({
   running: false,
   error: null,
+  result: null,
 });
 
 // Update state
@@ -272,6 +286,9 @@ export function activateVaultData(vaultPath: string | null): void {
 }
 
 // Derived
+// Entries are replaced, not mutated, when a note changes, so a parsed date stays valid for its entry.
+const noteTimestamps = { created: new WeakMap<NoteEntry, number>(), modified: new WeakMap<NoteEntry, number>() };
+
 export const sortedNotes = derived(
   [notes, sortMode, viewMode, noteOrder],
   ([$notes, $sortMode, $viewMode, $noteOrder]) => {
@@ -285,9 +302,11 @@ export const sortedNotes = derived(
     const dateField = $sortMode === "title" || ($sortMode === "custom" && customSortable)
       ? null
       : $sortMode === "created" ? "created" : "modified";
-    const timestamps = dateField ? new Map<NoteEntry, number>() : null;
+    const timestamps = dateField ? noteTimestamps[dateField] : null;
     if (dateField && timestamps) {
-      for (const note of $notes) timestamps.set(note, Date.parse(note.meta[dateField]));
+      for (const note of $notes) {
+        if (!timestamps.has(note)) timestamps.set(note, Date.parse(note.meta[dateField]));
+      }
     }
 
     const sortFn = (a: NoteEntry, b: NoteEntry) => {

@@ -1,3 +1,5 @@
+import { isValidTagColor } from './tag-styles.ts';
+
 export const NOTEBOOK_ICON_OPTIONS = [
   { id: 'book', label: 'Book' },
   { id: 'folder', label: 'Folder' },
@@ -14,10 +16,46 @@ export const NOTEBOOK_ICON_OPTIONS = [
   { id: 'archive', label: 'Archive' },
   { id: 'globe', label: 'Globe' },
   { id: 'plane', label: 'Travel' },
-  { id: 'palette', label: 'Creative' }
+  { id: 'palette', label: 'Creative' },
+  { id: 'music', label: 'Music' },
+  { id: 'camera', label: 'Photos' },
+  { id: 'film', label: 'Film' },
+  { id: 'gamepad', label: 'Games' },
+  { id: 'cart', label: 'Shopping' },
+  { id: 'money', label: 'Finance' },
+  { id: 'health', label: 'Health' },
+  { id: 'food', label: 'Food' },
+  { id: 'coffee', label: 'Coffee' },
+  { id: 'leaf', label: 'Nature' },
+  { id: 'users', label: 'People' },
+  { id: 'chat', label: 'Chat' },
+  { id: 'mail', label: 'Mail' },
+  { id: 'lock', label: 'Private' },
+  { id: 'wrench', label: 'Tools' },
+  { id: 'pen', label: 'Writing' },
+  { id: 'tag', label: 'Tag' },
+  { id: 'clock', label: 'Clock' },
+  { id: 'bell', label: 'Reminders' },
+  { id: 'pin', label: 'Location' },
+  { id: 'gift', label: 'Gifts' },
+  { id: 'trophy', label: 'Goals' },
+  { id: 'rocket', label: 'Projects' },
+  { id: 'flag', label: 'Flag' },
+  { id: 'shield', label: 'Security' },
+  { id: 'gear', label: 'Settings' },
+  { id: 'search', label: 'Search' },
+  { id: 'zap', label: 'Energy' }
 ] as const;
 
 export type NotebookIconId = (typeof NOTEBOOK_ICON_OPTIONS)[number]['id'];
+
+/** The pickers show this many icons until "More icons" is pressed. */
+export const COMMON_NOTEBOOK_ICON_COUNT = 8;
+
+export function isCommonNotebookIcon(icon: NotebookIconId | null | undefined): boolean {
+  if (!icon) return true;
+  return NOTEBOOK_ICON_OPTIONS.findIndex((option) => option.id === icon) < COMMON_NOTEBOOK_ICON_COUNT;
+}
 
 const BUILTIN_PREFIX = 'builtin:';
 const BUILTIN_IDS: Record<NotebookIconId, true> = {
@@ -36,19 +74,63 @@ const BUILTIN_IDS: Record<NotebookIconId, true> = {
   archive: true,
   globe: true,
   plane: true,
-  palette: true
+  palette: true,
+  music: true,
+  camera: true,
+  film: true,
+  gamepad: true,
+  cart: true,
+  money: true,
+  health: true,
+  food: true,
+  coffee: true,
+  leaf: true,
+  users: true,
+  chat: true,
+  mail: true,
+  lock: true,
+  wrench: true,
+  pen: true,
+  tag: true,
+  clock: true,
+  bell: true,
+  pin: true,
+  gift: true,
+  trophy: true,
+  rocket: true,
+  flag: true,
+  shield: true,
+  gear: true,
+  search: true,
+  zap: true
 };
 
 export function normalizeNotebookIconKey(path: string): string {
   return path.replace(/\\/g, '/');
 }
 
-export function encodeBuiltinNotebookIcon(icon: NotebookIconId): string {
-  return `${BUILTIN_PREFIX}${icon}`;
+export function encodeBuiltinNotebookIcon(icon: NotebookIconId | null, color?: string | null): string {
+  return `${BUILTIN_PREFIX}${icon ?? ''}${isValidTagColor(color) ? color.toLowerCase() : ''}`;
 }
 
 export function decodeBuiltinNotebookIcon(value: string | null | undefined): NotebookIconId | null {
   if (!value?.startsWith(BUILTIN_PREFIX)) return null;
   const icon = value.slice(BUILTIN_PREFIX.length);
   return Object.hasOwn(BUILTIN_IDS, icon) ? icon as NotebookIconId : null;
+}
+
+/**
+ * Notebook icons keep their color in the stored value: `builtin:star#e11d48`.
+ * `builtin:#e11d48` colors the default notebook glyph.
+ */
+export function decodeNotebookIcon(
+  value: string | null | undefined
+): { icon: NotebookIconId | null; color: string | null } | null {
+  if (!value?.startsWith(BUILTIN_PREFIX)) return null;
+  const hash = value.indexOf('#');
+  const icon = decodeBuiltinNotebookIcon(hash < 0 ? value : value.slice(0, hash));
+  const color = hash < 0 ? null : value.slice(hash);
+  const valid = isValidTagColor(color) ? color : null;
+  if (!icon && (!valid || hash !== BUILTIN_PREFIX.length)) return null;
+  return { icon, color: valid };
 }

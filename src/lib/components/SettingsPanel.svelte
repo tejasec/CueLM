@@ -1,11 +1,12 @@
 <script lang="ts">
-	import { showSettings, theme, resolvedTheme, appConfig, platformIsMobile, activeVaultConfig, updateAvailable as globalUpdateAvailable, updateObj as globalUpdateObj, installType, settingsTab, vaultReady, androidApkUrl, checkForUpdateMobile, notebookSortMode, isManagedInstall, customThemes } from '$lib/stores/app';
+	import { untrack } from 'svelte';
+	import { showSettings, syncState, theme, resolvedTheme, appConfig, platformIsMobile, activeVaultConfig, updateAvailable as globalUpdateAvailable, updateObj as globalUpdateObj, installType, settingsTab, vaultReady, androidApkUrl, checkForUpdateMobile, notebookSortMode, isManagedInstall, customThemes } from '$lib/stores/app';
 	import { setTheme, setSystemThemes, setAccentColor, setFontSize, setScrollToChangeFontSize, setFontFamily, setLineHeight, setUiScale, setContentWidth, setGeneralSettings, importObsidian, createBackup, listBackups, restoreBackup, deleteBackup, setBackupSettings, setAiSettings, testAiConnection, setSyncSettings, testSyncConnection, syncNow, saveCustomTheme, deleteCustomTheme, exportCustomTheme, importCustomThemes, getVaultStats, findOrphanedAttachments, trashOrphanedAttachments } from '$lib/api';
 	import { darkThemes, isMobile, isAndroid } from '$lib/platform';
 	import { open as openDialog, save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { listen } from '@tauri-apps/api/event';
 	import { getVersion } from '@tauri-apps/api/app';
-	import { getCurrentWebview } from '@tauri-apps/api/webview';
+	import { applyUiScale, defaultUiScale, uiScalePresets } from '$lib/ui-scale';
 	import { openUrl } from '$lib/api';
 	import type { OrphanAttachment } from '$lib/api';
 	import type { ImportResult, BackupEntry, CustomTheme, CustomThemeColors, StartupView, VaultStats } from '$lib/types';
@@ -467,11 +468,15 @@
 	let syncShowPassword = $state(false);
 	let syncTestLoading = $state(false);
 	let syncTestMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
-	let syncRunning = $state(false);
+	let syncStarting = $state(false);
+	const syncRunning = $derived(syncStarting || $syncState.running);
 	let syncMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
 	let syncOnOpen = $state(activeVaultConfig($appConfig)?.sync_on_open ?? false);
 	let syncOnChange = $state(activeVaultConfig($appConfig)?.sync_on_change ?? false);
 	let syncIntervalMinutes = $state(activeVaultConfig($appConfig)?.sync_interval_minutes ?? 0);
+	// 0 means never chosen, which the sync treats as DEFAULT_LISTING_PARALLELISM (6) in sync.rs.
+	const defaultFolderRequests = 6;
+	let syncFolderRequests = $state(activeVaultConfig($appConfig)?.sync_folder_requests ?? 0);
 
 	// Re-seed the sync form when the active vault changes, so Settings reflects the current vault.
 	let lastSyncVault: string | null = null;
@@ -491,10 +496,11 @@
 		syncOnOpen = vc?.sync_on_open ?? false;
 		syncOnChange = vc?.sync_on_change ?? false;
 		syncIntervalMinutes = vc?.sync_interval_minutes ?? 0;
+		syncFolderRequests = vc?.sync_folder_requests ?? 0;
 	});
 
 	async function saveSyncSettings() {
-		await setSyncSettings(syncProvider, syncUrl || null, syncUsername || null, syncPassword || null, syncOnOpen, syncOnChange, syncIntervalMinutes);
+		await setSyncSettings(syncProvider, syncUrl || null, syncUsername || null, syncPassword || null, syncOnOpen, syncOnChange, syncIntervalMinutes, syncFolderRequests);
 		// Reflect into the active vault's config in the store so the top-bar button and auto-sync
 		// triggers update live, without an app restart.
 		if ($appConfig) {
@@ -511,6 +517,7 @@
 					sync_on_open: syncOnOpen,
 					sync_on_change: syncOnChange,
 					sync_interval_minutes: syncIntervalMinutes,
+					sync_folder_requests: syncFolderRequests,
 				} : vault),
 			};
 		}
@@ -537,47 +544,37 @@
 		}
 	}
 
-	async function handleSyncNow() {
+	// The outcome of the last sync, whether it was started here, from the title bar or automatically.
+	$effect(() => {
+		const state = $syncState;
 		const vault = maintenanceVault;
-		if (!vault || syncRunning) return;
-		syncRunning = true;
-		syncMessage = null;
-		const unlisteners: Array<() => void> = [];
-		const cleanup = () => { unlisteners.forEach((u) => u()); };
-		unlisteners.push(await listen<{ vault_path: string; success: boolean; summary?: { uploaded?: number; downloaded?: number; deleted_local?: number; deleted_remote?: number; conflicts?: number }; last_sync_time?: string }>('sync-done', (event) => {
-			if (event.payload.vault_path !== vault) return;
-			if (!$showSettings || maintenanceVault !== vault) { cleanup(); return; }
-			const s = event.payload.summary ?? {};
-			const parts: string[] = [];
-			if (s.uploaded) parts.push(`${s.uploaded} uploaded`);
-			if (s.downloaded) parts.push(`${s.downloaded} downloaded`);
-			const deleted = (s.deleted_local ?? 0) + (s.deleted_remote ?? 0);
-			if (deleted) parts.push(`${deleted} deleted`);
-			if (s.conflicts) parts.push(`${s.conflicts} conflict copies`);
-			syncMessage = { type: 'success', text: parts.length ? `Synced: ${parts.join(', ')}.` : 'Already up to date.' };
-			syncRunning = false;
-			const timestamp = event.payload.last_sync_time;
-			const currentVault = activeVaultConfig($appConfig);
-			if (timestamp && currentVault && $appConfig) {
-				$appConfig = { ...$appConfig, vaults: $appConfig.vaults.map(item =>
-					item === currentVault ? { ...item, last_sync_time: timestamp } : item) };
+		untrack(() => {
+			if (state.running) syncMessage = null;
+			else if (state.error) syncMessage = { type: 'error', text: state.error };
+			else if (state.result && state.result.vault === vault) {
+				const s = state.result.summary;
+				const parts: string[] = [];
+				if (s.uploaded) parts.push(`${s.uploaded} uploaded`);
+				if (s.downloaded) parts.push(`${s.downloaded} downloaded`);
+				const deleted = (s.deleted_local ?? 0) + (s.deleted_remote ?? 0);
+				if (deleted) parts.push(`${deleted} deleted`);
+				if (s.conflicts) parts.push(`${s.conflicts} conflict ${s.conflicts === 1 ? 'copy' : 'copies'}`);
+				syncMessage = { type: 'success', text: parts.length ? `Synced: ${parts.join(', ')}.` : 'Already up to date.' };
 			}
-			cleanup();
-		}));
-		unlisteners.push(await listen<{ vault_path: string; error?: string }>('sync-error', (event) => {
-			if (event.payload.vault_path !== vault) return;
-			if (!$showSettings || maintenanceVault !== vault) { cleanup(); return; }
-			syncMessage = { type: 'error', text: event.payload.error ?? 'Sync failed' };
-			syncRunning = false;
-			cleanup();
-		}));
+		});
+	});
+
+	async function handleSyncNow() {
+		if (!maintenanceVault || syncRunning) return;
+		syncStarting = true;
+		syncMessage = null;
 		try {
 			await saveSyncSettings();
 			await syncNow();
 		} catch (e) {
 			syncMessage = { type: 'error', text: String(e) };
-			syncRunning = false;
-			cleanup();
+		} finally {
+			syncStarting = false;
 		}
 	}
 
@@ -621,6 +618,16 @@
 		{ id: 'cyberpunk', label: 'Cyberpunk', bg: '#0a0e17', sidebar: '#060911', accent: '#ff0080' },
 		{ id: 'black', label: 'Black', bg: '#000000', sidebar: '#0a0a0a', accent: '#ffffff' },
 		{ id: 'one-dark', label: 'One Dark', bg: '#282c34', sidebar: '#21252b', accent: '#61afef' },
+		{ id: 'matrix', label: 'Matrix', bg: '#0a0f0a', sidebar: '#060a06', accent: '#00ff66' },
+		{ id: 'amber-crt', label: 'Amber CRT', bg: '#180f00', sidebar: '#120b00', accent: '#ffb000' },
+		{ id: 'sepia', label: 'Sepia', bg: '#f4ecd8', sidebar: '#ebe0c7', accent: '#9a6a3a' },
+		{ id: 'deep-ocean', label: 'Deep Ocean', bg: '#081821', sidebar: '#05121a', accent: '#35c4d4' },
+		{ id: 'sandstone', label: 'Sandstone', bg: '#faf3e8', sidebar: '#f1e6d3', accent: '#c76b3f' },
+		{ id: 'lavender', label: 'Lavender', bg: '#f6f3fc', sidebar: '#ece6f7', accent: '#7c5cc4' },
+		{ id: 'graphite', label: 'Graphite', bg: '#17181a', sidebar: '#121315', accent: '#7f9cb3' },
+		{ id: 'nebula', label: 'Nebula', bg: '#14102a', sidebar: '#0f0c21', accent: '#b388ff' },
+		{ id: 'wine', label: 'Wine', bg: '#1c0f14', sidebar: '#160b10', accent: '#d98ca0' },
+		{ id: 'jade', label: 'Jade', bg: '#0b1a15', sidebar: '#071410', accent: '#2bbd8e' },
 	];
 
 	// Keep the default themes pinned at the top and sort the rest alphabetically.
@@ -667,23 +674,16 @@
 		{ name: 'Open Sans', value: 'opensans', stack: '"Open Sans", -apple-system, sans-serif' },
 		{ name: 'Literata', value: 'literata', stack: '"Literata", Georgia, serif' },
 		{ name: 'Mono', value: 'mono', stack: '"JetBrains Mono", "Fira Code", "Cascadia Code", monospace' },
+		{ name: 'Ubuntu', value: 'ubuntu', stack: '"Ubuntu", -apple-system, sans-serif' },
+		{ name: 'Ubuntu Mono', value: 'ubuntu-mono', stack: '"Ubuntu Mono", monospace' },
 	];
 
 	const lineHeightPresets = [
+		{ label: 'Single', value: 1.0 },
 		{ label: 'Tight', value: 1.4 },
 		{ label: 'Default', value: 1.6 },
 		{ label: 'Relaxed', value: 1.8 },
 		{ label: 'Loose', value: 2.0 },
-	];
-
-	const uiScalePresets = [
-		{ label: '80%', value: 0.8 },
-		{ label: '90%', value: 0.9 },
-		{ label: '100%', value: 1 },
-		{ label: '125%', value: 1.25 },
-		{ label: '150%', value: 1.5 },
-		{ label: '175%', value: 1.75 },
-		{ label: '200%', value: 2 },
 	];
 
 	const contentWidthPresets: { label: string; value: number | null }[] = [
@@ -699,7 +699,7 @@
 	let scrollToChangeFontSize = $state($appConfig?.scroll_to_change_font_size ?? true);
 	let activeFontFamily = $state($appConfig?.font_family ?? 'system');
 	let activeLineHeight = $state($appConfig?.line_height ?? 1.6);
-	let activeUiScale = $state($appConfig?.ui_scale ?? 1);
+	let activeUiScale = $state($appConfig?.ui_scale ?? defaultUiScale);
 	let activeContentWidth = $state<number | null>($appConfig?.content_width ?? null);
 	let themeDropdownOpen = $state(false);
 	let accentDropdownOpen = $state(false);
@@ -811,7 +811,7 @@
 		root.classList.remove('dark');
 		root.removeAttribute('data-theme');
 		for (const v of varsToClear) root.style.removeProperty(v);
-		const namedThemes = ['solarized-light','solarized-dark','catppuccin','nord','tokyo-night','github-light','github-dark','dracula','blueberry','forest-green','gruvbox','midnight-tide','cherry-blossom','synthwave','ember','moonlit','light-coffee','dark-coffee','cotton-candy','crimson','cloud','peach','material-dark','material-light','monokai','rose-pine','everforest','horizon','cyberpunk','black','one-dark'];
+		const namedThemes = ['solarized-light','solarized-dark','catppuccin','nord','tokyo-night','github-light','github-dark','dracula','blueberry','forest-green','gruvbox','midnight-tide','cherry-blossom','synthwave','ember','moonlit','light-coffee','dark-coffee','cotton-candy','crimson','cloud','peach','material-dark','material-light','monokai','rose-pine','everforest','horizon','cyberpunk','black','one-dark','matrix','amber-crt','sepia','deep-ocean','sandstone','lavender','graphite','nebula','wine','jade'];
 		if ($resolvedTheme.startsWith('custom-')) {
 			const ct = $customThemes.find(c => c.id === $resolvedTheme);
 			if (ct) {
@@ -1097,8 +1097,11 @@
 	function selectFontSize(size: number) {
 		activeFontSize = size;
 		applyFontSize(size);
-		if ($appConfig) $appConfig.font_size = size;
-		setFontSize(size).catch((e) => console.error('Failed to save font size:', e));
+		if ($appConfig) {
+			$appConfig.font_size = size;
+			$appConfig.preferred_font_size = size;
+		}
+		setFontSize(size, true).catch((e) => console.error('Failed to save font size:', e));
 	}
 
 	function toggleScrollToChangeFontSize() {
@@ -1139,14 +1142,6 @@
 		applyUiScale(value);
 		if ($appConfig) $appConfig.ui_scale = value;
 		setUiScale(value).catch((e) => console.error('Failed to save interface scale:', e));
-	}
-
-	async function applyUiScale(value: number) {
-		try {
-			await getCurrentWebview().setZoom(value);
-		} catch (e) {
-			console.error('Failed to apply interface scale:', e);
-		}
 	}
 
 	function selectContentWidth(value: number | null) {
@@ -1494,9 +1489,11 @@
 								<p class="setting-desc" style="margin-bottom: 12px; color: var(--text-tertiary); font-size: 13px;">Current: <strong style="color: var(--text-primary);">{$appConfig?.active_vault?.split('/').pop() ?? 'Unknown'}</strong></p>
 								<button class="import-btn" onclick={async () => { if (!(await onBeforeVaultSwitch())) return; $showSettings = false; $vaultReady = false; }}>
 									<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-										<path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/>
+										<rect x="3" y="3" width="18" height="16" rx="2"/>
+										<circle cx="12" cy="11" r="3.5"/>
+										<path d="M12 7.5V6M12 16v-1.5M7 19v2M17 19v2"/>
 									</svg>
-									Switch Vault
+									Manage Vaults
 								</button>
 							</div>
 							{/if}
@@ -2055,7 +2052,7 @@
 								{/if}
 							</div>
 
-							{#if !isMobile}
+							{#if !isMobile || isAndroid}
 								<div class="settings-section">
 									<h3>Interface Scale</h3>
 									<div class="font-size-options">
@@ -2069,7 +2066,7 @@
 											</button>
 										{/each}
 									</div>
-									<p class="setting-hint">Zooms the whole app: every panel, menu, and the editor. Use Default (100%) to reset.</p>
+									<p class="setting-hint">Zooms the whole app: every panel, menu, and the editor. Use Default ({Math.round(defaultUiScale * 100)}%) to reset.</p>
 								</div>
 							{/if}
 
@@ -2092,7 +2089,7 @@
 							{/if}
 
 							<div class="settings-section">
-								<h3>Line Height</h3>
+								<h3>Line Spacing</h3>
 								<div class="font-size-options">
 									{#each lineHeightPresets as preset}
 										<button
@@ -2105,6 +2102,7 @@
 										</button>
 									{/each}
 								</div>
+								<p class="setting-hint">Sets the spacing in the editor. Text copied to Word or email is pasted with single spacing.</p>
 							</div>
 
 							<div class="settings-section">
@@ -2221,6 +2219,9 @@
 												<div class="backup-info">
 													<span class="backup-date">{formatBackupDate(entry.created)}</span>
 													<span class="backup-size">{formatBackupSize(entry.size)}</span>
+													{#if entry.other_vault}
+														<span class="backup-size" title="This backup was made from a different vault folder">other vault</span>
+													{/if}
 												</div>
 												<div class="backup-item-actions">
 													<button class="backup-action-btn" title="Restore" onclick={() => restoreConfirm = entry}>
@@ -2248,6 +2249,9 @@
 									<div class="restore-confirm" role="alertdialog" aria-modal="true" aria-labelledby="restore-confirm-title" tabindex="-1">
 										<h4 id="restore-confirm-title">Restore Backup?</h4>
 										<p>This will replace all notes in your vault with the backup from <strong>{formatBackupDate(restoreConfirm.created)}</strong>. This action cannot be undone.</p>
+										{#if restoreConfirm.other_vault}
+											<p><strong>This backup was made from a different vault folder.</strong> Restoring it replaces this vault's notes with that vault's. Continue only if this vault was moved or renamed since then.</p>
+										{/if}
 										<div class="restore-confirm-actions">
 											<button class="restore-cancel" onclick={() => restoreConfirm = null}>Cancel</button>
 											<button class="restore-confirm-btn" onclick={() => handleRestore(restoreConfirm!)}>Restore</button>
@@ -2608,6 +2612,15 @@
 										<button class="toggle-switch" class:on={syncOnOpen} role="switch" aria-checked={syncOnOpen} aria-label="Sync when the vault opens" onclick={() => { syncOnOpen = !syncOnOpen; saveSyncSettings(); }}><span class="toggle-knob"></span></button>
 									</label>
 								</div>
+								<div class="settings-section">
+									<h3>Folder Request Parallelism</h3>
+									<div class="setting-options">
+										{#each [...new Set([1, 3, 6, 12, syncFolderRequests || defaultFolderRequests])].sort((a, b) => a - b) as opt}
+											<button class="option-btn" class:active={(syncFolderRequests || defaultFolderRequests) === opt} onclick={() => { syncFolderRequests = opt; saveSyncSettings(); }}>{opt}</button>
+										{/each}
+									</div>
+									<p class="setting-hint">How many folders are listed on the server at once. 6 suits most servers; choose 1 if yours rejects concurrent requests.</p>
+								</div>
 							{/if}
 						</div>
 
@@ -2691,7 +2704,7 @@
 										<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 											<path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
 										</svg>
-										Download from Codeberg
+										Download
 									</a>
 								{/if}
 								</div>
@@ -3857,7 +3870,13 @@
 		transform: translateX(18px);
 	}
 
+	.settings-panel.mobile .setting-options {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(min(120px, 100%), 1fr));
+	}
+
 	.settings-panel.mobile .option-btn {
+		min-width: 0;
 		padding: 12px 10px;
 		font-size: 14px;
 	}
@@ -3867,12 +3886,21 @@
 		font-size: 14px;
 	}
 
+	.settings-panel.mobile .font-family-options,
 	.settings-panel.mobile .font-size-options {
+		display: grid;
+		grid-template-columns: repeat(auto-fit, minmax(85px, 1fr));
 		gap: 8px;
 	}
 
 	.settings-panel.mobile .font-size-btn {
 		padding: 12px 6px;
+	}
+
+	@media (max-width: 480px) {
+		.settings-panel.mobile .two-col-sections {
+			grid-template-columns: minmax(0, 1fr);
+		}
 	}
 
 	/* ── Custom Themes ── */

@@ -1,5 +1,38 @@
 use std::path::Path;
 use tauri::{AppHandle, Manager, Runtime};
+use tauri_plugin_fs::FsExt;
+
+/// Only configured user-selected vaults may provide an external note's vault-relative root.
+pub fn external_note_root<R: Runtime>(
+    app: &AppHandle<R>,
+    note_path: &Path,
+) -> Result<std::path::PathBuf, String> {
+    let note = std::fs::canonicalize(note_path).map_err(|error| error.to_string())?;
+    if let Some(state) = app.try_state::<crate::state::AppState>() {
+        let (active, mut roots) = {
+            let config = state.config.lock().map_err(|error| error.to_string())?;
+            (
+                config.active_vault.clone(),
+                config
+                    .vaults
+                    .iter()
+                    .map(|vault| vault.path.clone())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        roots.sort_by_key(|root| std::cmp::Reverse(root.len()));
+        for root in active.into_iter().chain(roots) {
+            if let Ok(root) = std::fs::canonicalize(root) {
+                if note.starts_with(&root) {
+                    return Ok(root);
+                }
+            }
+        }
+    }
+    note.parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| "External note has no parent directory".into())
+}
 
 /// Grants asset-protocol access only to a vault selected by the user.
 /// `.cuelm` is added explicitly because Unix glob matching excludes hidden paths.
@@ -16,6 +49,7 @@ pub fn allow_vault_assets<R: Runtime>(app: &AppHandle<R>, vault_path: &Path) -> 
     scope
         .allow_directory(&vault, true)
         .map_err(|error| error.to_string())?;
+    let _ = scope.allow_directory(vault.join(".helixnotes"), true);
     scope
         .allow_directory(vault.join(".cuelm"), true)
         .map_err(|error| error.to_string())
@@ -37,7 +71,21 @@ pub fn allow_external_note_assets<R: Runtime>(
         .ok_or_else(|| "External note has no parent directory".to_string())?;
     app.asset_protocol_scope()
         .allow_directory(parent, true)
-        .map_err(|error| error.to_string())
+        .map_err(|error| error.to_string())?;
+    let root = external_note_root(app, &note)?;
+    for dir_name in [".cuelm/attachments", ".helixnotes/attachments"] {
+        let attachments = root.join(dir_name);
+        // Never follow a hidden attachment-directory symlink when extending either scope.
+        if std::fs::canonicalize(&attachments)
+            .is_ok_and(|canonical| canonical == attachments && canonical.is_dir())
+        {
+            let _ = app.asset_protocol_scope().allow_directory(&attachments, true);
+            if let Some(scope) = app.try_fs_scope() {
+                let _ = scope.allow_directory(&attachments, true);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -5,7 +5,6 @@
 	import StarterKit from '@tiptap/starter-kit';
 	import TaskList from '@tiptap/extension-task-list';
 	import TaskItem from '@tiptap/extension-task-item';
-	import { Table } from '@tiptap/extension-table';
 	import { TableRow } from '@tiptap/extension-table-row';
 	import { TableCell } from '@tiptap/extension-table-cell';
 	import { TableHeader } from '@tiptap/extension-table-header';
@@ -19,50 +18,62 @@
 	import { Color } from '@tiptap/extension-color';
 	import { TextStyle } from '@tiptap/extension-text-style';
 	import { CachedCodeBlockLowlight } from '$lib/editor/extensions/cachedCodeBlockLowlight';
+	import { AlwaysResizableTable } from '$lib/editor/tableExtension';
 	import { Details, DetailsSummary, DetailsContent } from '@tiptap/extension-details';
 	import TextAlign from '@tiptap/extension-text-align';
 	import { common, createLowlight } from 'lowlight';
 	import powershell from 'highlight.js/lib/languages/powershell';
-	import MarkdownIt from 'markdown-it';
-	import markdownItMark from 'markdown-it-mark';
-	import markdownItSup from 'markdown-it-sup';
-	import markdownItSub from 'markdown-it-sub';
 	import katex from 'katex';
 	import 'katex/dist/katex.min.css';
 	import { Extension, Node as TiptapNode, Mark as TiptapMark, mergeAttributes } from '@tiptap/core';
 	import { Plugin, PluginKey, EditorState, Selection, TextSelection } from '@tiptap/pm/state';
 	import { Decoration, DecorationSet } from '@tiptap/pm/view';
-	import { DOMSerializer } from '@tiptap/pm/model';
+	import { DOMParser as PMDOMParser, DOMSerializer, Slice, type Node as ProseMirrorNode } from '@tiptap/pm/model';
 	import { convertFileSrc } from '@tauri-apps/api/core';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import { readFile } from '@tauri-apps/plugin-fs';
 	import { openFile, openUrl, copyFileTo, copyImageToClipboard as copyImageToClipboardCmd, writeBytesTo, copyPngToClipboard, copyTextToClipboard } from '$lib/api';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
 	import { activeNote, activeNotePath, appConfig, editorDirty, sourceMode, focusMode, readOnly, quickAccessPaths, notes, navHistory, canGoBack, canGoForward, viewerNote, viewMode, notebooks, outlineWidth } from '$lib/stores/app';
-	import { saveNote, createNote, saveImage, saveAttachment, readClipboardImage, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout } from '$lib/api';
+	import { saveNote, importNote, createNote, saveImage, saveAttachment, readClipboardImage, readClipboardContents, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout } from '$lib/api';
 	import type { NoteContent, VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord, FileEvent, SearchTarget, ToolbarLayout } from '$lib/types';
 	import { listen } from '@tauri-apps/api/event';
 	import { debounce } from '$lib/utils/debounce';
+	import { formatClockTime } from '$lib/utils/time';
+	import DOMPurify from 'dompurify';
+	import { splitSnapshot } from '$lib/utils/history-comparison';
+	import HistoryReview from './HistoryReview.svelte';
 	import { RevisionSaveQueue, type SaveRevision } from '$lib/utils/revision-save';
 	import { isCurrentVaultEvent } from '$lib/utils/note-list-updates';
 	import { beginNoteNavigation, isCurrentNoteNavigation, cancelNoteNavigation } from '$lib/utils/note-navigation';
 	import { encryptSecretText, decryptSecretText, readSecretTitle } from '$lib/utils/secrets';
 	import { WrapSelectedText } from '$lib/editor/extensions/wrapSelectedText';
 	import { CodeBlockInputScroll } from '$lib/editor/extensions/codeBlockInputScroll';
+	import { ImageGrid } from '$lib/editor/extensions/imageGrid';
+	import { defaultGridCols, expandImageRange, reorderTarget, serializeImgGrid } from '$lib/editor/imageGrid';
 	import { calloutGroup, calloutIcon, calloutLabel, CALLOUT_MENU, transformCalloutBlockquotes, serializeCallout } from '$lib/editor/callouts';
 	import SourceEditor from './SourceEditor.svelte';
 	import { SourceController } from '$lib/editor/source/controller';
-	import { findDocumentMatches, findSourceMatches, closestSearchMatch, type NoteSearchMatch } from '$lib/editor/search';
+	import { findDocumentMatches, findSourceMatches, closestSearchMatch, type NoteSearchMatch, replaceableMatches } from '$lib/editor/search';
+	import { keybindings, bindingToKeys } from '$lib/keybindings';
 	import { resolveSearchTarget, visibleSearchTarget } from '$lib/editor/search-target';
 	import { convertListNode, type MixedListName } from '$lib/editor/mixedLists';
 	import { clearFormatting } from '$lib/editor/clearFormatting';
 	import { toolbarLabels, resolveToolbarLayout, groupToolbarButtons, moveToolbarButton, toolbarLayoutPreference, type ToolbarButtonId, type ToolbarArea, type ResolvedToolbarLayout } from '$lib/editor/toolbar';
 	import { buildCodeCopyDecorations, buildTaskMetaDecorations, focusedPlaceholderDecorations } from '$lib/editor/decorations';
-	import { serializeInlineMarkdown } from '$lib/editor/markdown';
+	import { escapeBlockStarts, serializeImage, serializeInlineMarkdownKeepingDollars, serializeCodeBlock, joinMarkdownBlocks, joinListItemBlocks, type ListItemBlock, type MarkdownBlock } from '$lib/editor/markdown';
 	import { restoreTitleHeading, stripTitleHeading, type HiddenTitleHeading } from '$lib/editor/titleVisibility';
+	import { documentHeadings, sourceHeadings, activeHeadingIndex, mapDocumentHeadings, mapSourceHeadings, type OutlineHeading } from '$lib/editor/outline';
+	import { createEditorMarkdownParser } from '$lib/editor/markdownParser';
+	import { collectClipboardPayload, isEmptyPayload, needsNativeClipboard, withNativeClipboard, type ClipboardPastePayload } from '$lib/utils/clipboard-paste';
+	import { applySingleLineSpacing } from '$lib/utils/clipboard-copy';
+	import { externalNoteReferences } from '$lib/editor/externalNote';
 	import { tagIterationKey } from '$lib/utils/tag-styles';
 	import { replaceWithWikiLink } from '$lib/editor/wikiLinks';
-	import { assetSourceToMarkdown, assetUrlToLocalPath, normalizeLocalAssetPath, resolveVaultFilePath, isTrashedNote } from '$lib/utils/paths';
+	import { renamedHref, renamedLink, renamedLinkChanges, type LinkRename } from '$lib/editor/renamedLinks';
+	import { countWords, markdownCountText } from '$lib/utils/word-count';
+	import { htmlHasFormatting, looksLikeMarkdown } from '$lib/utils/markdown-paste';
+	import { assetSourceToMarkdown, assetUrlToLocalPath, encodeMarkdownPath, resolveFileReference, noteAssetRoot, isTrashedNote } from '$lib/utils/paths';
 	import GraphView from './GraphView.svelte';
 	import TagSuggestInput from './TagSuggestInput.svelte';
 	import TagLabel from './TagLabel.svelte';
@@ -70,8 +81,13 @@
 	import { isMobile, isAndroid } from '$lib/platform';
 	import ResizeHandle from './ResizeHandle.svelte';
 
-	let { onMoveToTrash }: {
+	const componentId = $props.id();
+	const outlinePanelId = `${componentId}-outline`;
+	let { onMoveToTrash, onOutlineChange, onShowTag }: {
 		onMoveToTrash?: (path: string) => Promise<boolean>;
+		onOutlineChange?: (open: boolean, panelId: string) => void;
+		/** Shows the notes carrying a tag. Without it (a detached note window) the tags open the tag editor. */
+		onShowTag?: (tag: string) => void;
 	} = $props();
 
 	const modKey = navigator.platform.startsWith('Mac') ? '⌘' : 'Ctrl';
@@ -105,6 +121,67 @@
 			};
 		},
 	});
+	// Word and email clients give copied <p> tags their own paragraph style (extra line and
+	// paragraph spacing). Style the copied blocks so a note pastes with single spacing.
+	const CopyLineSpacing = Extension.create({
+		name: 'copyLineSpacing',
+		addProseMirrorPlugins() {
+			const serializer = DOMSerializer.fromSchema(this.editor.schema);
+			const serializeFragment = serializer.serializeFragment.bind(serializer);
+			serializer.serializeFragment = (fragment, options, target) => {
+				const dom = serializeFragment(fragment, options, target);
+				const wrapper = document.createElement('div');
+				wrapper.appendChild(dom);
+				const template = document.createElement('template');
+				template.innerHTML = applySingleLineSpacing(wrapper.innerHTML);
+				return template.content;
+			};
+			return [new Plugin({
+				key: new PluginKey('copyLineSpacing'),
+				props: { clipboardSerializer: serializer },
+			})];
+		},
+	});
+	// While a very large note is still being built in slices, its document is partial. Nothing may edit
+	// it then; a user action first finishes the build (see loadDocumentProgressively).
+	const ProgressiveLoadGuard = Extension.create({
+		name: 'progressiveLoadGuard',
+		addProseMirrorPlugins() {
+			return [new Plugin({ key: new PluginKey('progressiveLoadGuard'), filterTransaction: (tr) => !(progressiveLoad && tr.docChanged) })];
+		},
+	});
+	function hasInlineCode(node: ProseMirrorNode): boolean {
+		for (let i = 0; i < node.childCount; i++) {
+			if (node.child(i).marks.some(mark => mark.type.name === 'code')) return true;
+		}
+		return false;
+	}
+	// The parser marks blocks holding code spans so whitespace-only code survives DOM import.
+	const keepCodeWhitespace = {
+		parseHTML(this: any) {
+			return (this.parent?.() ?? []).flatMap((rule: any) => [
+				{ ...rule, tag: `${rule.tag}[data-helix-code]`, preserveWhitespace: 'full' as const },
+				rule,
+			]);
+		},
+	};
+	const EditorStarterKit = StarterKit.extend({
+		addExtensions() {
+			// Inline code may carry other marks, so **`code`** and [`code`](url) keep their formatting.
+			return this.parent!().map(extension => extension instanceof TiptapMark && extension.name === 'code' ? extension.extend({ excludes: '' })
+				: extension instanceof TiptapNode && extension.name === 'listItem' ? extension.extend(keepCodeWhitespace)
+				: extension instanceof TiptapNode && (extension.name === 'paragraph' || extension.name === 'heading') ? extension.extend({
+				...keepCodeWhitespace,
+				renderHTML(props) {
+					return this.parent!({
+						...props,
+						HTMLAttributes: hasInlineCode(props.node)
+							? { ...props.HTMLAttributes, 'data-helix-code': '' } : props.HTMLAttributes,
+					});
+				},
+			}) : extension);
+		},
+	});
 	let editorReady = $state(false);
 	const trashPreview = $derived(isTrashedNote($activeNotePath, $appConfig?.active_vault));
 	// CM retains an immutable document; edits never bind a full source string to Svelte.
@@ -113,7 +190,12 @@
 		if (edited) markEdited();
 		scheduleCounts();
 		if (noteSearchOpen) scheduleNoteSearch();
-	}, { paste: handleFilePaste, drop: handleFileDrop });
+		if ($sourceMode && showOutline && outlineOrigin && isOriginCurrent(outlineOrigin)) {
+			outlineHeadings = mapSourceHeadings(outlineHeadings, changes);
+			scheduleOutline();
+			scheduleOutlineActive();
+		}
+	}, { paste: handleFilePaste, drop: handleFileDrop, scroll: scheduleOutlineActive });
 	let loadedPath = '';
 	type NoteScrollPosition = { rich: number; source: number };
 	const MAX_NOTE_SCROLL_POSITIONS = 200;
@@ -135,6 +217,8 @@
 	let searchTitleReveal = $state(false);
 	let searchTagsReveal = $state(false);
 	let searchRevealNotice = $state('');
+	/** Path of a note the rich editor could not display; see failNoteLoad. */
+	let loadFailure = $state<string | null>(null);
 	type TaskRevealTarget = { sourceOrdinal: number; richOrdinal: number | null };
 	const TASK_LINE_RE = /^\s*[-*]\s\[[ xX]\]\s+.+?\s*$/;
 	const RICH_TASK_LINE_RE = /^\s*-\s\[(?:x| )\]\s+.+?\s*$/;
@@ -151,7 +235,7 @@
 	let morePanel = $state<HTMLDivElement>();
 	let moreOpen = $state(false);
 	let formattingTrigger: HTMLButtonElement | null = null;
-	const morePanelId = $props.id();
+	const morePanelId = `${componentId}-more`;
 	let toolbarDraft = $state<ResolvedToolbarLayout | null>(null);
 	let toolbarSelected = $state<ToolbarButtonId | null>(null);
 	let toolbarSaving = $state(false);
@@ -200,7 +284,10 @@
 	export async function revealSearchTarget(target: SearchTarget | null, canReveal: () => boolean) {
 		if (!target || !canReveal()) return;
 		closeNoteSearch(false);
+		
+		window.removeEventListener("cuelm-open-note", handleOpenNote);
 		clearTargetReveal();
+
 		const request = ++targetRevealRequest;
 		const snapshot = saves.capture();
 		const path = loadedPath;
@@ -283,7 +370,10 @@
 		} finally {
 			if (request === targetRevealRequest) {
 				if (current()) targetRevealTimer = setTimeout(clearTargetReveal, 4000);
-				else clearTargetReveal();
+				else 
+		window.removeEventListener("cuelm-open-note", handleOpenNote);
+		clearTargetReveal();
+
 			}
 		}
 	}
@@ -320,7 +410,10 @@
 	}
 
 	function revealTaskTarget(target: TaskRevealTarget): boolean {
+		
+		window.removeEventListener("cuelm-open-note", handleOpenNote);
 		clearTargetReveal();
+
 		if ($sourceMode) {
 			if (!source.view) return false;
 			const range = sourceTaskRange(target.sourceOrdinal);
@@ -423,42 +516,133 @@
 	let aiGeneration = 0;
 
 
-	// Outline
+	// Outline entries are mapped immediately; labels are rescanned after typing settles.
 	let showOutline = $state(false);
-	interface OutlineHeading { level: number; text: string; pos: number; }
 	let outlineHeadings = $state<OutlineHeading[]>([]);
+	let outlineOrigin: EditorOrigin | null = null;
+	let outlineActive = $state(-1);
+	let outlineList = $state<HTMLUListElement>();
+	let outlineTrigger: HTMLElement | null = null;
+	let outlineTimer: ReturnType<typeof setTimeout> | null = null;
+	let outlineFrame: number | null = null;
 
-	function updateOutline() {
-		if (!editor) { outlineHeadings = []; return; }
-		const headings: OutlineHeading[] = [];
-		editor.state.doc.descendants((node, pos) => {
-			if (node.type.name === 'heading') {
-				headings.push({ level: node.attrs.level, text: node.textContent, pos });
-			}
-		});
-		outlineHeadings = headings;
+	function clearOutline() {
+		if (outlineTimer !== null) clearTimeout(outlineTimer);
+		if (outlineFrame !== null) cancelAnimationFrame(outlineFrame);
+		outlineTimer = null;
+		outlineFrame = null;
+		outlineHeadings = [];
+		outlineOrigin = null;
+		outlineActive = -1;
 	}
 
-	const scheduleOutline = debounce(updateOutline, 250);
+	function updateOutline() {
+		if (outlineTimer !== null) clearTimeout(outlineTimer);
+		outlineTimer = null;
+		if (editorDisposed || !loadedPath || loadedPath !== $activeNotePath) { clearOutline(); return; }
+		outlineHeadings = $sourceMode ? sourceHeadings(source.state)
+			: editor && pendingContent === null ? documentHeadings(editor.state.doc) : [];
+		outlineOrigin = captureOrigin();
+		scheduleOutlineActive();
+	}
+
+	function scheduleOutline() {
+		if (outlineTimer !== null) clearTimeout(outlineTimer);
+		outlineTimer = setTimeout(() => {
+			outlineTimer = null;
+			if (showOutline && !editorDisposed) updateOutline();
+		}, 250);
+	}
+
+	function updateOutlineActive() {
+		if (!outlineOrigin || !isOriginCurrent(outlineOrigin)) return;
+		if ($sourceMode) {
+			const view = source.view;
+			if (!view || !view.scrollDOM.getClientRects().length) return;
+			const height = Math.max(0, view.scrollDOM.getBoundingClientRect().top + 24 - view.documentTop);
+			outlineActive = activeHeadingIndex(outlineHeadings, view.lineBlockAtHeight(height).to);
+		} else if (editor) {
+			const body = editor.view.dom.closest('.editor-body');
+			if (!body || !body.getClientRects().length) return;
+			const readingTop = body.getBoundingClientRect().top + 32;
+			let active = -1;
+			for (let i = 0; i < outlineHeadings.length; i++) {
+				const element = editor.view.nodeDOM(outlineHeadings[i].pos);
+				if (!(element instanceof HTMLElement) || !element.getClientRects().length) continue;
+				if (element.getBoundingClientRect().top > readingTop) break;
+				active = i;
+			}
+			outlineActive = active;
+		}
+	}
+
+	function scheduleOutlineActive() {
+		if (!showOutline || outlineFrame !== null) return;
+		outlineFrame = requestAnimationFrame(() => {
+			outlineFrame = null;
+			updateOutlineActive();
+		});
+	}
+
+	$effect(() => { onOutlineChange?.(showOutline && !showHistory, outlinePanelId); });
+	$effect(() => {
+		const active = outlineActive;
+		if (!showOutline || active < 0) return;
+		tick().then(() => {
+			if (!outlineList || outlineList.contains(document.activeElement)) return;
+			const item = outlineList.children[active] as HTMLElement | undefined;
+			if (!item) return;
+			const listRect = outlineList.getBoundingClientRect();
+			const itemRect = item.getBoundingClientRect();
+			if (itemRect.top < listRect.top) outlineList.scrollTop -= listRect.top - itemRect.top;
+			else if (itemRect.bottom > listRect.bottom) outlineList.scrollTop += itemRect.bottom - listRect.bottom;
+		});
+	});
 
 	function handleOutlineResize(delta: number) {
 		$outlineWidth = Math.max(160, Math.min(500, $outlineWidth - delta));
 	}
 
-	async function scrollToHeading(pos: number) {
+	async function closeOutline() {
+		showOutline = false;
+		await tick();
+		if (outlineTrigger?.isConnected) outlineTrigger.focus({ preventScroll: true });
+	}
+
+	async function scrollToHeading(heading: OutlineHeading) {
+		if (!outlineOrigin || !isOriginCurrent(outlineOrigin)) { updateOutline(); return; }
+		// A mapped position is not enough: the heading may have been converted or deleted.
+		const current = $sourceMode ? sourceHeadings(source.state) : editor ? documentHeadings(editor.state.doc) : [];
+		const target = current.find(h => h.pos === heading.pos);
+		if (!target) { updateOutline(); return; }
 		const origin = captureOrigin();
 		if (isMobile) {
 			showOutline = false;
 			await tick();
 		}
-		if (!editor || !isOriginCurrent(origin, true)) return;
-		editor.commands.setTextSelection(pos + 1);
-		editor.commands.scrollIntoView();
-		editor.view.focus();
-		if (isMobile) {
-			const heading = editor.view.nodeDOM(pos);
-			if (heading instanceof HTMLElement) heading.scrollIntoView({ block: 'start' });
+		if (!isOriginCurrent(origin, true)) return;
+		if ($sourceMode) {
+			source.view?.requestMeasure();
+			source.select(target.pos, target.pos, true);
+			source.focus();
+		} else if (editor) {
+			const element = editor.view.nodeDOM(target.pos);
+			if (element instanceof HTMLElement) {
+				for (let parent = element.parentElement; parent && parent !== editor.view.dom; parent = parent.parentElement) {
+					if (parent.matches('[data-type="details"]')) openDetailsEl(parent);
+					else if (parent.matches('.callout.is-folded')) {
+						// Reveal without changing the saved fold state; the node view keeps it open while it lives.
+						parent.setAttribute('data-revealed', '');
+						parent.classList.remove('is-folded');
+					}
+				}
+			}
+			editor.commands.setTextSelection(target.pos + 1);
+			editor.commands.scrollIntoView();
+			editor.view.focus();
+			if (element instanceof HTMLElement) element.scrollIntoView({ block: 'start' });
 		}
+		outlineActive = current.indexOf(target);
 	}
 
 	// Version history
@@ -469,6 +653,10 @@
 	let historyPreview = $state<string | null>(null);
 	let historySelected = $state<VersionEntry | null>(null);
 	let historyLoading = $state(false);
+	let historyError = $state<string | null>(null);
+	let historyPreviewLoading = $state(false);
+	let historyPreviewError = $state<string | null>(null);
+	let historyWorking = $state('');
 
 	// Info panel
 	let showInfo = $state(false);
@@ -476,6 +664,9 @@
 	let charCount = $state(0);
 	let infoPathCopyState = $state<'idle' | 'copied' | 'error'>('idle');
 	let infoPathCopyTimer: ReturnType<typeof setTimeout> | null = null;
+	const infoFrontmatter = $derived(showInfo && !showHistory && $activeNote
+		? splitSnapshot($activeNote.raw).metadata
+		: '');
 
 	$effect(() => {
 		$activeNotePath;
@@ -493,6 +684,9 @@
 	let noteSearchWholeWord = $state(false);
 	let noteSearchPending = $state(false);
 	let noteSearchInput = $state<HTMLInputElement>(null!);
+	let noteReplaceOpen = $state(false);
+	let noteReplaceValue = $state('');
+	let noteReplaceInput = $state<HTMLInputElement>(null!);
 	const noteSearchPluginKey = new PluginKey('noteSearch');
 
 	// Slash commands
@@ -517,7 +711,7 @@
 		const now = new Date();
 		const pad = (n: number) => String(n).padStart(2, '0');
 		const date = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
-		const time = `${pad(now.getHours())}:${pad(now.getMinutes())}`;
+		const time = formatClockTime(now, $appConfig?.time_format);
 		const text = kind === 'date' ? date : kind === 'time' ? time : `${date} ${time}`;
 		editor.chain().focus().insertContent(text).run();
 	}
@@ -536,6 +730,7 @@
 			{ label: 'Collapsible Section', aliases: ['details', 'accordion', 'collapse', 'toggle', 'summary'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><polyline points="10 8 14 12 10 16"/></svg>', action: () => insertDetails() },
 			{ label: 'Callout', aliases: ['callout', 'admonition', 'note', 'info', 'tip', 'warning', 'caution', 'danger', 'success', 'question', 'quote', 'aside', 'box'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><line x1="7" y1="5" x2="7" y2="19"/></svg>', action: () => insertCallout('note') },
 			{ label: 'Table', aliases: ['table', 'grid'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="3" y1="15" x2="21" y2="15"/><line x1="9" y1="3" x2="9" y2="21"/><line x1="15" y1="3" x2="15" y2="21"/></svg>', action: () => { slashTablePicker = true; slashTableHover = { rows: 0, cols: 0 }; } },
+			{ label: 'Image Grid', aliases: ['imagegrid', 'image-grid', 'imggrid', 'gallery', 'masonry', 'images', 'side-by-side'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>', action: () => openAssetPicker('insert-grid-input') },
 			{ label: 'Horizontal Rule', aliases: ['hr', 'divider', 'line', 'separator', 'rule'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="2" y1="12" x2="22" y2="12"/></svg>', action: () => editor?.chain().focus().setHorizontalRule().run() },
 			{ label: 'Page Break', aliases: ['pagebreak', 'page', 'break', 'newpage', 'print'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="2" y1="9" x2="22" y2="9" stroke-dasharray="4 2"/><line x1="2" y1="15" x2="22" y2="15" stroke-dasharray="4 2"/><path d="M6 5v4M18 5v4M6 15v4M18 15v4"/></svg>', action: () => editor?.chain().focus().insertContent({ type: 'pageBreak' }).run() },
 			{ label: 'Math Block', aliases: ['math', 'latex', 'equation', 'formula', 'tex', 'katex'], icon: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h6l4 14h6"/><path d="M7 19l10-14"/></svg>', action: () => openMathInsert('block') },
@@ -573,7 +768,8 @@
 	});
 	let textContextMenu = $state<{ x: number; y: number; submenuLeft: boolean } | null>(null);
 	let tableContextMenu = $state<{ x: number; y: number; hasStyling: boolean } | null>(null);
-	let imageToolbar = $state<{ pos: number; x: number; y: number; size: string; src: string; alt: string } | null>(null);
+	let imageToolbar = $state<{ pos: number; x: number; y: number; size: string; src: string; alt: string; title: string; inGrid: boolean; canGroup: boolean } | null>(null);
+	let imageTitleModal = $state<{ title: string } | null>(null);
 	let imageViewer = $state<{ src: string; alt: string } | null>(null);
 	let copyToast = $state<'copying' | 'done' | null>(null);
 
@@ -693,11 +889,21 @@
 			try {
 				html = katex.renderToString(tex, { displayMode, throwOnError: false });
 			} catch {
-				html = `<span class="katex-error">${tex}</span>`;
+				html = `<span class="katex-error">${escapeHtml(tex)}</span>`;
 			}
 			katexCache.set(key, html);
+			if (katexCache.size > 512) katexCache.delete(katexCache.keys().next().value!);
 		}
 		return html;
+	}
+
+	function mathHTML(tex: string, displayMode: boolean): HTMLElement {
+		const dom = document.createElement(displayMode ? 'div' : 'span');
+		dom.setAttribute(displayMode ? 'data-math-block' : 'data-math-inline', encodeURIComponent(tex));
+		dom.className = displayMode ? 'math-block' : 'math-inline';
+		dom.contentEditable = 'false';
+		dom.innerHTML = renderKatex(tex, displayMode);
+		return dom;
 	}
 
 	let mathObserver: IntersectionObserver | null = null;
@@ -735,7 +941,7 @@
 		const out: Array<{ path: string; name: string; depth: number }> = [];
 		const walk = (list: any[], depth: number) => {
 			for (const nb of list) {
-				out.push({ path: nb.path, name: nb.name, depth });
+				out.push({ path: nb.relative_path.replace(/\\/g, '/'), name: nb.name, depth });
 				if (nb.children?.length) walk(nb.children, depth + 1);
 			}
 		};
@@ -764,29 +970,11 @@
 		if (!isCurrent() || !v || !vaultRoot || viewerImportBusy) return;
 		viewerImportBusy = true;
 		try {
-			const filename = v.path.split('/').pop() || 'imported.md';
-			const baseName = filename.replace(/\.md$/i, '');
-			const folder = folderPath ? `${vaultRoot}/${folderPath}` : vaultRoot;
-			let dest = `${folder}/${filename}`;
-			// Conflict resolution: append (2), (3)... if file exists
-			let n = 2;
-			// readNote throws if file doesn't exist; use it as an existence probe
-			while (true) {
-				try {
-					await readNote(vaultRoot, dest);
-					if (!isCurrent()) return;
-				} catch {
-					if (!isCurrent()) return;
-					break;
-				}
-				dest = `${folder}/${baseName} (${n}).md`;
-				n++;
-				if (n > 100) throw new Error('Could not find a free filename');
-			}
-			await copyFileTo(v.path, dest);
+			const raw = $activeNote?.raw;
+			if (raw === undefined || $activeNote?.path !== v.path) throw new Error('Reopen the source note before importing.');
+			const content = await importNote(vaultRoot, v.path, folderPath || null, raw, externalNoteReferences(raw));
 			if (!isCurrent()) return;
-			const content = await readNote(vaultRoot, dest);
-			if (!isCurrent()) return;
+			const dest = content.path;
 			// Switch to the imported note as a real vault note
 			$viewerNote = null;
 			$readOnly = false;
@@ -813,12 +1001,7 @@
 	const lowlight = createLowlight(common);
 	lowlight.register('powershell', powershell);
 	const codeLanguages = [...lowlight.listLanguages(), 'mermaid'].sort();
-	const mdit = MarkdownIt({ html: true, linkify: false, breaks: false })
-		.use(markdownItMark)
-		.use(markdownItSup)
-		.use(markdownItSub);
-	// Disable indented code blocks - tab-indented text should stay as text, not become code
-	mdit.disable('code');
+	const mdit = createEditorMarkdownParser();
 
 	function normalizePath(p: string): string {
 		const parts = p.split('/');
@@ -892,6 +1075,17 @@
 						return { 'data-size': attributes.size };
 					},
 				},
+				// From HTML images (`<img width="80">`); saved as HTML again so the size is kept.
+				width: {
+					default: null,
+					parseHTML: (element: HTMLElement) => element.getAttribute('width'),
+					renderHTML: (attributes: Record<string, any>) => attributes.width ? { width: attributes.width } : {},
+				},
+				height: {
+					default: null,
+					parseHTML: (element: HTMLElement) => element.getAttribute('height'),
+					renderHTML: (attributes: Record<string, any>) => attributes.height ? { height: attributes.height } : {},
+				},
 			};
 		},
 	});
@@ -916,15 +1110,31 @@
 		};
 	}
 
+	/** Column alignment from a Markdown table's delimiter row (`:---`, `:---:`, `---:`), kept per cell. */
+	function cellAlignAttributes() {
+		return {
+			align: {
+				default: null,
+				parseHTML: (element: HTMLElement) => {
+					const align = element.style.textAlign || element.getAttribute('align') || '';
+					return align === 'left' || align === 'center' || align === 'right' ? align : null;
+				},
+				renderHTML: (attributes: Record<string, any>) => attributes.align ? { style: `text-align: ${attributes.align}` } : {},
+			},
+		};
+	}
+
 	const CustomTableCell = TableCell.extend({
+		...keepCodeWhitespace,
 		addAttributes() {
-			return { ...this.parent?.(), ...cellColorAttributes() };
+			return { ...this.parent?.(), ...cellColorAttributes(), ...cellAlignAttributes() };
 		},
 	});
 
 	const CustomTableHeader = TableHeader.extend({
+		...keepCodeWhitespace,
 		addAttributes() {
-			return { ...this.parent?.(), ...cellColorAttributes() };
+			return { ...this.parent?.(), ...cellColorAttributes(), ...cellAlignAttributes() };
 		},
 	});
 
@@ -952,10 +1162,10 @@
 			const name = HTMLAttributes.name || 'file.pdf';
 			const showInline = !isMobile && ($appConfig?.pdf_preview ?? false);
 			if (showInline) {
-				const vaultRoot = $appConfig?.active_vault ?? '';
+				const root = currentNoteAssetRoot();
 				const pdfHeight = $appConfig?.pdf_height ?? 600;
-				const absPath = normalizePath(`${vaultRoot}/${decodeURIComponent(src)}`);
-				const displaySrc = convertFileSrc(absPath);
+				const local = resolveFileReference(src, root ? `${root}/.vault-root` : $activeNotePath, root);
+				const displaySrc = convertFileSrc(local.path) + local.suffix;
 				return ['div', mergeAttributes({ 'data-pdf-src': src, 'data-pdf-name': name, class: 'pdf-embed' }),
 					['iframe', { src: displaySrc, width: '100%', height: `${pdfHeight}px`, frameborder: '0' }],
 					['p', { class: 'pdf-label' }, name],
@@ -963,7 +1173,7 @@
 			}
 			// Non-inline: render as a clickable link (mobile + desktop with setting off)
 			return ['div', mergeAttributes({ 'data-pdf-src': src, 'data-pdf-name': name, class: 'pdf-embed-mobile' }),
-				['a', { href: decodeURIComponent(src), class: 'pdf-link-mobile' },
+				['a', { href: src, class: 'pdf-link-mobile' },
 					['span', { class: 'pdf-icon-mobile' }, '\uD83D\uDCC4'],
 					['span', {}, name],
 				],
@@ -1062,6 +1272,15 @@
 		dom.append(header, body);
 	}
 
+	/** Percent-decoding of an attribute from note content: a stray `%` must not abort loading the note. */
+	function decodeNoteAttribute(value: string): string {
+		try {
+			return decodeURIComponent(value);
+		} catch {
+			return value;
+		}
+	}
+
 	function decodeSecretPayload(value: string): string {
 		try {
 			return decodeURIComponent(value);
@@ -1122,13 +1341,11 @@
 		parseHTML() {
 			return [{
 				tag: 'div[data-math-block]',
-				getAttrs: (el: HTMLElement) => ({ tex: decodeURIComponent(el.getAttribute('data-math-block') || '') }),
+				getAttrs: (el: HTMLElement) => ({ tex: decodeNoteAttribute(el.getAttribute('data-math-block') || '') }),
 			}];
 		},
 		renderHTML({ HTMLAttributes }) {
-			const tex = HTMLAttributes.tex || '';
-			const rendered = renderKatex(tex, true);
-			return ['div', { 'data-math-block': encodeURIComponent(tex), class: 'math-block', contenteditable: 'false' }, ['div', { innerHTML: rendered }]];
+			return { dom: mathHTML(HTMLAttributes.tex || '', true) };
 		},
 		addNodeView() {
 			return ({ node, getPos }) => {
@@ -1160,13 +1377,11 @@
 		parseHTML() {
 			return [{
 				tag: 'span[data-math-inline]',
-				getAttrs: (el: HTMLElement) => ({ tex: decodeURIComponent(el.getAttribute('data-math-inline') || '') }),
+				getAttrs: (el: HTMLElement) => ({ tex: decodeNoteAttribute(el.getAttribute('data-math-inline') || '') }),
 			}];
 		},
 		renderHTML({ HTMLAttributes }) {
-			const tex = HTMLAttributes.tex || '';
-			const rendered = renderKatex(tex, false);
-			return ['span', { 'data-math-inline': encodeURIComponent(tex), class: 'math-inline', contenteditable: 'false' }, ['span', { innerHTML: rendered }]];
+			return { dom: mathHTML(HTMLAttributes.tex || '', false) };
 		},
 		addNodeView() {
 			return ({ node, getPos }) => {
@@ -1228,7 +1443,7 @@
 				const apply = (n: any) => {
 					dom.className = 'callout';
 					dom.classList.toggle('is-foldable', !!n.attrs.foldable);
-					dom.classList.toggle('is-folded', !!n.attrs.folded);
+					dom.classList.toggle('is-folded', !!n.attrs.folded && !dom.hasAttribute('data-revealed'));
 					dom.setAttribute('data-callout', n.attrs.type || 'note');
 					dom.setAttribute('data-callout-group', calloutGroup(n.attrs.type));
 				};
@@ -1284,9 +1499,13 @@
 				foldBtn.addEventListener('mousedown', (e) => e.preventDefault());
 				foldBtn.addEventListener('click', (e) => {
 					e.preventDefault();
-					const nowFolded = !dom.classList.contains('is-folded');
+					// A callout revealed from the Outline is open on screen but still folded in the note.
+					const revealed = dom.hasAttribute('data-revealed');
+					dom.removeAttribute('data-revealed');
+					const nowFolded = revealed || !dom.classList.contains('is-folded');
 					if (editor.isEditable) {
 						updateAttr({ folded: nowFolded, foldable: true });
+						if (revealed) dom.classList.add('is-folded');
 					} else {
 						dom.classList.toggle('is-folded', nowFolded);
 						dom.classList.add('is-foldable');
@@ -1320,6 +1539,43 @@
 						return header.contains(event.target as Node);
 					},
 				};
+			};
+		},
+	});
+
+	/**
+	 * The body of a collapsible section is isolating, so Backspace at its start did nothing and the
+	 * caret could never leave it: a section could not be removed from inside, least of all when
+	 * nothing sits above it. Backspace there now steps back into the summary, where the stock
+	 * handler deletes text and then unwraps the section; a section with nothing in it is removed.
+	 */
+	const DetailsWithBodyBackspace = Details.extend({
+		addKeyboardShortcuts() {
+			const parent = this.parent?.() ?? {};
+			return {
+				...parent,
+				Backspace: (props) => {
+					const { state, view } = this.editor;
+					const { empty, $anchor: anchor } = state.selection;
+					const depth = anchor.depth - 1;
+					if (empty && anchor.parentOffset === 0 && depth >= 1 && anchor.node(depth).type.name === 'detailsContent' && anchor.index(depth) === 0) {
+						const content = anchor.node(depth);
+						const details = anchor.node(depth - 1);
+						const detailsPos = anchor.before(depth - 1);
+						const summary = details.firstChild;
+						if (summary?.type.name === 'detailsSummary') {
+							const bodyEmpty = content.childCount === 1 && content.firstChild!.isTextblock && content.firstChild!.content.size === 0;
+							if (summary.content.size === 0 && bodyEmpty) {
+								const tr = state.tr.replaceWith(detailsPos, detailsPos + details.nodeSize, state.schema.nodes.paragraph.create());
+								view.dispatch(tr.setSelection(TextSelection.create(tr.doc, detailsPos + 1)).scrollIntoView());
+							} else {
+								view.dispatch(state.tr.setSelection(TextSelection.create(state.doc, detailsPos + summary.nodeSize)).scrollIntoView());
+							}
+							return true;
+						}
+					}
+					return parent.Backspace?.(props) ?? false;
+				},
 			};
 		},
 	});
@@ -1507,7 +1763,7 @@
 	const MermaidRenderer = Extension.create({
 		name: 'mermaidRendererOptIn',
 		addProseMirrorPlugins() {
-			console.info('[CueLM] Mermaid renderer (opt-in) initialised');
+			console.info('[HelixNotes] Mermaid renderer (opt-in) initialised');
 
 			let mermaidPromise: Promise<any> | null = null;
 			const svgCache = new Map<string, string>();
@@ -1559,6 +1815,10 @@
 			const clone = svgEl.cloneNode(true) as SVGElement;
 			if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
 			if (!clone.getAttribute('xmlns:xlink')) clone.setAttribute('xmlns:xlink', 'http://www.w3.org/1999/xlink');
+			// The labels inherit their font from the editor; a standalone image has nothing to inherit from.
+			const shown = getComputedStyle(svgEl);
+			clone.style.fontFamily = shown.fontFamily;
+			clone.style.lineHeight = shown.lineHeight;
 
 			// Sanitize: remove external resource references that taint canvas on WebKitGTK ("The operation is insecure")
 			clone.querySelectorAll('image').forEach((img) => {
@@ -1730,7 +1990,9 @@
 						return;
 					}
 					const id = `mermaid-${++renderCounter}`;
-					const { svg } = await mermaid.render(id, source);
+					// Measure labels where the diagram is shown: measured under <body>, they get a
+					// different line height than the editor's and the last line of a box is cut off.
+					const { svg } = await mermaid.render(id, source, container.isConnected ? container : undefined);
 					svgCache.set(source, svg);
 					if (container.isConnected) {
 						container.classList.remove('mermaid-render-loading');
@@ -2463,7 +2725,8 @@
 
 	let wikiLinkMenu = $state<{ x: number; y: number; query: string; from: number } | null>(null);
 	let wikiLinkSelectedIndex = $state(0);
-	let wikiLinkTitlesCache = $state<NoteTitleEntry[]>([]);
+	// Replaced, never mutated: the markdown parser keeps one lookup index per array.
+	let wikiLinkTitlesCache = $state.raw<NoteTitleEntry[]>([]);
 	let wikiLinkTypedByUser = false;
 	// Disambiguation state: when ]] auto-close finds multiple matches
 	let wikiLinkDisambigEntries = $state<NoteTitleEntry[] | null>(null);
@@ -2504,6 +2767,18 @@
 			.map(x => x.entry);
 		return scored;
 	});
+
+	let wikiLinkVisible = $derived(wikiLinkFiltered.slice(0, 12));
+	// The note name typed after `[[` when no note has that title yet.
+	let wikiLinkCreateTitle = $derived.by(() => {
+		if (!wikiLinkMenu || wikiLinkDisambigEntries) return null;
+		const noteRef = wikiLinkMenu.query.split('|')[0].replace(/#.*$/, '').replace(/\^.*$/, '');
+		const title = noteRef.split('/').pop()!.trim();
+		if (!title) return null;
+		const lower = title.toLowerCase();
+		return wikiLinkTitlesCache.some(e => e.title.toLowerCase() === lower) ? null : title;
+	});
+	let wikiLinkRowCount = $derived(wikiLinkVisible.length + (wikiLinkCreateTitle ? 1 : 0));
 
 	// Set of lowercase titles that appear more than once (for disambiguation display)
 	let wikiLinkDuplicateTitles = $derived.by(() => {
@@ -2599,9 +2874,13 @@
 			const entry = { path, title: event.note.meta.title };
 			const index = wikiLinkTitlesCache.findIndex(note => note.path === path);
 			if (index >= 0) {
-				if (wikiLinkTitlesCache[index].title !== entry.title) wikiLinkTitlesCache[index] = entry;
+				if (wikiLinkTitlesCache[index].title !== entry.title) {
+					const updated = wikiLinkTitlesCache.slice();
+					updated[index] = entry;
+					wikiLinkTitlesCache = updated;
+				}
 			} else {
-				wikiLinkTitlesCache.push(entry);
+				wikiLinkTitlesCache = [...wikiLinkTitlesCache, entry];
 			}
 			if (wikiTitleRefresh) pendingWikiTitleChanges.set(path, entry);
 		} else if (event.event_type === 'remove') {
@@ -2673,6 +2952,7 @@
 					);
 					ignoreNextUpdate = true;
 					editor.view.dispatch(tr);
+					ignoreNextUpdate = false;
 				}
 				refreshWikiLinkTitles();
 			} catch (e) {
@@ -2709,8 +2989,55 @@
 		editor.view.focus();
 	}
 
+	// Inserts the link right away, then creates the note and points the link at it.
+	async function createNoteFromWikiLinkMenu() {
+		const title = wikiLinkCreateTitle;
+		const origin = captureOrigin();
+		if (!editor || !wikiLinkMenu || !title || !canInsert(origin)) return;
+		const rawQuery = wikiLinkMenu.query;
+		const pipeIdx = rawQuery.indexOf('|');
+		const noteRef = (pipeIdx >= 0 ? rawQuery.slice(0, pipeIdx) : rawQuery).trim();
+		const display = (pipeIdx >= 0 ? rawQuery.slice(pipeIdx + 1).trim() : '') || noteRef;
+		const transaction = replaceWithWikiLink(
+			editor.state,
+			wikiLinkMenu.from,
+			editor.state.selection.from,
+			display,
+			{ title: noteRef, path: '', aliased: display !== noteRef },
+		);
+		closeWikiLinkMenu();
+		editor.view.dispatch(transaction);
+		editor.view.focus();
+		const notebookRel = origin.path!.replace(/\\/g, '/').replace(origin.vault!.replace(/\\/g, '/') + '/', '').split('/').slice(0, -1).join('/');
+		try {
+			const { createNote } = await import('$lib/api');
+			const created = await createNote(origin.vault!, notebookRel || null, title);
+			refreshWikiLinkTitles();
+			if (!editor || !isOriginCurrent(origin)) return;
+			const path = normalizeWikiPath(created.path);
+			const tr = editor.state.tr;
+			editor.state.doc.descendants((node: any, pos: number) => {
+				const mark = node.isText && node.marks.find((m: any) => m.type.name === 'wikiLink');
+				if (!mark || mark.attrs.path || mark.attrs.title !== noteRef) return;
+				tr.addMark(pos, pos + node.nodeSize, mark.type.create({ ...mark.attrs, path }));
+			});
+			if (!tr.steps.length) return;
+			// Keep text typed right after the link out of it, as when the link was inserted.
+			tr.setStoredMarks(editor.state.storedMarks);
+			ignoreNextUpdate = true;
+			editor.view.dispatch(tr);
+			ignoreNextUpdate = false;
+		} catch (e) {
+			console.error('Failed to create note from wiki-link menu:', e);
+		}
+	}
+
 	function executeWikiLinkCommand(index: number) {
 		const items = wikiLinkFiltered;
+		if (index >= wikiLinkVisible.length && wikiLinkCreateTitle) {
+			void createNoteFromWikiLinkMenu();
+			return;
+		}
 		if (index < 0 || index >= items.length) return;
 		if (wikiLinkDisambigEntries) {
 			// In disambiguation mode: use stored display/ref
@@ -2726,7 +3053,9 @@
 		// the user to edit a title in-place. Moving the cursor one step past the mark
 		// exits it, so typing plain text after a link still works normally.
 		inclusive: true,
-		excludes: 'link',
+		// Naming `link` alone would let two wikiLink marks sit on the same text, and
+		// updating a link's attrs would then write `[[Old|[[New]]]]`.
+		excludes: 'wikiLink link',
 		addAttributes() {
 			return {
 				title: { default: null },
@@ -2831,16 +3160,16 @@
 							if (!wikiLinkMenu) return false;
 							if (event.key === 'ArrowDown') {
 								event.preventDefault();
-								wikiLinkSelectedIndex = (wikiLinkSelectedIndex + 1) % Math.max(1, wikiLinkFiltered.length);
+								wikiLinkSelectedIndex = (wikiLinkSelectedIndex + 1) % Math.max(1, wikiLinkRowCount);
 								return true;
 							}
 							if (event.key === 'ArrowUp') {
 								event.preventDefault();
-								wikiLinkSelectedIndex = (wikiLinkSelectedIndex - 1 + wikiLinkFiltered.length) % Math.max(1, wikiLinkFiltered.length);
+								wikiLinkSelectedIndex = (wikiLinkSelectedIndex - 1 + wikiLinkRowCount) % Math.max(1, wikiLinkRowCount);
 								return true;
 							}
 							if (event.key === 'Enter' || event.key === 'Tab') {
-								if (wikiLinkFiltered.length > 0) {
+								if (wikiLinkRowCount > 0) {
 									event.preventDefault();
 									executeWikiLinkCommand(wikiLinkSelectedIndex);
 									return true;
@@ -3124,6 +3453,10 @@
 		{ name: 'Gray', value: '#374151' },
 	];
 
+	function currentNoteAssetRoot(): string | null {
+		return noteAssetRoot($activeNotePath, $appConfig?.active_vault ?? null, $appConfig?.vaults.map(vault => vault.path) ?? []);
+	}
+
 	function resolveImageSrc(src: string): string {
 		// Already a proxied, asset, data, or blob URL
 		if (src.startsWith('data:') || src.startsWith('asset:') || src.startsWith('blob:') || src.startsWith('imgproxy:') || src.startsWith('http://imgproxy.localhost') || src.startsWith('https://imgproxy.localhost')) {
@@ -3138,40 +3471,24 @@
 		if (src.startsWith('http://') || src.startsWith('https://')) {
 			return convertFileSrc(src, 'imgproxy');
 		}
-		// Decode URL encoding and undo the extra leading slash added to Windows drive paths.
-		let decoded: string;
-		try {
-			decoded = normalizeLocalAssetPath(decodeURIComponent(src));
-		} catch {
-			decoded = normalizeLocalAssetPath(src);
-		}
-		// Keep repairing legacy POSIX paths that were saved with duplicate leading slashes.
-		if (/^\/{2,}/.test(decoded)) decoded = decoded.replace(/^\/{2,}/, '/');
-		if (decoded.startsWith('/') || /^[A-Za-z]:\//.test(decoded)) {
-			return convertFileSrc(normalizePath(decoded));
-		}
-		// Paths containing .cuelm/ are vault-root relative (our own attachments)
-		if (decoded.includes('.cuelm/')) {
-			const vaultRoot = $appConfig?.active_vault;
-			if (vaultRoot) {
-				// Extract from .cuelm/ onward in case of prefixed subdir paths
-				const idx = decoded.indexOf('.cuelm/');
-				return convertFileSrc(`${vaultRoot}/${decoded.substring(idx)}`);
-			}
-		}
-		// Standard markdown: resolve relative paths against the note's directory
-		const notePath = $activeNotePath;
-		if (notePath) {
-			const normalizedNotePath = notePath.replace(/\\/g, '/');
-			const noteDir = normalizedNotePath.substring(0, normalizedNotePath.lastIndexOf('/'));
-			return convertFileSrc(normalizePath(`${noteDir}/${decoded}`));
-		}
-		// Last fallback: vault root
-		const vaultRoot = $appConfig?.active_vault;
-		if (vaultRoot) {
-			return convertFileSrc(normalizePath(`${vaultRoot}/${decoded}`));
-		}
-		return src;
+		const local = resolveFileReference(src, $activeNotePath, currentNoteAssetRoot());
+		return convertFileSrc(normalizePath(local.path)) + local.suffix;
+	}
+
+	// A web image whose load fails stays blank until the note is drawn again, so ask again a
+	// few times. Counted per address, because the editor may replace the element meanwhile.
+	const imageRetries = new Map<string, number>();
+	function retryFailedImage(event: Event) {
+		const image = event.target;
+		if (!(image instanceof HTMLImageElement)) return;
+		const src = image.getAttribute('src') ?? '';
+		if (!src.startsWith('imgproxy:') && !src.startsWith('http://imgproxy.localhost') && !src.startsWith('https://imgproxy.localhost')) return;
+		const attempt = imageRetries.get(src) ?? 0;
+		if (attempt >= 3) return;
+		imageRetries.set(src, attempt + 1);
+		setTimeout(() => {
+			if (image.isConnected && image.getAttribute('src') === src) image.src = src;
+		}, 1000 * 3 ** attempt);
 	}
 
 	function normalizeImageHtml(html: string): string {
@@ -3440,10 +3757,11 @@
 	$effect(() => {
 		if (trashPreview && !$readOnly) $readOnly = true;
 		const ro = $readOnly;
+		const inspecting = showHistory;
 		untrack(() => {
 			if (editor) {
 				if (ro && $editorDirty) forceSave();
-				editor.setEditable(!ro && !externalOperationBusy);
+				editor.setEditable(!ro && !inspecting && !externalOperationBusy);
 			}
 		});
 	});
@@ -3457,24 +3775,15 @@
 		});
 	});
 
-	function countWords(text: string): number {
-		return text.trim() ? text.trim().split(/\s+/).filter(Boolean).length : 0;
-	}
-
 	function updateCounts() {
 		if (!showInfo || editorDisposed) return;
 		let text = '';
 		if (get(sourceMode)) {
-			text = source.state.doc.toString()
-				.replace(/^---[\s\S]*?---\n?/, '')
-				.replace(/!\[[^\]]*\]\([^)]*\)/g, '')
-				.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1')
-				.replace(/^#{1,6}\s+/gm, '')
-				.replace(/[*_~`]+/g, '')
-				.replace(/^>\s*/gm, '')
-				.replace(/^[-*+]\s+/gm, '');
+			text = markdownCountText(source.state.doc.toString());
 		} else if (editor) {
-			text = editor.state.doc.textContent;
+			// textContent runs blocks and table cells together, so `a` and `b` in two cells read as `ab`.
+			const { doc } = editor.state;
+			text = doc.textBetween(0, doc.content.size, ' ', ' ');
 		}
 		wordCount = countWords(text);
 		charCount = text.replace(/\s/g, '').length;
@@ -3513,24 +3822,63 @@
 
 	let historyRequest = 0;
 
+	function closeHistory() {
+		historyRequest++;
+		showHistory = false;
+		historyVersions = [];
+		historySelected = null;
+		historyPreview = null;
+		historyLoading = false;
+		historyError = null;
+		historyPreviewLoading = false;
+		historyPreviewError = null;
+	}
+
 	async function toggleHistory() {
+		if (showHistory) {
+			closeHistory();
+			return;
+		}
+		closeNoteSearch(false);
+		endToolbarCustomization();
+		historyWorking = $editorDirty
+			? ($sourceMode ? restoreTitleH1(source.state.doc.toString()) : editorToMarkdown())
+			: ($activeNote?.content ?? '');
+		showHistory = true;
+		await loadHistory();
+	}
+
+	async function loadHistory() {
 		const origin = captureOrigin();
 		const request = ++historyRequest;
-		showHistory = !showHistory;
-		historyPreview = null;
+		const current = () => !editorDisposed && request === historyRequest && showHistory;
+		historyVersions = [];
 		historySelected = null;
+		historyPreview = null;
+		historyPreviewLoading = false;
+		historyPreviewError = null;
+		historyError = null;
 		historyLoading = false;
-		if (!showHistory || !origin.noteId || !origin.vault) return;
+		if (!origin.noteId || !origin.vault) {
+			historyError = 'Version history is unavailable for this note.';
+			return;
+		}
 		historyLoading = true;
 		try {
 			const versions = await getNoteVersions(origin.vault, origin.noteId);
-			if (!isOriginCurrent(origin) || request !== historyRequest || !showHistory) return;
+			if (!current()) return;
+			if (!isOriginCurrent(origin)) {
+				historyError = 'The editor changed while versions were loading. Retry to reload them.';
+				return;
+			}
 			historyVersions = versions;
+			historyLoading = false;
+			if (versions[0]) void previewVersion(versions[0]);
 		} catch (e) {
 			console.error('Failed to load versions:', e);
-			if (isOriginCurrent(origin) && request === historyRequest) historyVersions = [];
+			if (current()) historyError = `Could not load versions: ${String(e)}`;
 		} finally {
-			if (isOriginCurrent(origin) && request === historyRequest) historyLoading = false;
+			if (current()) historyLoading = false;
 		}
 	}
 
@@ -3538,36 +3886,39 @@
 		const origin = captureOrigin();
 		if (!origin.noteId || !origin.vault) return;
 		const request = ++historyRequest;
+		const current = () => !editorDisposed && request === historyRequest && showHistory;
 		historySelected = v;
 		historyPreview = null;
+		historyPreviewError = null;
+		historyPreviewLoading = true;
 		try {
 			const content = await getNoteVersionContent(origin.vault, origin.noteId, v.timestamp);
-			if (isOriginCurrent(origin) && request === historyRequest && showHistory) historyPreview = content;
+			if (!current()) return;
+			if (!isOriginCurrent(origin)) {
+				historyPreviewError = 'The editor changed while this version was loading. Select it again to retry.';
+				return;
+			}
+			historyPreview = content;
 		} catch (e) {
 			console.error('Failed to load version:', e);
+			if (current()) historyPreviewError = `Could not load this version: ${String(e)}`;
+		} finally {
+			if (current()) historyPreviewLoading = false;
 		}
 	}
 
-	async function restoreVersion() {
-		if (!$activeNote || !$activeNotePath || !historySelected) return;
-		const origin = captureOrigin();
-		const selected = historySelected;
-		const request = historyRequest;
-		if (!canInsert(origin)) return;
+	function restoreVersion() {
+		if (!$activeNote || !$activeNotePath || !historySelected || historyPreview === null || historyPreviewLoading) return;
+		if (!canInsert(captureOrigin())) return;
+		if ($editorDirty && !window.confirm('Restore this version and replace your unsaved draft?')) return;
 		try {
-			const raw = historyPreview ?? await getNoteVersionContent(origin.vault!, origin.noteId!, selected.timestamp);
-			if (!isOriginCurrent(origin, true) || !canInsert(origin) || request !== historyRequest || !showHistory) return;
-			// The raw content includes frontmatter - parse out the body
-			const fmEnd = raw.indexOf('---', 4);
-			const body = fmEnd > 0 ? raw.substring(raw.indexOf('\n', fmEnd) + 1) : raw;
+			const body = splitSnapshot(historyPreview).body;
 			if ($sourceMode) {
 				source.replace(stripTitleH1(body));
 			} else if (editor) {
 				editor.commands.setContent(markdownToHtml(body));
 			}
-			historyPreview = null;
-			historySelected = null;
-			showHistory = false;
+			closeHistory();
 		} catch (e) {
 			console.error('Failed to restore version:', e);
 		}
@@ -3588,22 +3939,14 @@
 		}
 	}
 
+	const historyDateFormatter = new Intl.DateTimeFormat(undefined, {
+		year: 'numeric', month: 'short', day: 'numeric',
+		hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3,
+	});
+
 	function formatVersionDate(iso: string): string {
-		try {
-			const d = new Date(iso);
-			const now = new Date();
-			const diffMs = now.getTime() - d.getTime();
-			const diffMins = Math.floor(diffMs / 60000);
-			if (diffMins < 1) return 'Just now';
-			if (diffMins < 60) return `${diffMins}m ago`;
-			const diffHours = Math.floor(diffMins / 60);
-			if (diffHours < 24) return `${diffHours}h ago`;
-			const diffDays = Math.floor(diffHours / 24);
-			if (diffDays < 7) return `${diffDays}d ago`;
-			return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: d.getFullYear() !== now.getFullYear() ? 'numeric' : undefined });
-		} catch {
-			return iso;
-		}
+		const date = new Date(iso);
+		return Number.isNaN(date.getTime()) ? iso : historyDateFormatter.format(date);
 	}
 
 	function formatVersionSize(bytes: number): string {
@@ -3722,18 +4065,40 @@
 		requestAnimationFrame(apply);
 	}
 
+	/**
+	 * Converting or showing a note failed, so the editor still holds the previous note while every
+	 * other piece of state already points at this one. Nothing may be saved from it: forget the
+	 * loaded path (saving and inserting both require it), empty the view and lock it.
+	 */
+	function failNoteLoad(path: string, error: unknown) {
+		console.error('Failed to open note in the editor:', error);
+		loadedPath = '';
+		$editorDirty = false;
+		saves.cancelScheduled();
+		isLoadingNote = false;
+		if (editor) {
+			ignoreNextUpdate = true;
+			try { editor.commands.clearContent(); } catch { /* Saving is already blocked. */ }
+			ignoreNextUpdate = false;
+			clearEditorHistory();
+			editor.setEditable(false);
+		}
+		loadFailure = path;
+	}
+
 	export function loadNote(path: string, content: string, taskTarget?: TaskRecord) {
+		loadFailure = null;
+		imageRetries.clear();
+		cancelProgressiveLoad();
 		endToolbarCustomization();
+		clearOutline();
 		cancelCounts();
 		closeNoteSearch(false);
 		saves.startSession($activeNote?.raw ?? content);
 		saveError = null;
 		retryingSave = false;
 		closeAiMenu();
-		showHistory = false;
-		historyPreview = null;
-		historySelected = null;
-		historyVersions = [];
+		closeHistory();
 		secretModal = null;
 		linkModal = false;
 		textContextMenu = null;
@@ -3745,13 +4110,14 @@
 		linkContextMenu = null;
 		imageToolbar = null;
 		tableContextMenu = null;
-		historyRequest++;
-		historyLoading = false;
 		savedBlobImages = new Map();
 		$editorDirty = false;
 		rememberLoadedNoteScroll();
 		const scrollPosition = taskTarget ? undefined : noteScrollPositions.get(path);
+		
+		window.removeEventListener("cuelm-open-note", handleOpenNote);
 		clearTargetReveal();
+
 		const revealRequest = ++targetRevealRequest;
 		const revealTarget = taskTarget ? resolveTaskTarget(taskTarget, content) : null;
 		loadedPath = path;
@@ -3782,33 +4148,142 @@
 			updateCounts();
 		} else if (editorElement && editor) {
 			// Editor already exists, just swap content
-			const html = markdownToHtml(content);
-			ignoreNextUpdate = true;
-			editor.commands.setContent(html);
-			// Clear undo/redo history so it doesn't bleed across notes
-			clearEditorHistory();
-			updateCounts();
-			// Restore scroll and reset the cursor after all ProseMirror/Svelte DOM updates settle.
-			tick().then(() => {
-				if (!saves.isCurrentSession(loadSnapshot) || path !== loadedPath) return;
-				if (editorBody) restoreNoteScroll(editorBody, scrollPosition?.rich ?? 0, path);
-				// Explicitly reset ProseMirror selection to start so TipTap's focus()
-				// (triggered by checkbox clicks etc.) doesn't scroll to the old note's cursor position.
-				if (editor) {
-					const tr = editor.state.tr.setSelection(TextSelection.atStart(editor.state.doc));
-					// No tr.scrollIntoView() - must not trigger any scroll
-					editor.view.dispatch(tr);
+			try {
+				const html = markdownToHtml(content);
+				// Retire the outgoing native selection before its DOM is replaced, or the webview can keep
+				// painting the old caret. Selections in other controls are left alone.
+				const editorDom = editor.view.dom;
+				const domSelection = editorDom.ownerDocument.getSelection();
+				if (domSelection && (editorDom.contains(domSelection.anchorNode) || editorDom.contains(domSelection.focusNode))) {
+					domSelection.removeAllRanges();
 				}
-				isLoadingNote = false;
-			});
+				const settle = () => {
+					updateCounts();
+					// Restore scroll and reset the cursor after all ProseMirror/Svelte DOM updates settle.
+					tick().then(() => {
+						if (!saves.isCurrentSession(loadSnapshot) || path !== loadedPath) return;
+						if (editorBody) restoreNoteScroll(editorBody, scrollPosition?.rich ?? 0, path);
+						// Explicitly reset ProseMirror selection to start so TipTap's focus()
+						// (triggered by checkbox clicks etc.) doesn't scroll to the old note's cursor position.
+						if (editor) {
+							const tr = editor.state.tr.setSelection(TextSelection.atStart(editor.state.doc));
+							// No tr.scrollIntoView() - must not trigger any scroll
+							editor.view.dispatch(tr);
+						}
+						isLoadingNote = false;
+					});
+				};
+				if (content.length > LARGE_DOC_CHARS) {
+					// Very large note: show the start at once and build the rest in slices.
+					loadDocumentProgressively(html, () => {
+						settle();
+						if (showOutline) updateOutline();
+						scheduleTaskReveal(path, revealTarget, revealRequest);
+					});
+					return;
+				}
+				// An identical document emits no update, so the flag is cleared here, not by the update
+				// handler: left set, it would swallow the user's next edit.
+				ignoreNextUpdate = true;
+				editor.commands.setContent(html);
+				ignoreNextUpdate = false;
+				// Clear undo/redo history so it doesn't bleed across notes
+				clearEditorHistory();
+				settle();
+			} catch (error) {
+				failNoteLoad(path, error);
+				return;
+			}
 		} else {
 			// Editor element not in DOM yet (first note load).
 			// Store content and let the $effect on editorElement handle init.
 			pendingContent = content;
 			isLoadingNote = false;
 		}
-		if (!isMobile && showOutline) scheduleOutline();
+		if (showOutline) updateOutline();
 		scheduleTaskReveal(path, revealTarget, revealRequest);
+	}
+
+	// ---- Progressive loading of very large notes
+	// Building the page for a few hundred KB of Markdown in one go freezes it for about half a second.
+	// Instead the document is built in slices, the first screen at once. Until it is complete the
+	// document is partial: the guard plugin rejects edits to it, and any interaction with the editor,
+	// or anything that serializes it, first finishes the build synchronously.
+	const FIRST_SLICE_BLOCKS = 40;
+	const SLICE_BLOCKS = 150;
+	const LOAD_INTERRUPTS = ['keydown', 'beforeinput', 'compositionstart', 'paste', 'cut', 'drop', 'pointerdown'] as const;
+	let progressiveLoad: { finish: () => void; cancel: () => void } | null = null;
+
+	function cancelProgressiveLoad() {
+		progressiveLoad?.cancel();
+	}
+
+	function finishProgressiveLoad() {
+		progressiveLoad?.finish();
+	}
+
+	function loadDocumentProgressively(html: string, whenLoaded: () => void) {
+		const view = editor!.view;
+		const schema = editor!.schema;
+		const plugins = editor!.state.plugins;
+		const nodes = Array.from(new DOMParser().parseFromString(`<body>${html}</body>`, 'text/html').body.childNodes);
+		const parser = PMDOMParser.fromSchema(schema);
+		const blocks: ProseMirrorNode[] = [];
+		let next = 0;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let rendered: ProseMirrorNode | null = null;
+
+		let dirty = false;
+		const addSlice = (count: number) => {
+			dirty = true;
+			const container = document.createElement('div');
+			for (const node of nodes.slice(next, next + count)) container.append(node);
+			next += count;
+			parser.parse(container).forEach((block) => blocks.push(block));
+		};
+		const render = () => {
+			if (!dirty) return;
+			dirty = false;
+			// updateState does not run plugins' appendTransaction, so no stray trailing paragraph appears mid-note.
+			view.updateState(EditorState.create({ doc: schema.topNodeType.create(null, blocks), plugins }));
+			rendered = view.state.doc;
+		};
+		const interrupt = (event: Event) => {
+			// Only interaction with the editor itself (its text, toolbar and menus) counts, not choosing another note.
+			if (event.target instanceof Element && event.target.closest('.editor-container')) finish();
+		};
+		const stop = () => {
+			clearTimeout(timer);
+			for (const type of LOAD_INTERRUPTS) window.removeEventListener(type, interrupt, true);
+			if (progressiveLoad === handle) progressiveLoad = null;
+		};
+		const finish = () => {
+			if (progressiveLoad !== handle) return;
+			if (view.state.doc === rendered && !view.isDestroyed) {
+				while (next < nodes.length) addSlice(SLICE_BLOCKS);
+				render();
+			}
+			stop();
+			// TipTap normalizes a new document on its first transaction (a trailing paragraph); run it now.
+			ignoreNextUpdate = true;
+			if (!view.isDestroyed) view.dispatch(view.state.tr);
+			ignoreNextUpdate = false;
+			whenLoaded();
+		};
+		const step = () => {
+			if (progressiveLoad !== handle) return;
+			if (view.state.doc !== rendered) { finish(); return; }  // something else replaced the document
+			// Each render re-walks everything already built, so slices double in size: few renders, no long freeze.
+			addSlice(Math.max(SLICE_BLOCKS, next));
+			render();
+			if (next < nodes.length) timer = setTimeout(step, 0); else finish();
+		};
+		const handle = { finish, cancel: stop };
+		progressiveLoad = handle;
+		addSlice(FIRST_SLICE_BLOCKS);
+		render();
+		for (const type of LOAD_INTERRUPTS) window.addEventListener(type, interrupt, true);
+		if (next < nodes.length) timer = setTimeout(step, 0); else finish();
 	}
 
 	function stripTitleH1(md: string): string {
@@ -3821,8 +4296,30 @@
 		return restoreTitleHeading(md, hiddenTitleHeading);
 	}
 
+	/**
+	 * With the title heading shown in the body, the heading and the title field are the same text.
+	 * When the field changes, the leading heading that still reads as the old title follows it;
+	 * left behind, it was saved under a second heading carrying the new title.
+	 */
+	function syncVisibleTitleHeading(previous: string, next: string) {
+		if (hiddenTitleHeading || !next.trim()) return;
+		const same = (text: string) => text.trim().toLowerCase() === previous.trim().toLowerCase();
+		if ($sourceMode) {
+			const text = source.state.doc.toString();
+			const heading = /^(\s*# )([^\n]*)/.exec(text);
+			if (heading && same(heading[2])) source.replace(next.trim(), heading[1].length, heading[0].length);
+			return;
+		}
+		if (!editor) return;
+		finishProgressiveLoad();
+		const first = editor.state.doc.firstChild;
+		if (first?.type.name !== 'heading' || first.attrs.level !== 1 || !same(first.textContent)) return;
+		editor.view.dispatch(editor.state.tr.insertText(next.trim(), 1, 1 + first.content.size));
+	}
+
 	function editorToMarkdown(): string {
 		if (!editor) return '';
+		finishProgressiveLoad();
 		const md = prosemirrorToMarkdown(editor.state.doc);
 		return restoreTitleH1(md);
 	}
@@ -3839,42 +4336,56 @@
 		return hasImage && !hasOther;
 	}
 
+	/**
+	 * A paragraph saved as one `![...](...)` line, the only kind the parser reads a blank line above
+	 * as an empty paragraph for. An image in a link, or with a size (saved as HTML), is not one.
+	 */
+	function isImageLine(node: any): boolean {
+		if (node.type.name === 'image') return true;
+		if (node.type.name !== 'paragraph' || node.childCount !== 1) return false;
+		const image = node.firstChild;
+		return image.type.name === 'image' && image.marks.length === 0 && !image.attrs.width && !image.attrs.height;
+	}
+
+	// Saving used to serialize every block of the note each time. Document nodes are immutable and
+	// an edit replaces only the blocks it touches, so the Markdown of each top-level block is kept
+	// and a save re-serializes just what changed. The cache is dropped when the note or vault
+	// changes, since image paths are written relative to them.
+	let serializedBlocks = new WeakMap<object, MarkdownBlock>();
+	let serializedBlocksFor = '';
+
 	function prosemirrorToMarkdown(doc: any): string {
-		const entries: { text: string; isImage: boolean }[] = [];
+		const owner = `${$appConfig?.active_vault ?? ''}\n${$activeNotePath}`;
+		if (owner !== serializedBlocksFor) {
+			serializedBlocks = new WeakMap();
+			serializedBlocksFor = owner;
+		}
+		const blocks: MarkdownBlock[] = [];
 		doc.forEach((node: any) => {
-			const isEmpty = node.type.name === 'paragraph' && node.childCount === 0;
-			// Preserve every empty paragraph as <!-- --> so markdown round-trip keeps the user's
-			// vertical spacing exactly. markdownToHtml converts the marker back to <p></p> on load.
-			if (isEmpty) {
-				entries.push({ text: '<!-- -->', isImage: false });
-				return;
+			let block = serializedBlocks.get(node);
+			if (!block) {
+				// Preserve every empty paragraph so markdown round-trip keeps the user's vertical
+				// spacing exactly. The parser converts the marker (or a blank line before an image)
+				// back to <p></p> on load.
+				const isEmpty = node.type.name === 'paragraph' && node.childCount === 0;
+				block = { text: isEmpty ? '' : serializeNode(node), isImage: !isEmpty && isImageLine(node), isEmpty };
+				serializedBlocks.set(node, block);
 			}
-			entries.push({ text: serializeNode(node), isImage: isImageNode(node) });
+			blocks.push(block);
 		});
-		while (entries.length > 0 && entries[entries.length - 1].text === '<!-- -->') {
-			entries.pop();
-		}
-		// Join: skip extra \n separator before image nodes so they don't get unwanted blank lines
-		let result = '';
-		for (let i = 0; i < entries.length; i++) {
-			if (i === 0) {
-				result = entries[i].text;
-			} else {
-				const separator = entries[i].isImage ? '' : '\n';
-				result += separator + entries[i].text;
-			}
-		}
-		return result.replace(/\n{3,}/g, '\n\n').trim() + '\n';
+		return joinMarkdownBlocks(blocks);
 	}
 
 	function tableToMarkdown(table: any): string {
 		const rows: string[][] = [];
+		const aligns: (string | null)[] = [];
 		let hasHeader = false;
 		table.forEach((row: any) => {
 			if (row.type.name !== 'tableRow') return;
 			const cells: string[] = [];
 			row.forEach((cell: any) => {
 				if (cell.type.name === 'tableHeader') hasHeader = true;
+				if (rows.length === 0) aligns.push(cell.attrs.align || null);
 				const cellText: string[] = [];
 				cell.forEach((p: any) => {
 					cellText.push(serializeInline(p));
@@ -3889,7 +4400,9 @@
 		rows.forEach((row, i) => {
 			lines.push('| ' + row.join(' | ') + ' |');
 			if (i === 0 && hasHeader) {
-				lines.push('| ' + Array(colCount).fill('---').join(' | ') + ' |');
+				const delimiters = Array.from({ length: colCount }, (_, column) =>
+					aligns[column] === 'left' ? ':---' : aligns[column] === 'center' ? ':---:' : aligns[column] === 'right' ? '---:' : '---');
+				lines.push('| ' + delimiters.join(' | ') + ' |');
 			}
 		});
 		return lines.join('\n');
@@ -3921,27 +4434,32 @@
 		closeTableContextMenu();
 	}
 
+	function serializeHTMLNode(node: ProseMirrorNode): string {
+		const container = document.createElement('div');
+		container.appendChild(DOMSerializer.fromSchema(editor!.schema).serializeNode(node));
+		// The editor shows images through machine-specific asset URLs; notes store portable paths.
+		for (const image of container.querySelectorAll('img[src]')) image.setAttribute('src', stripAssetSrc(image.getAttribute('src') ?? ''));
+		return container.innerHTML;
+	}
+
 	function serializeNode(node: any): string {
 		switch (node.type.name) {
 			case 'paragraph': {
 				const align = node.attrs.textAlign;
 				if (align && align !== 'left') {
-					return `<p style="text-align: ${align}">${serializeInline(node)}</p>\n`;
+					return serializeHTMLNode(node) + '\n';
 				}
-				return serializeInline(node) + '\n';
+				return serializeParagraphText(node) + '\n';
 			}
 			case 'heading': {
 				const align = node.attrs.textAlign;
 				if (align && align !== 'left') {
-					return `<h${node.attrs.level} style="text-align: ${align}">${serializeInline(node)}</h${node.attrs.level}>\n`;
+					return serializeHTMLNode(node) + '\n';
 				}
 				return '#'.repeat(node.attrs.level) + ' ' + serializeInline(node) + '\n';
 			}
-			case 'codeBlock': {
-				const lang = node.attrs.language || '';
-				const code = node.textContent.replace(/\n+$/, '');
-				return '```' + lang + '\n' + code + '\n```\n';
-			}
+			case 'codeBlock':
+				return serializeCodeBlock(node.textContent, node.attrs.language || '');
 			case 'blockquote': {
 				const blocks: string[] = [];
 				node.forEach((child: any) => {
@@ -3959,7 +4477,7 @@
 			}
 			case 'orderedList': {
 				const items: string[] = [];
-				let i = node.attrs.start || 1;
+				let i = node.attrs.start ?? 1;
 				node.forEach((child: any) => { items.push(`${i++}. ` + serializeListItem(child)); });
 				return items.join('') + '\n';
 			}
@@ -3995,10 +4513,7 @@
 					return true;
 				});
 				if (hasStyling || !hasHeaderRow) {
-					const tempDiv = document.createElement('div');
-					const frag = DOMSerializer.fromSchema(editor!.schema).serializeNode(node);
-					tempDiv.appendChild(frag);
-					return tempDiv.innerHTML + '\n';
+					return serializeHTMLNode(node) + '\n';
 				}
 				return tableToMarkdown(node) + '\n';
 			}
@@ -4018,45 +4533,79 @@
 			case 'details': {
 				// Markdown HTML blocks end at a blank line, including one inside <pre><code>.
 				// Keep the details element on one source line; HTML parsing restores each encoded newline.
-				const detDiv = document.createElement('div');
-				const detFrag = DOMSerializer.fromSchema(editor!.schema).serializeNode(node);
-				detDiv.appendChild(detFrag);
-				return detDiv.innerHTML.replace(/\n/g, '&#10;') + '\n';
+				return serializeHTMLNode(node).replace(/\n/g, '&#10;') + '\n';
 			}
 			case 'image': {
 				const src = stripAssetSrc(node.attrs.src || '');
 				if (!src) return ''; // Skip images with unresolved blob: URLs
-				const alt = node.attrs.alt || '';
-				const size = node.attrs['data-size'] || node.attrs.size || 'full';
-				const sizeSuffix = size && size !== 'full' ? `|size=${size}` : '';
-				return `![${alt}${sizeSuffix}](${src})\n`;
+				return `${serializeImage(node, src)}\n`;
 			}
+			case 'imageGrid':
+				// Images serialize exactly as they do in a paragraph, one per line.
+				return serializeImgGrid({ cols: node.attrs.cols, layout: node.attrs.layout }, serializeInline(node));
 			default:
 				return node.textContent || '';
 		}
 	}
 
 	function serializeListItem(node: any): string {
-		const parts: string[] = [];
-		node.forEach((child: any) => {
-			if (child.type.name === 'paragraph') {
-				parts.push(serializeInline(child));
-			} else if (child.type.name === 'bulletList' || child.type.name === 'orderedList' || child.type.name === 'taskList') {
-				// Indent nested lists so markdown parsers recognize nesting
-				// Use 4 spaces - works for both bullet (- ) and ordered (1. ) parent markers
-				const nested = serializeNode(child).replace(/\n$/, '');
-				const indented = nested.split('\n').map((line: string) => '    ' + line).join('\n');
-				parts.push(indented);
-			} else {
-				parts.push(serializeNode(child));
-			}
+		const blocks: ListItemBlock[] = [];
+		node.forEach((child: any, _offset: number, index: number) => {
+			const isList = child.type.name === 'bulletList' || child.type.name === 'orderedList' || child.type.name === 'taskList';
+			blocks.push({
+				isList,
+				// Text that starts like a task box in a plain list item must not become a task.
+				text: index === 0 && child.type.name === 'paragraph'
+					? (node.type.name === 'listItem' ? serializeParagraphText(child).replace(/^\[(?=[ xX]\](?:\s|$))/, '\\[') : serializeParagraphText(child))
+					: serializeNode(child),
+			});
 		});
-		return parts.join('\n') + '\n';
+		return joinListItemBlocks(blocks);
+	}
+
+	function inlineMathPayloads(markdown: string): string[] {
+		const children = mdit.parseInline(markdown, {})[0]?.children ?? [];
+		return children.filter(token => token.type === 'helix_math_inline').map(token => token.content);
+	}
+
+	/** The text a line of inline Markdown shows when it is read back, without its formatting. */
+	function inlinePlainText(markdown: string): string {
+		let text = '';
+		for (const token of mdit.parseInline(markdown, {})[0]?.children ?? []) {
+			if (token.type === 'text' || token.type === 'code_inline' || token.type === 'helix_wiki') text += token.content;
+		}
+		return text;
+	}
+
+	function readsAsParagraph(markdown: string): boolean {
+		const tokens = mdit.parse(markdown, {});
+		return tokens.length === 3 && tokens[0].type === 'paragraph_open';
 	}
 
 	function serializeInline(node: any): string {
-		return serializeInlineMarkdown(node, stripAssetSrc);
+		return serializeInlineMarkdownKeepingDollars(node, stripAssetSrc, inlineMathPayloads, inlinePlainText);
 	}
+
+	// Lines of the note as it was last loaded or saved, without indentation; see escapeBlockStarts.
+	let sourceLines: { raw: string; lines: Set<string> } | null = null;
+	function inNoteSource(line: string): boolean {
+		const raw = saves.raw;
+		if (sourceLines?.raw !== raw) sourceLines = { raw, lines: new Set(raw.split('\n').map((text) => text.trim())) };
+		return sourceLines.lines.has(line.trim());
+	}
+
+	/** A paragraph's text, kept from turning into a heading, list, quote or other block on reload. */
+	function serializeParagraphText(node: any): string {
+		return escapeBlockStarts(serializeInline(node), (markdown) => {
+			// Nodes are reused between saves, so an unchanged paragraph is parsed back only once.
+			const known = paragraphChecks.get(node);
+			if (known?.markdown === markdown) return known.reads;
+			const reads = readsAsParagraph(markdown);
+			paragraphChecks.set(node, { markdown, reads });
+			return reads;
+		}, inNoteSource);
+	}
+	const paragraphChecks = new WeakMap<object, { markdown: string; reads: boolean }>();
 
 	function autofocus(el: HTMLElement) {
 		requestAnimationFrame(() => el.focus());
@@ -4607,19 +5156,105 @@
 	function noteSearchNext() { navigateNoteSearch(1); }
 	function noteSearchPrev() { navigateNoteSearch(-1); }
 
-	export function openNoteSearch() {
+	export function openNoteSearch(replace = false) {
 		++targetRevealRequest;
+		
+		window.removeEventListener("cuelm-open-note", handleOpenNote);
 		clearTargetReveal();
+
+		// Asking for replace while find is already showing moves on to the replace field.
+		const toReplace = replace && noteSearchOpen && !!noteSearchQuery;
 		noteSearchOpen = true;
+		if (replace) noteReplaceOpen = true;
 		tick().then(() => {
-			if (noteSearchOpen && !editorDisposed) noteSearchInput?.focus({ preventScroll: true });
+			if (!noteSearchOpen || editorDisposed) return;
+			if (toReplace) noteReplaceInput?.focus({ preventScroll: true });
+			else noteSearchInput?.focus({ preventScroll: true });
 		});
+	}
+
+	function canReplaceInNote(): boolean {
+		if ($readOnly || $viewerNote || trashPreview || showHistory || externalOperationBusy) return false;
+		return $sourceMode ? !!source.view : !!editor?.isEditable;
+	}
+
+	// Replacing text shown by a wiki link changes what the link says, not where it points:
+	// [[Home]] becomes [[Home|House]]. Otherwise it would count as retitling the linked note.
+	function keepWikiLinkTarget(tr: any, from: number) {
+		const wikiLink = tr.doc.type.schema.marks.wikiLink;
+		if (!wikiLink) return;
+		const resolved = tr.doc.resolve(from);
+		const parent = resolved.parent;
+		const index = resolved.index();
+		const mark = parent.maybeChild(index)?.marks.find((m: any) => m.type === wikiLink);
+		if (!mark || mark.attrs.aliased) return;
+		let first = index;
+		let last = index;
+		const linked = (i: number) => !!parent.maybeChild(i)?.marks.some((m: any) => m.eq(mark));
+		while (first > 0 && linked(first - 1)) first--;
+		while (linked(last + 1)) last++;
+		let start = resolved.start();
+		for (let i = 0; i < first; i++) start += parent.child(i).nodeSize;
+		let end = start;
+		let shown = '';
+		for (let i = first; i <= last; i++) { end += parent.child(i).nodeSize; shown += parent.child(i).text ?? ''; }
+		// The mark does not exclude itself, so the old one has to go first.
+		tr.removeMark(start, end, mark);
+		tr.addMark(start, end, wikiLink.create({ ...mark.attrs, title: mark.attrs.title || shown, aliased: true }));
+	}
+
+	function replaceNoteMatches(matches: NoteSearchMatch[]) {
+		const insert = noteReplaceValue;
+		if ($sourceMode) {
+			source.dispatch({ changes: matches.map(({ from, to }) => ({ from, to, insert })), userEvent: 'input.replace' });
+			return;
+		}
+		if (!editor) return;
+		const tr = editor.state.tr;
+		// Last to first, so earlier positions stay valid. One transaction is one undo step.
+		for (let i = matches.length - 1; i >= 0; i--) {
+			keepWikiLinkTarget(tr, matches[i].from);
+			tr.insertText(insert, matches[i].from, matches[i].to);
+		}
+		editor.view.dispatch(tr);
+	}
+
+	function replaceNoteMatch() {
+		if (!noteSearchOpen || !canReplaceInNote()) return;
+		if (noteSearchPending) { cancelNoteSearchWork(); scanNoteSearch(); }
+		const match = noteSearchResults[noteSearchIndex];
+		if (!match) return;
+		replaceNoteMatches([match]);
+		// Continue behind the inserted text, so a replacement that contains the query is not found again.
+		cancelNoteSearchWork();
+		noteSearchAnchor = match.from + noteReplaceValue.length;
+		scanNoteSearch();
+		if (noteSearchResults.length && noteSearchResults[noteSearchIndex].from < noteSearchAnchor) {
+			noteSearchIndex = 0;
+			noteSearchAnchor = noteSearchResults[0].from;
+			if (!$sourceMode) applySearchDecorations();
+		}
+		if (noteSearchResults.length) revealNoteSearchMatch();
+		else source.highlight(null);
+	}
+
+	function replaceAllNoteMatches() {
+		if (!noteSearchOpen || !canReplaceInNote()) return;
+		if (noteSearchPending) { cancelNoteSearchWork(); scanNoteSearch(); }
+		const matches = replaceableMatches(noteSearchResults);
+		if (!matches.length) return;
+		replaceNoteMatches(matches);
+		cancelNoteSearchWork();
+		scanNoteSearch();
+		source.highlight(null);
 	}
 
 	function closeNoteSearch(restoreFocus = true) {
 		cancelNoteSearchWork();
 		noteSearchOpen = false;
 		noteSearchQuery = '';
+		noteReplaceOpen = false;
+		noteReplaceValue = '';
 		noteSearchResults = [];
 		noteSearchIndex = 0;
 		noteSearchSourceHighlighted = false;
@@ -4772,200 +5407,44 @@
 		return md.trim() + '\n';
 	}
 
-	function secretFencesToHtml(md: string): string {
-		const lines = md.split('\n');
-		const out: string[] = [];
-		for (let i = 0; i < lines.length; i++) {
-			if (!/^\s*```helix-secret\s*$/.test(lines[i])) {
-				out.push(lines[i]);
-				continue;
+
+	function markdownToHtml(md: string, snapshot = false, pasted = false): string {
+		const src = snapshot || pasted ? md : stripTitleH1(md);
+		// Render once; parser rules keep code and math payloads out of prose transformations.
+		let html = mdit.render(src, {
+			wikiLinkTitles: $appConfig?.enable_wiki_links ? wikiLinkTitlesCache : undefined,
+		});
+
+		// PDF embeds are raw HTML here; literal code is already escaped by the parser.
+		html = html.replace(/<div[^>]*data-pdf-src="([^"]*)"[^>]*data-pdf-name="([^"]*)"[^>]*>[^<]*<\/div>/gi, (_, pdfSrc, name) => {
+			const root = currentNoteAssetRoot();
+			const local = resolveFileReference(pdfSrc, root ? `${root}/.vault-root` : $activeNotePath, root);
+			const showInline = !snapshot && !isMobile && ($appConfig?.pdf_preview ?? false);
+			const safeSrc = mdit.utils.escapeHtml(pdfSrc);
+			const safeName = mdit.utils.escapeHtml(name);
+			if (showInline) {
+				const pdfHeight = $appConfig?.pdf_height ?? 600;
+				const displaySrc = convertFileSrc(local.path) + local.suffix;
+				return `<div data-pdf-src="${safeSrc}" data-pdf-name="${safeName}" class="pdf-embed"><iframe src="${mdit.utils.escapeHtml(displaySrc)}" width="100%" height="${pdfHeight}px"></iframe><p class="pdf-label">${safeName}</p></div>`;
 			}
+			return `<div data-pdf-src="${safeSrc}" data-pdf-name="${safeName}" class="pdf-embed-mobile"><a href="${mdit.utils.escapeHtml(pdfSrc)}" class="pdf-link-mobile">\uD83D\uDCC4 ${safeName}</a></div>`;
+		});
 
-			const payloadLines: string[] = [];
-			let closedAt = -1;
-			for (let j = i + 1; j < lines.length; j++) {
-				if (/^\s*```\s*$/.test(lines[j])) {
-					closedAt = j;
-					break;
-				}
-				payloadLines.push(lines[j]);
-			}
-
-			if (closedAt === -1) {
-				out.push(lines[i], ...payloadLines);
-				break;
-			}
-
-			const payload = payloadLines.join('\n');
-			out.push(`<div data-secret-block="${escapeHtml(encodeURIComponent(payload))}"></div>`);
-			i = closedAt;
-		}
-		return out.join('\n');
-	}
-
-	function markdownToHtml(md: string): string {
-		let src = stripTitleH1(md);
-		src = secretFencesToHtml(src);
-
-		// Pre-process: convert [[Note Title]] wiki-links to HTML anchors
-		// Supports Obsidian syntax: [[note|alias]], [[note#heading]], [[note^block]]
-		if ($appConfig?.enable_wiki_links) {
-			src = src.replace(/\[\[([^\]]+)\]\]/g, (_, raw) => {
-				// Split on pipe: [[note|display text]] → noteRef="note", display="display text"
-				const pipeIdx = raw.indexOf('|');
-				const noteRef = (pipeIdx >= 0 ? raw.slice(0, pipeIdx) : raw).trim();
-				const display = (pipeIdx >= 0 ? raw.slice(pipeIdx + 1) : noteRef).trim();
-				// Strip #heading and ^block anchors for title matching
-				const titleForLookup = noteRef.replace(/#.*$/, '').replace(/\^.*$/, '').trim();
-				// Try to resolve: first by vault-relative path (for disambiguated links), then by title.
-				// entry.path is vault-relative (e.g. "folder/note.md"); match against that.
-				let match: NoteTitleEntry | undefined;
-				if (titleForLookup.includes('/')) {
-					const relPath = titleForLookup + '.md';
-					match = wikiLinkTitlesCache.find(e => e.path === relPath);
-				}
-				if (!match) {
-					// Fallback: resolve by title (use the last segment if path-based)
-					const titleOnly = titleForLookup.includes('/') ? titleForLookup.split('/').pop()! : titleForLookup;
-					const titleLower = titleOnly.toLowerCase();
-					const titleMatches = wikiLinkTitlesCache.filter(e => e.title.toLowerCase() === titleLower);
-					if (titleMatches.length === 1) {
-						match = titleMatches[0];
-					} else if (titleMatches.length > 1) {
-						// Multiple matches - prefer the shallowest path (closest to vault root)
-						match = titleMatches.reduce((a, b) =>
-							a.path.split('/').length <= b.path.split('/').length ? a : b
-						);
-					}
-				}
-				const path = match ? match.path : '';
-				return `<span data-wiki-link data-path="${escapeHtml(path)}" data-title="${escapeHtml(noteRef)}" class="wiki-link">${escapeHtml(display)}</span>`;
+		html = normalizeImageHtml(html);
+		if (snapshot) {
+			html = DOMPurify.sanitize(html, {
+				USE_PROFILES: { html: true },
+				ADD_URI_SAFE_ATTR: ['src'],
+				FORBID_TAGS: ['style', 'iframe', 'object', 'embed', 'form', 'input', 'button', 'video', 'audio', 'source', 'svg', 'math', 'link'],
 			});
 		}
 
-		// Pre-process: fix image paths with multiple leading slashes (from broken saves)
-		src = src.replace(/!\[([^\]]*)\]\((\/{2,})(home\/)/g, '![$1](/home/');
-
-		// Pre-process: normalize link/image destinations for strict-CommonMark markdown-it.
-		// Handles angle-bracket destinations <url>, optional titles ("..."/'...'/(...)), and the
-		// non-standard %20 separator some exporters (e.g. Notesnook) emit between url and title.
-		// Emits clean [label](encoded-url); titles are dropped (we never serialize them anyway).
-		src = src.replace(
-			/(!?)(\[[^\]]*\])\(<([^>]*)>(?:(?:\s|%20)*(?:"[^"]*"|'[^']*'|\([^)]*\)))?(?:\s|%20)*\)/g,
-			(_m, bang, label, url) => `${bang}${label}(${url.replace(/ /g, '%20')})`
-		);
-		// Bare destination with a trailing quoted title: [label](url "title") -> drop title, encode spaces.
-		// Stops our own space-encoder below from mangling valid CommonMark titled links.
-		src = src.replace(
-			/(!?)(\[[^\]]*\])\(([^()<>]*?)(?:\s|%20)+(?:"[^"]*"|'[^']*')(?:\s|%20)*\)/g,
-			(_m, bang, label, url) => `${bang}${label}(${url.replace(/ /g, '%20')})`
-		);
-
-		// Pre-process: percent-encode spaces in image URLs so markdown-it parses them correctly
-		src = src.replace(/!\[([^\]]*)\]\(([^)]*\s[^)]*)\)/g, (match, alt, url) => {
-			return `![${alt}](${url.replace(/ /g, '%20')})`;
-		});
-
-		// Pre-process: percent-encode spaces in link URLs so markdown-it parses them correctly
-		// Matches [text](url with spaces) but not ![image](url) (already handled above)
-		src = src.replace(/(?<!!)\[([^\]]*)\]\(([^)]*\s[^)]*)\)/g, (_match, text, url) => {
-			return `[${text}](${url.replace(/ /g, '%20')})`;
-		});
-
-		// Pre-process: transform PDF embed divs - iframes when inline preview is on, clickable links otherwise
-		src = src.replace(/<div[^>]*data-pdf-src="([^"]*)"[^>]*data-pdf-name="([^"]*)"[^>]*>[^<]*<\/div>/gi, (_, pdfSrc, name) => {
-			const vaultRoot = $appConfig?.active_vault ?? '';
-			const absPath = normalizePath(`${vaultRoot}/${decodeURIComponent(pdfSrc)}`);
-			const showInline = !isMobile && ($appConfig?.pdf_preview ?? false);
-			if (showInline) {
-				const pdfHeight = $appConfig?.pdf_height ?? 600;
-				const displaySrc = convertFileSrc(absPath);
-				return `<div data-pdf-src="${pdfSrc}" data-pdf-name="${name}" class="pdf-embed"><iframe src="${displaySrc}" width="100%" height="${pdfHeight}px"></iframe><p class="pdf-label">${name}</p></div>`;
-			}
-			return `<div data-pdf-src="${pdfSrc}" data-pdf-name="${name}" class="pdf-embed-mobile"><a href="${decodeURIComponent(pdfSrc)}" class="pdf-link-mobile">\uD83D\uDCC4 ${name}</a></div>`;
-		});
-
-		// Pre-process: render KaTeX math - only outside fenced code blocks
-		{
-			const lines = src.split('\n');
-			const outLines: string[] = [];
-			let inFence = false;
-			let mathBlock: string[] | null = null;
-			for (let i = 0; i < lines.length; i++) {
-				const line = lines[i];
-				if (/^```/.test(line)) { inFence = !inFence; outLines.push(line); continue; }
-				if (inFence) { outLines.push(line); continue; }
-				// Accumulate block math: $$ on its own line starts/ends a block
-				if (line.trim() === '$$') {
-					if (!mathBlock) { mathBlock = []; continue; }
-					const tex = mathBlock.join('\n').trim();
-					mathBlock = null;
-					outLines.push(`<div data-math-block="${encodeURIComponent(tex)}" class="math-block"></div>`);
-					continue;
-				}
-				if (mathBlock) { mathBlock.push(line); continue; }
-				// Inline math: $...$ (skip content inside backticks)
-				const processed = line.replace(/`[^`]*`/g, m => '\x00'.repeat(m.length));
-				let result = line;
-				let offset = 0;
-				for (const m of processed.matchAll(/(?<!\$)\$(?![\s$])([^\n$]+?)(?<!\s)\$(?!\$)(?!\d)/g)) {
-					const tex = m[1].trim();
-					const html = `<span data-math-inline="${encodeURIComponent(tex)}" class="math-inline"></span>`;
-					result = result.slice(0, m.index! + offset) + html + result.slice(m.index! + m[0].length + offset);
-					offset += html.length - m[0].length;
-				}
-				outLines.push(result);
-			}
-			// If unclosed math block, just output the lines as-is
-			if (mathBlock) { outLines.push('$$', ...mathBlock); }
-			src = outLines.join('\n');
-		}
-
-		// Pre-process: convert task list syntax before markdown-it (it doesn't know TipTap's format)
-		// Support indented (nested) and blockquoted task lists too
-		src = src.replace(/^([\s>]*)-\s\[x\][^\S\n]+(.+)$/gm, '$1- <tiptask checked="true">$2</tiptask>');
-		src = src.replace(/^([\s>]*)-\s\[x\][^\S\n]*$/gm, '$1- <tiptask checked="true">&nbsp;</tiptask>');
-		src = src.replace(/^([\s>]*)-\s\[ \][^\S\n]+(.+)$/gm, '$1- <tiptask checked="false">$2</tiptask>');
-		src = src.replace(/^([\s>]*)-\s\[ \][^\S\n]*$/gm, '$1- <tiptask checked="false">&nbsp;</tiptask>');
-
-		// Pre-process: replace empty-paragraph markers with a div sentinel before markdown-it.
-		// A bare <!-- --> starts an HTML block that swallows the next line; the blank lines
-		// around the div keep it isolated. Post-render converts it back to <p></p>.
-		src = src.replace(/<!-- -->/g, '\n\n<div data-empty-para></div>\n\n');
-
-		// Pre-process: preserve blank lines before image-only lines
-		// markdown-it collapses blank lines into paragraph breaks, losing the empty paragraph.
-		// Insert a <div> marker that markdown-it passes through (html: true), then convert to <p></p>
-		src = src.replace(/\n\n(!\[[^\]]*\]\([^)]*\)\s*$)/gm, '\n\n<div data-img-gap></div>\n\n$1');
-
-		// Run markdown-it (single-pass parser - handles headings, bold, italic, strike, code, blockquote, lists, links, images, hr, tables, raw HTML)
-		let html = mdit.render(src);
-
-		// Post-process: convert image gap markers into empty paragraphs for ProseMirror
-		html = html.replace(/<div data-img-gap><\/div>\n?/g, '<p></p>\n');
-
-		// Post-process: strip trailing newlines inside code blocks (markdown-it adds them, TipTap shows them as blank lines)
-		html = html.replace(/<code([^>]*)>\n?/g, '<code$1>');
-		html = html.replace(/\n<\/code>/g, '</code>');
-
-		// Post-process: convert empty-paragraph div sentinels back to empty paragraphs for TipTap
-		html = html.replace(/<div data-empty-para><\/div>\n?/g, '<p></p>\n');
-
-		// Post-process: convert task list items to TipTap format
-		// Convert opening <li> + <tiptask> into data-attributed <li>, handles both tight and loose (with <p>) lists
-		html = html.replace(/<li>(\s*(?:<p>)?)\s*<tiptask checked="(true|false)">([\s\S]*?)<\/tiptask>\s*(?:<\/p>)?/gi, (_, _pre, checked, text) => {
-			return `<li data-type="taskItem" data-checked="${checked}">${text}`;
-		});
-		html = html.replace(/<ul>(\s*<li data-type="taskItem")/gi, '<ul data-type="taskList">$1');
-
-		html = normalizeImageHtml(html);
-
 		// Post-process: turn Obsidian callout blockquotes (> [!type] ...) into callout blocks.
 		if (html.includes('[!')) {
-			const tmp = document.createElement('div');
-			tmp.innerHTML = html;
-			transformCalloutBlockquotes(tmp);
-			html = tmp.innerHTML;
+			const template = document.createElement('template');
+			template.innerHTML = html;
+			for (const child of Array.from(template.content.children)) transformCalloutBlockquotes(child);
+			html = template.innerHTML;
 		}
 
 		return html;
@@ -4983,6 +5462,7 @@
 				createEditor(pendingContent);
 				pendingContent = null;
 				updateCounts();
+				if (showOutline) updateOutline();
 			} else if (isMobile && !lastSourceMode) {
 				createEditor('');
 			}
@@ -5089,7 +5569,9 @@
 	});
 
 	function destroyEditor() {
+		if (!$sourceMode) clearOutline();
 		saves.cancelScheduled();
+		cancelProgressiveLoad();
 		if (editor) {
 			editor.destroy();
 			editor = null;
@@ -5102,6 +5584,7 @@
 
 	function createEditor(content: string) {
 		if (!editorElement) return;
+		cancelProgressiveLoad();
 		if (editor) {
 			editor.destroy();
 			editor = null;
@@ -5116,12 +5599,14 @@
 			element: editorElement,
 			editable: !$readOnly,
 			extensions: [
+				CopyLineSpacing,
 				MixedListShortcuts,
-				StarterKit.configure({ codeBlock: false, link: false, underline: false }),
+				ProgressiveLoadGuard,
+				EditorStarterKit.configure({ code: { HTMLAttributes: { style: 'white-space: pre-wrap' } }, codeBlock: false, link: false, underline: false }),
 				FocusedPlaceholder,
 				TaskList,
-				TaskItem.configure({ nested: true }),
-				Table.configure({ resizable: true }),
+				TaskItem.extend(keepCodeWhitespace).configure({ nested: true }),
+				AlwaysResizableTable.configure({ resizable: true }),
 				TableRow,
 				CustomTableCell,
 				CustomTableHeader,
@@ -5146,7 +5631,8 @@
 				PageBreak,
 				Callout,
 				CalloutTyping,
-				Details.configure({ persist: true, HTMLAttributes: { class: 'editor-details' } }),
+				ImageGrid.configure({ onUngroup: ungroupImageGridAt, onMoveImage: moveGridImageByIndex }),
+				DetailsWithBodyBackspace.configure({ persist: true, HTMLAttributes: { class: 'editor-details' } }),
 				DetailsSummary,
 				DetailsContent,
 				Extension.create({
@@ -5369,6 +5855,14 @@
 				},
 			},
 			onTransaction: ({ transaction, appendedTransactions }) => {
+				if (imageToolbar && (transaction.docChanged || appendedTransactions.some((tr) => tr.docChanged))) closeStaleImageToolbar();
+				if (showOutline && !$sourceMode && outlineOrigin && isOriginCurrent(outlineOrigin)
+					&& (transaction.docChanged || appendedTransactions.some(tr => tr.docChanged))) {
+					outlineHeadings = mapDocumentHeadings(outlineHeadings, transaction.mapping);
+					for (const tr of appendedTransactions) outlineHeadings = mapDocumentHeadings(outlineHeadings, tr.mapping);
+					scheduleOutline();
+					scheduleOutlineActive();
+				}
 				if (noteSearchOpen && !$sourceMode && (transaction.docChanged || appendedTransactions.some((tr) => tr.docChanged))) {
 					noteSearchAnchor = transaction.mapping.map(noteSearchAnchor);
 					for (const tr of appendedTransactions) noteSearchAnchor = tr.mapping.map(noteSearchAnchor);
@@ -5403,20 +5897,37 @@
 					return;
 				}
 				markEdited();
-				if (!isMobile && showOutline) scheduleOutline();
 				if (showInfo) scheduleCounts();
 			},
 		});
+		// TipTap normalizes a newly created document on its first transaction (it adds a paragraph
+		// after a final list, for example). Run that now so it is not taken for the user's first
+		// edit, which would save, and possibly reformat, a note that was only opened.
+		ignoreNextUpdate = true;
+		editor.view.dispatch(editor.state.tr);
+		ignoreNextUpdate = false;
+		clearEditorHistory();
 		editorReady = true;
+		if (showOutline) updateOutline();
 		// Pre-load note titles for wiki-link autocomplete
 		if ($appConfig?.enable_wiki_links) {
 			refreshWikiLinkTitles();
 		}
 	}
 
-	export function toggleOutlinePanel() {
-		showOutline = !showOutline;
-		if (showOutline) updateOutline();
+	export async function toggleOutlinePanel() {
+		if (showOutline) { await closeOutline(); return; }
+		outlineTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+		showOutline = true;
+		updateOutline();
+		updateOutlineActive();
+		const origin = captureOrigin();
+		await tick();
+		if (!showOutline || !isOriginCurrent(origin)) return;
+		const button = outlineList?.querySelector<HTMLButtonElement>('button[aria-current="location"]')
+			?? outlineList?.querySelector<HTMLButtonElement>('button')
+			?? document.getElementById(outlinePanelId)?.querySelector<HTMLButtonElement>('.outline-close');
+		button?.focus({ preventScroll: true });
 	}
 
 	export function toggleHistoryPanel() {
@@ -5449,7 +5960,10 @@
 		const origin = captureOrigin();
 		linkOrigin = origin;
 		if (!origin.vault) return;
-		getAllNoteTitles(origin.vault).then(t => {
+		// The wiki-link cache is kept current by file events; skip a vault-wide scan when it is loaded.
+		if ($appConfig?.enable_wiki_links && wikiTitleVault === origin.vault && !wikiTitleRefresh && wikiLinkTitlesCache.length) {
+			linkSuggestTitles = [...wikiLinkTitlesCache];
+		} else getAllNoteTitles(origin.vault).then(t => {
 			if (linkModal && linkOrigin === origin && isOriginCurrent(origin)) linkSuggestTitles = t;
 		}).catch(() => {});
 		tick().then(() => {
@@ -5570,11 +6084,14 @@
 			const currentSize = node?.attrs.size || 'full';
 			const imgSrc = node?.attrs.src || (target as HTMLImageElement).src || '';
 			const imgAlt = node?.attrs.alt || (target as HTMLImageElement).alt || '';
+			const imgTitle = node?.attrs.title || '';
 			const toolbarW = isAndroid ? 188 : isMobile ? 130 : 250;
 			const toolbarH = isAndroid ? 48 : 38;
 			const x = Math.max(8, Math.min(event.clientX, window.innerWidth - toolbarW - 8));
 			const y = Math.max(8, Math.min(event.clientY, window.innerHeight - toolbarH - 8));
-			imageToolbar = { pos, x, y, size: currentSize, src: imgSrc, alt: imgAlt };
+			const inGrid = editor.state.doc.resolve(pos).parent.type.name === 'imageGrid';
+			const canGroup = !inGrid && !!nearbyImageRange(editor.state, pos).range;
+			imageToolbar = { pos, x, y, size: currentSize, src: imgSrc, alt: imgAlt, title: imgTitle, inGrid, canGroup };
 			// Move cursor after the image to clear ProseMirror's node selection highlight
 			const afterPos = pos + (node?.nodeSize || 1);
 			editor.chain().setTextSelection(afterPos).run();
@@ -5590,22 +6107,51 @@
 		imageToolbar = null;
 	}
 
+	/**
+	 * The image toolbar remembers its image by position. Undo, redo or any other edit made while it
+	 * is open can leave a different node there, and its buttons would then change that one instead.
+	 */
+	function closeStaleImageToolbar() {
+		if (!editor || !imageToolbar) return;
+		const { pos, src } = imageToolbar;
+		const node = pos < editor.state.doc.content.size ? editor.state.doc.nodeAt(pos) : null;
+		if (node?.type.name === 'image' && node.attrs.src === src) return;
+		imageToolbar = null;
+		imageTitleModal = null;
+	}
+
 	function setImageSize(size: string) {
 		if (!editor || !imageToolbar) return;
 		const { pos } = imageToolbar;
 		const tr = editor.state.tr.setNodeAttribute(pos, 'size', size);
 		editor.view.dispatch(tr);
-		imageToolbar = { ...imageToolbar, size };
+		if (imageToolbar) imageToolbar = { ...imageToolbar, size };
+	}
+
+	function openImageTitleModal() {
+		if (!editor || !imageToolbar) return;
+		imageTitleModal = { title: editor.state.doc.nodeAt(imageToolbar.pos)?.attrs.title || imageToolbar.title };
+	}
+
+	/** Set or clear the toolbar image's hover text, saved as `![alt](src "title")`. */
+	function commitImageTitleModal() {
+		if (!editor || !imageToolbar || !imageTitleModal) return;
+		const node = editor.state.doc.nodeAt(imageToolbar.pos);
+		if (node?.type.name !== 'image') { imageTitleModal = null; return; }
+		const title = imageTitleModal.title.trim();
+		editor.view.dispatch(editor.state.tr.setNodeAttribute(imageToolbar.pos, 'title', title || null));
+		if (imageToolbar) imageToolbar = { ...imageToolbar, title };
+		imageTitleModal = null;
+	}
+
+	function cancelImageTitleModal() {
+		imageTitleModal = null;
 	}
 
 	function getImageAbsPath(src: string): string {
 		const assetPath = assetUrlToLocalPath(src);
 		if (assetPath !== null) return assetPath;
-		return resolveVaultFilePath(
-			decodeURIComponent(src),
-			$activeNotePath,
-			$appConfig?.active_vault ?? null,
-		);
+		return resolveFileReference(src, $activeNotePath, currentNoteAssetRoot()).path;
 	}
 
 	async function copyImageToClipboard() {
@@ -5691,7 +6237,7 @@
 		let x = event.clientX;
 		let y = event.clientY;
 		const menuWidth = 220;
-		const menuHeight = 740;
+		const menuHeight = 780;
 		if (x + menuWidth > window.innerWidth) x = window.innerWidth - menuWidth - 8;
 		if (y + menuHeight > window.innerHeight) y = window.innerHeight - menuHeight - 8;
 		if (x < 4) x = 4;
@@ -5731,27 +6277,127 @@
 		closeTableContextMenu();
 	}
 
+	/** The current selection as clipboard HTML and text, using the same serializer as Ctrl/Cmd+C. */
+	function selectionClipboard(): { html: string; text: string } | null {
+		if (!editor) return null;
+		const { from, to } = editor.state.selection;
+		if (from === to) return null;
+		const { dom, text } = editor.view.serializeForClipboard(editor.state.selection.content());
+		return { html: dom.innerHTML, text };
+	}
+
+	/** Write HTML and its plain-text alternative. Returns false when the platform has no rich clipboard. */
+	async function writeRichClipboard({ html, text }: { html: string; text: string }): Promise<boolean> {
+		if (navigator.clipboard?.write && typeof ClipboardItem !== 'undefined') {
+			try {
+				await navigator.clipboard.write([new ClipboardItem({
+					'text/html': new Blob([html], { type: 'text/html' }),
+					'text/plain': new Blob([text], { type: 'text/plain' }),
+				})]);
+				return true;
+			} catch (error) {
+				console.warn('Rich clipboard write failed, trying the copy command:', error);
+			}
+		}
+		return false;
+	}
+
+	/** Write rich text and its plain-text alternative, falling back to text. */
+	async function writeClipboard(data: { html: string; text: string }): Promise<void> {
+		if (await writeRichClipboard(data)) return;
+		await navigator.clipboard.writeText(data.text);
+	}
+
 	async function ctxCut() {
 		if (!editor) return;
 		const origin = captureOrigin();
 		if (!canInsert(origin)) return;
 		const { from, to } = editor.state.selection;
-		if (from === to) { closeTextContextMenu(); return; }
-		const text = editor.state.doc.textBetween(from, to, '\n');
-		await navigator.clipboard.writeText(text);
+		const data = selectionClipboard();
+		if (!data) { closeTextContextMenu(); return; }
+		try {
+			await writeClipboard(data);
+		} catch (error) {
+			console.error('Failed to copy selection:', error);
+			return;
+		}
 		if (!canInsert(origin) || !isOriginCurrent(origin, true) || !editor) return;
 		editor.commands.deleteRange({ from, to });
 		closeTextContextMenu();
 	}
 
+	/** Let ProseMirror write the selection through its own copy handler; used as the fallback on WebKit. */
+	function copySelectionWithCommand(): boolean {
+		const view = editor?.view;
+		if (!view) return false;
+		view.focus();
+		try {
+			return document.execCommand('copy');
+		} catch {
+			return false;
+		}
+	}
+
 	async function ctxCopy() {
-		if (!editor) return;
-		const origin = captureOrigin();
-		const { from, to } = editor.state.selection;
-		if (from === to) { closeTextContextMenu(); return; }
-		const text = editor.state.doc.textBetween(from, to, '\n');
-		await navigator.clipboard.writeText(text);
-		if (isOriginCurrent(origin)) closeTextContextMenu();
+		const data = selectionClipboard();
+		if (!data) { closeTextContextMenu(); return; }
+		if (!(await writeRichClipboard(data)) && !copySelectionWithCommand()) {
+			try {
+				await navigator.clipboard.writeText(data.text);
+			} catch (error) {
+				console.error('Failed to copy selection:', error);
+			}
+		}
+		closeTextContextMenu();
+	}
+
+	async function ctxCopyPlain() {
+		const data = selectionClipboard();
+		if (!data) { closeTextContextMenu(); return; }
+		try {
+			await navigator.clipboard.writeText(data.text);
+		} catch (error) {
+			console.error('Failed to copy selection as plain text:', error);
+		}
+		closeTextContextMenu();
+	}
+
+	/**
+	 * Replays clipboard data as a paste event on the editor DOM, so it takes the same path as
+	 * Ctrl/Cmd+V. ProseMirror's paste handler then runs every `handlePaste` prop (file paste,
+	 * callout paste, link paste), `transformPastedHTML`, the clipboard parsers and TipTap's paste rules.
+	 */
+	function replayPaste(payload: ClipboardPastePayload): boolean {
+		if (!editor) return false;
+		const data = new DataTransfer();
+		if (payload.text) data.setData('text/plain', payload.text);
+		if (payload.html) data.setData('text/html', payload.html);
+		for (const [type, value] of payload.strings) data.setData(type, value);
+		for (const file of payload.files) data.items.add(file);
+		const event = new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true });
+		editor.view.focus();
+		editor.view.dom.dispatchEvent(event);
+		return event.defaultPrevented;
+	}
+
+	async function readWebClipboard(): Promise<ClipboardPastePayload | null> {
+		try {
+			const payload = await collectClipboardPayload(await navigator.clipboard.read());
+			return isEmptyPayload(payload) ? null : payload;
+		} catch (e) {
+			// WebKitGTK (bug #218519) often cannot read content copied from other applications.
+			console.warn('Web clipboard read failed, using the native clipboard:', e);
+			return null;
+		}
+	}
+
+	async function readNativeClipboard(): Promise<{ text?: string | null; html?: string | null }> {
+		try {
+			return await readClipboardContents();
+		} catch (e) {
+			console.error('Native clipboard read failed:', e);
+			return {};
+		}
 	}
 
 	async function ctxPaste() {
@@ -5760,21 +6406,21 @@
 		// cannot accept the insertion.
 		if (!editor || $readOnly || $viewerNote) { closeTextContextMenu(); return; }
 		const origin = captureOrigin();
-		try {
-			const text = await navigator.clipboard.readText();
+		let payload = await readWebClipboard();
+		if (!canInsert(origin) || !editor) return;
+		// WebKitGTK (bug #218519) often gives nothing, or only plain text, for content from other
+		// apps. Fill in text and HTML from the native clipboard so formatting survives like Ctrl+V.
+		if (needsNativeClipboard(payload)) {
+			payload = withNativeClipboard(payload, await readNativeClipboard());
 			if (!canInsert(origin) || !editor) return;
-			if (text) {
-				editor.commands.insertContent(text);
-				closeTextContextMenu();
-				return;
-			}
-		} catch (e) {
-			console.error('Paste failed:', e);
 		}
-		// readText() only reads text/plain. An image copied from a browser has none,
-		// so pasting an image from this menu used to do nothing at all. Fall back to
-		// the same native clipboard reader the paste handler uses; it is a no-op when
-		// the clipboard holds no image.
+		// Replaying the event runs Ctrl+V's handlers, including the WebKitGTK image fallback for a
+		// clipboard holding only an image (or a bare <img>).
+		if (payload && !isEmptyPayload(payload) && replayPaste(payload)) {
+			closeTextContextMenu();
+			return;
+		}
+		// Nothing textual at all: the clipboard may still hold a bitmap only the native reader sees.
 		await insertClipboardImage(origin);
 		if (isOriginCurrent(origin)) closeTextContextMenu();
 	}
@@ -5923,6 +6569,161 @@
 			document.addEventListener('keydown', onKey, true);
 			window.addEventListener('scroll', close, true);
 		}, 0);
+	}
+
+	function handleGridInput(event: Event) {
+		const input = event.currentTarget as HTMLInputElement;
+		const origin = assetPickerOrigins.get(input);
+		assetPickerOrigins.delete(input);
+		const files = Array.from(input.files ?? []).filter((file) => file.type.startsWith('image/'));
+		input.value = '';
+		if (origin && files.length) void insertImageGrid(files, origin);
+	}
+
+	/** Save the picked images and insert them as one grid (a single image is inserted normally). */
+	async function insertImageGrid(files: File[], origin: EditorOrigin) {
+		if (files.length === 1 || origin.sourceMode) {
+			for (const file of files) await insertFile(file, origin);
+			return;
+		}
+		const sources: string[] = [];
+		for (const file of files) {
+			if (!canInsert(origin)) return;
+			try {
+				const data = Array.from(new Uint8Array(await file.arrayBuffer()));
+				if (!canInsert(origin)) return;
+				sources.push(resolveImageSrc(encodeMarkdownPath(await saveImage(origin.vault!, file.name, data))));
+			} catch (e) {
+				console.error('Failed to insert image:', e);
+			}
+		}
+		if (!canInsert(origin) || !editor || sources.length === 0) return;
+		editor.commands.insertContent(sources.length === 1
+			? { type: 'image', attrs: { src: sources[0] } }
+			: { type: 'imageGrid', attrs: { cols: defaultGridCols(sources.length), layout: 'grid' },
+				content: sources.map((src) => ({ type: 'image', attrs: { src } })) });
+	}
+
+	// Images on consecutive lines share one paragraph, joined by a line break that reads as a space.
+	function countBlockImages(node: ProseMirrorNode): number {
+		if (node.type.name === 'imageGrid') return node.childCount;
+		if (node.type.name === 'image') return 1;
+		if (node.type.name !== 'paragraph') return 0;
+		let count = 0;
+		let other = false;
+		node.forEach((child) => {
+			if (child.type.name === 'image') count++;
+			else if (child.type.name !== 'hardBreak' && !(child.isText && !child.text?.trim())) other = true;
+		});
+		return other ? 0 : count;
+	}
+
+	/** Top-level blocks and the run of image blocks around `pos`, or no range when there is nothing to group. */
+	function nearbyImageRange(state: EditorState, pos: number) {
+		const blocks: { node: ProseMirrorNode; offset: number }[] = [];
+		state.doc.forEach((node, offset) => blocks.push({ node, offset }));
+		const target = blocks.findIndex((block) => pos >= block.offset && pos < block.offset + block.node.nodeSize);
+		const range = expandImageRange(blocks.map((block) => ({
+			isImage: countBlockImages(block.node) > 0,
+			imageCount: countBlockImages(block.node),
+			isEmpty: block.node.type.name === 'paragraph' && block.node.childCount === 0,
+		})), target);
+		return { blocks, range };
+	}
+
+	/** Group the toolbar's image and its neighboring image-only blocks (and grids) into one grid. */
+	function wrapNearbyImagesInGrid() {
+		if (!editor || !imageToolbar) return;
+		const { state } = editor;
+		const { blocks, range } = nearbyImageRange(state, imageToolbar.pos);
+		if (!range) return;
+		const images: ProseMirrorNode[] = [];
+		for (let i = range.start; i <= range.end; i++) {
+			blocks[i].node.forEach((child) => { if (child.type.name === 'image') images.push(child); });
+		}
+		const grid = state.schema.nodes.imageGrid.create({ cols: defaultGridCols(images.length), layout: 'grid' }, images);
+		const from = blocks[range.start].offset;
+		const to = blocks[range.end].offset + blocks[range.end].node.nodeSize;
+		editor.view.dispatch(state.tr.replaceWith(from, to, grid));
+		imageToolbar = null;
+	}
+
+	/**
+	 * Replace a grid with one image paragraph per image. At the top level each image gets the empty
+	 * paragraph that stands for the blank line above it, so the images are saved a blank line apart
+	 * instead of being glued to the paragraph above (the reverse of grouping them).
+	 */
+	function ungroupImageGridAt(gridPos: number) {
+		if (!editor) return;
+		const { state } = editor;
+		const grid = state.doc.nodeAt(gridPos);
+		if (!grid || grid.type.name !== 'imageGrid') return;
+		const resolved = state.doc.resolve(gridPos);
+		const before = resolved.nodeBefore;
+		const topLevel = resolved.depth === 0;
+		const paragraphs: ProseMirrorNode[] = [];
+		grid.forEach((image, _offset, index) => {
+			const blankLineAbove = index > 0 || (!!before && !(before.type.name === 'paragraph' && before.childCount === 0));
+			if (topLevel && blankLineAbove) paragraphs.push(state.schema.nodes.paragraph.create());
+			paragraphs.push(state.schema.nodes.paragraph.create(null, image));
+		});
+		editor.view.dispatch(state.tr.replaceWith(gridPos, gridPos + grid.nodeSize, paragraphs));
+		imageToolbar = null;
+	}
+
+	function gridChildren(grid: ProseMirrorNode): ProseMirrorNode[] {
+		const children: ProseMirrorNode[] = [];
+		grid.forEach((child) => children.push(child));
+		return children;
+	}
+
+	/** Move the toolbar's image one place left or right inside its grid. */
+	function moveGridImage(direction: -1 | 1) {
+		if (!editor || !imageToolbar?.inGrid) return;
+		const { state } = editor;
+		const resolved = state.doc.resolve(imageToolbar.pos);
+		const grid = resolved.parent;
+		if (grid.type.name !== 'imageGrid') return;
+		const index = resolved.index();
+		const next = index + direction;
+		if (next < 0 || next >= grid.childCount) return;
+		const children = gridChildren(grid);
+		[children[index], children[next]] = [children[next], children[index]];
+		const gridPos = resolved.before();
+		let newPos = gridPos + 1;
+		for (let i = 0; i < next; i++) newPos += children[i].nodeSize;
+		// Follow the image before the change lands, so the toolbar is not taken for a stale one.
+		imageToolbar = { ...imageToolbar, pos: newPos };
+		editor.view.dispatch(state.tr.replaceWith(gridPos, gridPos + grid.nodeSize, grid.type.create(grid.attrs, children)));
+	}
+
+	/** Drag-and-drop: move an image within a grid or into another grid. An emptied source grid is removed. */
+	function moveGridImageByIndex(fromGridPos: number, fromIndex: number, toGridPos: number, toIndex: number) {
+		if (!editor) return;
+		const { state } = editor;
+		const source = state.doc.nodeAt(fromGridPos);
+		if (!source || source.type.name !== 'imageGrid' || fromIndex < 0 || fromIndex >= source.childCount) return;
+		const sourceChildren = gridChildren(source);
+		if (fromGridPos === toGridPos) {
+			const target = reorderTarget(fromIndex, toIndex, sourceChildren.length);
+			if (target === null) return;
+			const [moved] = sourceChildren.splice(fromIndex, 1);
+			sourceChildren.splice(target, 0, moved);
+			editor.view.dispatch(state.tr.replaceWith(fromGridPos, fromGridPos + source.nodeSize, source.type.create(source.attrs, sourceChildren)));
+		} else {
+			const destination = state.doc.nodeAt(toGridPos);
+			if (!destination || destination.type.name !== 'imageGrid') return;
+			const [moved] = sourceChildren.splice(fromIndex, 1);
+			const tr = state.tr;
+			if (sourceChildren.length === 0) tr.delete(fromGridPos, fromGridPos + source.nodeSize);
+			else tr.replaceWith(fromGridPos, fromGridPos + source.nodeSize, source.type.create(source.attrs, sourceChildren));
+			const mapped = tr.mapping.map(toGridPos);
+			const destinationChildren = gridChildren(destination);
+			destinationChildren.splice(Math.max(0, Math.min(destinationChildren.length, toIndex)), 0, moved);
+			tr.replaceWith(mapped, mapped + destination.nodeSize, destination.type.create(destination.attrs, destinationChildren));
+			editor.view.dispatch(tr);
+		}
+		imageToolbar = null;
 	}
 
 	function insertDetails() {
@@ -6285,9 +7086,8 @@
 
 	/** Resolve a link href to an absolute .md note path, or null if not a note link. */
 	function resolveNoteHref(href: string): string | null {
-		const decoded = decodeURIComponent(href);
-		if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(decoded)) return null;
-		const path = resolveVaultFilePath(decoded, $activeNotePath, $appConfig?.active_vault ?? null);
+		if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(href)) return null;
+		const path = resolveFileReference(href, $activeNotePath, currentNoteAssetRoot()).path;
 		return path.endsWith('.md') ? path : null;
 	}
 
@@ -6349,11 +7149,7 @@
 	}
 
 	function resolveHrefToAbsPath(href: string): string {
-		return resolveVaultFilePath(
-			decodeURIComponent(href),
-			$activeNotePath,
-			$appConfig?.active_vault ?? null,
-		);
+		return resolveFileReference(href, $activeNotePath, currentNoteAssetRoot()).path;
 	}
 
 	function isFileLink(href: string): boolean {
@@ -6412,17 +7208,45 @@
 			insertClipboardImage();
 			return true;
 		}
-		return false;
+		return pasteMarkdown(event, hasText, html);
 	}
 
-	async function insertClipboardImage(origin = captureOrigin()) {
-		if (!canInsert(origin)) return;
+	/**
+	 * Pasted text written in Markdown is rendered the way a note is, then goes through the normal
+	 * HTML paste. Not inside code, not for Ctrl+Shift+V (paste as plain text), and not when the
+	 * clipboard HTML has formatting of its own; styled text from a code editor or terminal does not.
+	 */
+	function pasteMarkdown(event: ClipboardEvent, text: string, html: string): boolean {
+		const view = editor?.view;
+		if (!view || !looksLikeMarkdown(text) || (html && htmlHasFormatting(html))) return false;
+		if (view.state.selection.$from.parent.type.spec.code || (view as any).input?.shiftKey) return false;
+		event.preventDefault();
+		// Parsed from an inert document, so images in it are not fetched before they are resolved.
+		const rendered = new window.DOMParser().parseFromString(markdownToHtml(text.replace(/\r\n?/g, '\n'), false, true), 'text/html');
+		// The line breaks between rendered blocks would each become an empty paragraph.
+		for (const node of Array.from(rendered.body.childNodes)) {
+			if (node.nodeType === Node.TEXT_NODE && !node.textContent?.trim()) node.remove();
+		}
+		const { content } = PMDOMParser.fromSchema(view.state.schema).parseSlice(rendered.body, { context: view.state.selection.$from });
+		// One paragraph joins the text around the cursor; whole blocks split it, so a pasted heading
+		// stays a heading and the rest of the line does not end up inside a pasted code block.
+		const inline = content.childCount === 1 && content.firstChild!.type.name === 'paragraph';
+		const slice = new Slice(content, inline ? 1 : 0, inline ? 1 : 0);
+		view.dispatch(view.state.tr.replaceSelection(slice).scrollIntoView().setMeta('paste', true).setMeta('uiEvent', 'paste'));
+		return true;
+	}
+
+	/** Inserts the native clipboard image. Resolves true when there was an image to insert. */
+	async function insertClipboardImage(origin = captureOrigin()): Promise<boolean> {
+		if (!canInsert(origin)) return false;
 		try {
 			const data = await readClipboardImage();
-			if (!canInsert(origin)) return;
+			if (!canInsert(origin)) return false;
 			await uploadAsset(origin, 'pasted-image.png', data, 'image');
+			return true;
 		} catch (e) {
 			console.error('Clipboard image fallback failed:', e);
+			return false;
 		}
 	}
 
@@ -6435,18 +7259,20 @@
 			: await saveAttachment(origin.vault!, name, data);
 		if (!canInsert(origin)) return;
 		const label = `${name} (${Math.round(data.length / 1024)} kB)`;
+		// The stored name may contain #, %, spaces or parentheses; every use below is a URI or Markdown destination.
+		const destination = encodeMarkdownPath(relativePath);
 		if (origin.sourceMode) {
 			const { from, to } = source.state.selection.main;
 			const escaped = (kind === 'image' ? name : label).replace(/[[\]\\]/g, '\\$&');
-			source.replace(`${kind === 'image' ? '!' : ''}[${escaped}](${relativePath}) `, from, to);
+			source.replace(`${kind === 'image' ? '!' : ''}[${escaped}](${destination}) `, from, to);
 		} else if (editor) {
 			// Async completion may insert into its origin, but must never take focus.
-			if (kind === 'image') editor.commands.setImage({ src: resolveImageSrc(relativePath) });
+			if (kind === 'image') editor.commands.setImage({ src: resolveImageSrc(destination) });
 			else if (kind === 'pdf' && !isMobile && $appConfig?.pdf_preview) {
-				editor.commands.insertContent({ type: 'pdfEmbed', attrs: { src: relativePath, name } });
+				editor.commands.insertContent({ type: 'pdfEmbed', attrs: { src: destination, name } });
 			} else {
 				editor.commands.insertContent([
-					{ type: 'text', text: label, marks: [{ type: 'link', attrs: { href: relativePath } }] },
+					{ type: 'text', text: label, marks: [{ type: 'link', attrs: { href: destination } }] },
 					{ type: 'text', text: ' ' },
 				]);
 			}
@@ -6512,6 +7338,7 @@
 			// Resolving an image changes its representation, not the user's revision.
 			ignoreNextUpdate = true;
 			editor.view.dispatch(tr);
+			ignoreNextUpdate = false;
 		}
 	}
 
@@ -6519,14 +7346,16 @@
 	// Source mode toggle - only react to explicit user toggle, not note switches
 	$effect(() => {
 		const isSource = $sourceMode;
-		// Only act if we have a loaded note
-		if (!loadedPath) return;
+		// Only act if we have a loaded note, or one the rich editor could not display
+		const failedLoad = loadFailure !== null && loadFailure === $activeNotePath;
+		if (!loadedPath && !failedLoad) return;
 		const origin = captureOrigin();
 		const isCurrent = () => !editorDisposed && origin.path === loadedPath
 			&& origin.path === $activeNotePath && origin.vault === $appConfig?.active_vault
 			&& saves.isCurrentSession(origin.snapshot) && isSource === $sourceMode;
 
 		if (isSource && !lastSourceMode) {
+			clearOutline();
 			// Markdown conversion is lossy; carry both selection ends by visible text.
 			const selection = editor?.state.selection;
 			const visibleBefore = (position: number) => editor
@@ -6534,9 +7363,17 @@
 			const anchorNonWs = visibleBefore(selection?.anchor ?? 0);
 			const headNonWs = selection?.head === selection?.anchor ? anchorNonWs : visibleBefore(selection?.head ?? 0);
 			const docNonWs = docNonWhitespace();
-			const text = stripTitleH1(editor ? editorToMarkdown() : ($activeNote?.content ?? ''));
+			const text = stripTitleH1(editor && !failedLoad ? editorToMarkdown() : ($activeNote?.content ?? ''));
 			source.load(text);
+			// The counts now come from the source text.
+			scheduleCounts();
+			if (failedLoad) {
+				// The source view holds the real content, so the note counts as loaded again.
+				loadedPath = $activeNotePath ?? '';
+				loadFailure = null;
+			}
 			lastSourceMode = true;
+			if (showOutline) updateOutline();
 			const anchor = scanAlign(text, docNonWs, { stopAtNw: anchorNonWs }).srcOffset;
 			const head = headNonWs === anchorNonWs ? anchor : scanAlign(text, docNonWs, { stopAtNw: headNonWs }).srcOffset;
 			tick().then(() => {
@@ -6546,6 +7383,7 @@
 				if (!isMobile) source.focus();
 			});
 		} else if (!isSource && lastSourceMode) {
+			clearOutline();
 			lastSourceMode = false;
 			const selection = source.state.selection.main;
 			const srcText = source.state.doc.toString();
@@ -6564,14 +7402,17 @@
 				requestAnimationFrame(() => { if (isCurrent()) editor?.commands.scrollIntoView(); });
 			};
 			if (isMobile) {
-				// Mobile: editor stays in DOM, just update its content
-				const content = srcText;
+				// A source-only first load has no rich editor yet.
 				if (editor) {
 					ignoreNextUpdate = true;
-					editor.commands.setContent(markdownToHtml(restoreTitleH1(content)));
-					updateCounts();
-					tick().then(restoreRichCaret);
+					editor.commands.setContent(markdownToHtml(restoreTitleH1(srcText)));
+					ignoreNextUpdate = false;
+				} else {
+					createEditor(restoreTitleH1(srcText));
 				}
+				updateCounts();
+				if (showOutline) updateOutline();
+				tick().then(restoreRichCaret);
 			} else {
 				// Desktop: destroy old editor (its DOM element is gone),
 				// Wait for the source component to unmount before recreating the rich view.
@@ -6642,6 +7483,7 @@
 		$activeNotePath = migrated;
 		$activeNote = { ...previous, path: migrated };
 		navHistory.remap(payload.old_path, payload.new_path);
+		if (showOutline) updateOutline();
 		void (async () => {
 			try {
 				await saves.idle();
@@ -6677,6 +7519,79 @@
 		else unlistenPathMoved = fn;
 	}).catch(error => console.error('Failed to listen for relocated notes:', error));
 
+	/** Bring the links of the open note in line with renamed or moved notes they point to. */
+	function applyRenamedLinks(renames: LinkRename[], noteDir: string) {
+		if ($sourceMode) {
+			const view = source.view;
+			if (!view) return;
+			const changes = renamedLinkChanges(view.state.doc.toString(), renames, noteDir);
+			if (changes.length) view.dispatch({ changes });
+			return;
+		}
+		if (!editor) return;
+		const { schema, doc } = editor.state;
+		const wikiLink = schema.marks.wikiLink;
+		const link = schema.marks.link;
+		const edits: { from: number; to: number; node: any }[] = [];
+		doc.descendants((node: any, pos: number) => {
+			if (!node.isText) return;
+			const text = node.text as string;
+			const mark = wikiLink ? node.marks.find((m: any) => m.type === wikiLink) : null;
+			const linkMark = link ? node.marks.find((m: any) => m.type === link) : null;
+			const href = linkMark ? renamedHref(String(linkMark.attrs.href ?? ''), noteDir, renames) : null;
+			if (linkMark && href !== null) {
+				const marks = node.marks.map((m: any) => m === linkMark ? link.create({ ...linkMark.attrs, href }) : m);
+				const titled = renames.find((rename) => rename.old_title === text && rename.old_title !== rename.new_title);
+				edits.push({ from: pos, to: pos + node.nodeSize, node: schema.text(titled ? titled.new_title : text, marks) });
+			} else if (mark) {
+				const ref = (mark.attrs.title as string | null) || text;
+				const next = renamedLink(ref, ref === text ? null : text, renames);
+				if (!next) return;
+				const path = String(mark.attrs.path ?? '').replace(/\\/g, '/').toLowerCase();
+				const moved = renames.find((rename) => `${rename.old_ref}.md`.toLowerCase() === path);
+				const attrs = { ...mark.attrs, title: next.ref, path: moved ? `${moved.new_ref}.md` : mark.attrs.path };
+				const marks = node.marks.map((m: any) => m === mark ? wikiLink.create(attrs) : m);
+				edits.push({ from: pos, to: pos + node.nodeSize, node: schema.text(next.display ?? next.ref, marks) });
+			} else if (!wikiLink && !node.marks.some((m: any) => m.type.name === 'code')) {
+				// With wiki links switched off they are ordinary text in the note.
+				for (const change of renamedLinkChanges(text, renames, noteDir)) {
+					edits.push({ from: pos + change.from, to: pos + change.to, node: schema.text(change.insert, node.marks) });
+				}
+			}
+		});
+		if (!edits.length) return;
+		const tr = editor.state.tr.setMeta('addToHistory', false);
+		for (const edit of edits.reverse()) tr.replaceWith(edit.from, edit.to, edit.node);
+		editor.view.dispatch(tr);
+	}
+
+	type LinksRewrittenEvent = { vault_path: string; path: string; old_raw: string; new_raw: string; renames: LinkRename[] };
+	let unlistenLinksRewritten: (() => void) | null = null;
+	listen<LinksRewrittenEvent>('vault-links-rewritten', ({ payload }) => {
+		if (editorDisposed || payload.vault_path !== $appConfig?.active_vault
+			|| payload.path !== $activeNotePath || payload.path !== loadedPath) return;
+		// Without unsaved edits the note is simply reloaded when the file change is noticed.
+		if (!$editorDirty) return;
+		const session = saves.capture();
+		void (async () => {
+			await saves.idle();
+			if (editorDisposed || !saves.isCurrentSession(session) || $activeNotePath !== payload.path) return;
+			// The rename rewrote the version this draft is based on: take over the same link changes
+			// and continue from the rewritten file, so the draft saves instead of conflicting.
+			if (!saves.adoptMovedRaw(payload.old_raw, payload.new_raw)) {
+				if (saves.raw !== payload.new_raw) flagExternalConflict();
+				return;
+			}
+			const vault = payload.vault_path.replace(/\\/g, '/');
+			const notePath = payload.path.replace(/\\/g, '/');
+			const relative = notePath.startsWith(`${vault}/`) ? notePath.slice(vault.length + 1) : notePath;
+			applyRenamedLinks(payload.renames, relative.includes('/') ? relative.slice(0, relative.lastIndexOf('/')) : '');
+		})();
+	}).then(fn => {
+		if (editorDisposed) fn();
+		else unlistenLinksRewritten = fn;
+	}).catch(error => console.error('Failed to listen for updated links:', error));
+
 	let unlistenToolbarLayout: (() => void) | null = null;
 	listen<ToolbarLayout | null>('toolbar-layout-changed', (event) => {
 		const preference = JSON.stringify(event.payload);
@@ -6692,9 +7607,11 @@
 		const path = (event as CustomEvent<string>).detail;
 		if (typeof path === 'string' && path) void navigateToWikiLink(path, '');
 	}
+	window.addEventListener('helixnotes-open-note', handleOpenNote);
 	window.addEventListener('cuelm-open-note', handleOpenNote);
 
 	onDestroy(() => {
+		cancelProgressiveLoad();
 		void flushSave();
 		closeAiMenu();
 		endToolbarCustomization();
@@ -6702,14 +7619,19 @@
 		if (editorNavigationToken !== null) cancelNoteNavigation(editorNavigationToken);
 		saves.startSession();
 		cancelCounts();
+		clearOutline();
 		cancelNoteSearchWork();
 		searchRevealedDetails.clear();
 		if (wikiTitleRefreshTimer !== null) clearTimeout(wikiTitleRefreshTimer);
-		window.removeEventListener('cuelm-open-note', handleOpenNote);
+		window.removeEventListener('helixnotes-open-note', handleOpenNote);
+		
+		window.removeEventListener("cuelm-open-note", handleOpenNote);
 		clearTargetReveal();
+
 		destroyEditor();
 		unlistenFileChange?.();
 		unlistenPathMoved?.();
+		unlistenLinksRewritten?.();
 		unlistenToolbarLayout?.();
 		if (infoPathCopyTimer) clearTimeout(infoPathCopyTimer);
 	});
@@ -7101,6 +8023,7 @@
 						if (!$activeNote) return;
 						const title = e.currentTarget.value;
 						if ($activeNote.meta.title === title) return;
+						syncVisibleTitleHeading($activeNote.meta.title, title);
 						$activeNote.meta.title = title;
 						if (hiddenTitleHeading) hiddenTitleHeading = { ...hiddenTitleHeading, title };
 						markEdited();
@@ -7123,6 +8046,7 @@
 							if (!newTitle) return;
 							const oldPath = $activeNotePath;
 							if ($activeNote.meta.title !== newTitle) {
+								syncVisibleTitleHeading($activeNote.meta.title, newTitle);
 								$activeNote.meta.title = newTitle;
 								if (hiddenTitleHeading) hiddenTitleHeading = { ...hiddenTitleHeading, title: newTitle };
 								markEdited();
@@ -7140,6 +8064,7 @@
 									if (isOriginCurrent(origin)) {
 										loadedPath = newPath;
 										$activeNotePath = newPath;
+										if (showOutline) updateOutline();
 									}
 									if (origin.vault !== $appConfig?.active_vault) return;
 									notes.update(list => list.map(n =>
@@ -7255,9 +8180,12 @@
 				</button>
 				<button
 					class="icon-btn"
-					class:active={showOutline}
-					onclick={() => { showOutline = !showOutline; if (showOutline) updateOutline(); }}
+					class:active={showOutline && !showHistory}
+					onclick={toggleOutlinePanel}
 					title="Outline"
+					aria-label="Outline"
+					aria-expanded={showOutline && !showHistory}
+					aria-controls={outlinePanelId}
 				>
 					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<line x1="4" y1="6" x2="20" y2="6"/><line x1="8" y1="12" x2="20" y2="12"/><line x1="8" y1="18" x2="20" y2="18"/><circle cx="4" cy="12" r="1" fill="currentColor"/><circle cx="4" cy="18" r="1" fill="currentColor"/>
@@ -7340,6 +8268,11 @@
 				{/if}
 			</div>
 		{/if}
+		{#if loadFailure && loadFailure === $activeNotePath && !$sourceMode}
+			<div class="save-error" role="alert">
+				<span><strong>This note could not be opened in the editor.</strong> It is shown empty and nothing will be saved from here; the file on disk is unchanged. Switch to source mode to view or edit it.</span>
+			</div>
+		{/if}
 		{#if searchRevealNotice}
 			<div class="search-target-notice" role="status">{searchRevealNotice}</div>
 		{/if}
@@ -7357,20 +8290,31 @@
 				{/if}
 			</span>
 			<span class="meta-divider">·</span>
-			<button class="note-tags-trigger" class:search-target-meta={searchTagsReveal} onclick={toggleTagMenu} title="Edit tags">
-				{#if $activeNote.meta.tags?.length > 0}
-					{#each $activeNote.meta.tags as tag, i (tagIterationKey(tag, i))}<TagLabel name={tag} size={11} tone="muted" />{/each}
-				{:else}
-					<span class="note-tags-add">+ Tags</span>
-				{/if}
-			</button>
+			{#if onShowTag && $activeNote.meta.tags?.length > 0}
+				<!-- Each tag leads to its notes; the tag button in the header edits them. -->
+				<span class="note-tags-trigger" class:search-target-meta={searchTagsReveal}>
+					{#each $activeNote.meta.tags as tag, i (tagIterationKey(tag, i))}
+						<button type="button" class="note-tag-link" onclick={() => onShowTag(tag)} title={`Show notes tagged ${tag}`}><TagLabel name={tag} size={11} tone="muted" /></button>
+					{/each}
+				</span>
+			{:else}
+				<button class="note-tags-trigger" class:search-target-meta={searchTagsReveal} onclick={toggleTagMenu} title="Edit tags">
+					{#if $activeNote.meta.tags?.length > 0}
+						{#each $activeNote.meta.tags as tag, i (tagIterationKey(tag, i))}<TagLabel name={tag} size={11} tone="muted" />{/each}
+					{:else}
+						<span class="note-tags-add">+ Tags</span>
+					{/if}
+				</button>
+			{/if}
 		</div>
 		{/if}
 
 		<div class="editor-body-wrapper">
 			{#if noteSearchOpen}
 				<div class="note-search-bar">
-					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.5;flex-shrink:0"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+					<button type="button" class="note-search-btn note-replace-toggle" class:open={noteReplaceOpen} aria-label="Replace" aria-expanded={noteReplaceOpen} title={`Replace (${bindingToKeys($keybindings['replace-in-note']).join('+')})`} onmousedown={(e) => e.preventDefault()} onclick={() => { noteReplaceOpen = !noteReplaceOpen; }}>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"/></svg>
+					</button>
 					<input
 						bind:this={noteSearchInput}
 						type="text"
@@ -7405,24 +8349,51 @@
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 					</button>
 				</div>
+				{#if noteReplaceOpen}
+					{@const replaceDisabled = (!noteSearchPending && !noteSearchResults.length) || $readOnly || !!$viewerNote || trashPreview || showHistory}
+					<div class="note-search-bar note-replace-bar">
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="opacity:0.5;flex-shrink:0"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
+						<input
+							bind:this={noteReplaceInput}
+							type="text"
+							class="note-search-input"
+							placeholder="Replace with..."
+							aria-label="Replace with"
+							bind:value={noteReplaceValue}
+							onkeydown={(e) => {
+								if (e.isComposing) return;
+								if (e.key === 'Enter') { e.preventDefault(); (e.ctrlKey || e.metaKey) ? replaceAllNoteMatches() : replaceNoteMatch(); }
+								if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeNoteSearch(); }
+							}}
+						/>
+						<button type="button" class="note-search-btn note-replace-btn" onclick={replaceNoteMatch} onmousedown={(e) => e.preventDefault()} disabled={replaceDisabled} title="Replace (Enter)">Replace</button>
+						<button type="button" class="note-search-btn note-replace-btn" onclick={replaceAllNoteMatches} onmousedown={(e) => e.preventDefault()} disabled={replaceDisabled} title={`Replace all (${modKey}+Enter)`}>All</button>
+					</div>
+				{/if}
 			{/if}
-			<div class="editor-body-row">
-			<div class="editor-body" class:source-body={$sourceMode}>
+			<div class="editor-body-row" class:reviewing-history={showHistory}>
+			<div class="editor-body" class:source-body={$sourceMode} class:history-hidden={showHistory} onscroll={scheduleOutlineActive}>
 				{#if isMobile}
-					<SourceEditor controller={source} readonly={$readOnly || !!$viewerNote || externalOperationBusy} visible={$sourceMode} mobile />
+					<SourceEditor controller={source} readonly={showHistory || $readOnly || !!$viewerNote || externalOperationBusy} visible={$sourceMode} mobile />
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
-					<div class="tiptap-wrapper" class:large-doc={isLargeDoc} style={$sourceMode ? 'display:none' : ''} spellcheck="false" bind:this={editorElement} onclick={(e) => { closeLinkContextMenu(); handleEditorClick(e); }} onkeydown={(e) => { if (e.key === 'Escape') closeLinkContextMenu(); }}></div>
+					<div class="tiptap-wrapper" class:large-doc={isLargeDoc} style={$sourceMode ? 'display:none' : ''} spellcheck="false" bind:this={editorElement} onerrorcapture={retryFailedImage} onclick={(e) => { closeLinkContextMenu(); handleEditorClick(e); }} onkeydown={(e) => { if (e.key === 'Escape') closeLinkContextMenu(); }}></div>
 				{:else}
 					{#if $sourceMode}
-						<SourceEditor controller={source} readonly={$readOnly || !!$viewerNote || externalOperationBusy} numbers={$appConfig?.show_line_numbers ?? false} />
+						<SourceEditor controller={source} readonly={showHistory || $readOnly || !!$viewerNote || externalOperationBusy} numbers={$appConfig?.show_line_numbers ?? false} />
 					{:else}
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
-						<div class="tiptap-wrapper" class:large-doc={isLargeDoc} spellcheck="false" bind:this={editorElement} onclick={(e) => { closeLinkContextMenu(); handleEditorClick(e); }} onkeydown={(e) => { if (e.key === 'Escape') closeLinkContextMenu(); }} oncontextmenu={handleEditorContextMenu}></div>
+						<div class="tiptap-wrapper" class:large-doc={isLargeDoc} spellcheck="false" bind:this={editorElement} onerrorcapture={retryFailedImage} onclick={(e) => { closeLinkContextMenu(); handleEditorClick(e); }} onkeydown={(e) => { if (e.key === 'Escape') closeLinkContextMenu(); }} oncontextmenu={handleEditorContextMenu}></div>
 					{/if}
 				{/if}
 			</div>
 
 			{#if showHistory}
+				<HistoryReview raw={historyPreview} current={historyWorking}
+					selected={historySelected ? formatVersionDate(historySelected.timestamp) : null}
+					loading={historyLoading || historyPreviewLoading} error={historyError ?? historyPreviewError}
+					canRestore={historyPreview !== null && !historyPreviewLoading && canInsert(captureOrigin())}
+					onRetry={() => { if (historySelected) void previewVersion(historySelected); else void loadHistory(); }}
+					onRestore={restoreVersion} renderSnapshot={(body) => markdownToHtml(body, true)} />
 				<div class="history-panel">
 					<div class="history-header">
 						<h3>Version History</h3>
@@ -7433,7 +8404,7 @@
 									<line x1="5" y1="12" x2="19" y2="12" />
 								</svg>
 							</button>
-							<button class="history-close" onclick={() => { showHistory = false; historyPreview = null; historySelected = null; }} aria-label="Close version history">
+							<button class="history-close" onclick={closeHistory} aria-label="Close version history">
 								<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 									<line x1="18" y1="6" x2="6" y2="18" />
 									<line x1="6" y1="6" x2="18" y2="18" />
@@ -7442,16 +8413,33 @@
 						</div>
 					</div>
 					{#if historyLoading}
-						<div class="history-empty">Loading...</div>
+						<div class="history-empty" role="status">Loading...</div>
+					{:else if historyError}
+						<div class="history-empty" role="alert">
+							<p>{historyError}</p>
+							<button class="history-retry-btn" onclick={loadHistory}>Retry</button>
+						</div>
 					{:else if historyVersions.length === 0}
 						<div class="history-empty">No versions yet. Versions are created automatically as you edit (at least 5 minutes apart).</div>
 					{:else}
+						<div class="history-picker">
+							<label for="history-version-picker">Version</label>
+							<select id="history-version-picker" aria-label="Select snapshot version"
+								value={historySelected?.timestamp ?? ''}
+								onchange={(event) => { const version = historyVersions.find((v) => v.timestamp === event.currentTarget.value); if (version) void previewVersion(version); }}>
+								{#each historyVersions as version (version.timestamp)}
+									<option value={version.timestamp}>{formatVersionDate(version.timestamp)}</option>
+								{/each}
+							</select>
+						</div>
 						<div class="history-list">
-							{#each historyVersions as v}
+							{#each historyVersions as v (v.timestamp)}
 								<button
 									class="history-item"
 									class:active={historySelected?.timestamp === v.timestamp}
+									aria-pressed={historySelected?.timestamp === v.timestamp}
 									onclick={() => previewVersion(v)}
+									title={v.timestamp}
 								>
 									<span class="history-date">{formatVersionDate(v.timestamp)}</span>
 									<span class="history-size">{formatVersionSize(v.size)}</span>
@@ -7459,21 +8447,16 @@
 							{/each}
 						</div>
 					{/if}
-					{#if historySelected}
-						<div class="history-actions">
-							<button class="history-restore-btn" onclick={restoreVersion}>
-								Restore this version
-							</button>
-						</div>
-					{/if}
 				</div>
 			{/if}
-			{#if showOutline}
-				<ResizeHandle onResize={handleOutlineResize} />
-				<div class="outline-panel" style="width: {$outlineWidth}px">
+			{#if showOutline && !showHistory}
+				<ResizeHandle onResize={handleOutlineResize} label="Resize outline" value={$outlineWidth} min={160} max={500} controls={outlinePanelId} />
+				<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+				<nav id={outlinePanelId} class="outline-panel" style="width: {$outlineWidth}px" aria-label="Note outline"
+					onkeydown={(event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); void closeOutline(); } }}>
 					<div class="outline-header">
 						<h3>Outline</h3>
-						<button class="outline-close" onclick={() => { showOutline = false; }} aria-label="Close outline">
+						<button class="outline-close" onclick={closeOutline} aria-label="Close outline">
 							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 								<line x1="18" y1="6" x2="6" y2="18" />
 								<line x1="6" y1="6" x2="18" y2="18" />
@@ -7483,20 +8466,26 @@
 					{#if outlineHeadings.length === 0}
 						<div class="outline-empty">No headings in this note.</div>
 					{:else}
-						<div class="outline-list">
-							{#each outlineHeadings as h}
-								<button
-									class="outline-item outline-level-{h.level}"
-									onclick={() => scrollToHeading(h.pos)}
-								>
-									{h.text}
-								</button>
+						<ul class="outline-list" bind:this={outlineList}>
+							{#each outlineHeadings as h, i}
+								<li>
+									<button
+										class="outline-item outline-level-{h.level}"
+										class:current={i === outlineActive}
+										aria-current={i === outlineActive ? 'location' : undefined}
+										aria-label={`Heading level ${h.level}: ${h.text.trim() || 'Untitled heading'}`}
+										title={h.text.trim() || 'Untitled heading'}
+										onclick={() => scrollToHeading(h)}
+									>
+										{h.text.trim() || 'Untitled heading'}
+									</button>
+								</li>
 							{/each}
-						</div>
+						</ul>
 					{/if}
-				</div>
+				</nav>
 			{/if}
-			{#if showInfo && $activeNote}
+			{#if showInfo && $activeNote && !showHistory}
 				<div class="info-panel">
 					<div class="info-panel-header">
 						<span class="info-panel-title">Note Info</span>
@@ -7578,6 +8567,18 @@
 						{/if}
 					</div>
 
+					{#key $activeNotePath}
+						<details class="info-section info-frontmatter">
+							<summary class="info-section-label">Frontmatter</summary>
+							<p class="info-frontmatter-caption">Last loaded or saved YAML. Unsaved changes are not shown.</p>
+							{#if infoFrontmatter}
+								<pre aria-label="Saved frontmatter">{infoFrontmatter}</pre>
+							{:else}
+								<p class="info-frontmatter-caption">No frontmatter in this note.</p>
+							{/if}
+						</details>
+					{/key}
+
 					{#if onMoveToTrash && $viewMode !== 'trash'}
 						<div class="info-section info-actions">
 							<button type="button" class="info-trash-btn" onclick={moveOpenNoteToTrash} disabled={trashingNote}>
@@ -7594,7 +8595,7 @@
 			</div>
 		</div>
 
-		{#if editorReady && !$sourceMode && !$viewerNote}
+		{#if editorReady && !$sourceMode && !$viewerNote && !showHistory}
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<div
 				class="editor-formatting-bar"
@@ -7699,6 +8700,7 @@
 
 	<!-- Hidden file inputs for Insert dropdown -->
 	<input type="file" id="insert-image-input" accept="image/*" style="display:none" onchange={handleAssetInput} />
+	<input type="file" id="insert-grid-input" accept="image/*" multiple style="display:none" onchange={handleGridInput} />
 	{#if isAndroid}
 		<input type="file" id="insert-camera-input" accept="image/*" capture="environment" style="display:none" onchange={handleAssetInput} />
 	{/if}
@@ -7764,6 +8766,10 @@
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
 				Copy
 				<span class="text-ctx-shortcut">{modKey}+C</span>
+			</button>
+			<button onclick={ctxCopyPlain}>
+				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16M12 5v14M8 19h8"/></svg>
+				Copy as Plain Text
 			</button>
 			<button onclick={ctxPaste}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4h2a2 2 0 012 2v14a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>
@@ -7962,6 +8968,14 @@
 			<button class:active={imageToolbar.size === 'small'} onclick={() => setImageSize('small')} title="Small (33%)">S</button>
 			<button class:active={imageToolbar.size === 'medium'} onclick={() => setImageSize('medium')} title="Medium (50%)">M</button>
 			<button class:active={imageToolbar.size === 'full'} onclick={() => setImageSize('full')} title="Full width">L</button>
+			<button class:active={!!imageToolbar.title} onclick={openImageTitleModal} title={imageToolbar.title ? `Hover text: ${imageToolbar.title}` : 'Set hover text'} aria-label="Image hover text">T</button>
+			<span class="img-toolbar-sep"></span>
+			{#if imageToolbar.inGrid}
+				<button onclick={() => moveGridImage(-1)} title="Move left in grid" aria-label="Move left in grid">←</button>
+				<button onclick={() => moveGridImage(1)} title="Move right in grid" aria-label="Move right in grid">→</button>
+			{:else}
+				<button onclick={wrapNearbyImagesInGrid} disabled={!imageToolbar.canGroup} title={imageToolbar.canGroup ? 'Group neighboring images into a grid' : 'Put another image right above or below this one to make a grid'}>Grid</button>
+			{/if}
 			{#if isAndroid}
 				<span class="img-toolbar-sep"></span>
 				<button class="img-toolbar-view" onclick={openImageViewer} title="View and zoom image" aria-label="View and zoom image">
@@ -7983,6 +8997,37 @@
 
 {#if imageViewer}
 	<ImageViewer src={imageViewer.src} alt={imageViewer.alt} onclose={() => (imageViewer = null)} />
+{/if}
+
+{#if imageTitleModal}
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="math-modal-overlay" onclick={(e) => closeFromOverlay(e, cancelImageTitleModal)} onkeydown={(e) => closeOnEscape(e, cancelImageTitleModal)}>
+		<div class="math-modal" role="dialog" aria-modal="true" aria-label="Image hover text" tabindex="-1">
+			<div class="math-modal-header">
+				<span>Image hover text</span>
+				<button type="button" class="math-modal-close" onclick={cancelImageTitleModal} aria-label="Close">
+					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+				</button>
+			</div>
+			<input
+				class="math-modal-input img-title-input"
+				placeholder="Shown when hovering the image. Leave empty to remove it."
+				bind:value={imageTitleModal.title}
+				onkeydown={(e) => {
+					if (e.key === 'Enter') { e.preventDefault(); commitImageTitleModal(); }
+					if (e.key === 'Escape') { e.preventDefault(); cancelImageTitleModal(); }
+				}}
+				use:autofocus
+			/>
+			<div class="math-modal-footer">
+				<span class="math-modal-hint">Saved as ![alt](image "hover text") · Enter to apply · Esc to cancel</span>
+				<div class="math-modal-actions">
+					<button type="button" onclick={cancelImageTitleModal}>Cancel</button>
+					<button type="button" class="primary" onclick={commitImageTitleModal}>Apply</button>
+				</div>
+			</div>
+		</div>
+	</div>
 {/if}
 
 {#if copyToast}
@@ -8295,12 +9340,12 @@
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div class="wiki-link-overlay" onclick={(e) => closeFromOverlay(e, closeWikiLinkMenu)} onkeydown={(e) => closeOnEscape(e, closeWikiLinkMenu)}>
 		<div class="wiki-link-menu" style="left: {wikiLinkMenu.x}px; top: {wikiLinkMenu.y}px">
-			{#if wikiLinkFiltered.length === 0}
+			{#if wikiLinkRowCount === 0}
 				<div class="wiki-link-empty">
 					{wikiLinkMenu.query ? 'No matching notes' : 'Type to search notes...'}
 				</div>
 			{:else}
-				{#each wikiLinkFiltered.slice(0, 12) as entry, i}
+				{#each wikiLinkVisible as entry, i}
 					<button
 						class="wiki-link-item"
 						class:selected={i === wikiLinkSelectedIndex}
@@ -8316,6 +9361,19 @@
 						</span>
 					</button>
 				{/each}
+				{#if wikiLinkCreateTitle}
+					<button
+						class="wiki-link-item"
+						class:selected={wikiLinkSelectedIndex === wikiLinkVisible.length}
+						onmouseenter={() => wikiLinkSelectedIndex = wikiLinkVisible.length}
+						onmousedown={(e) => { e.preventDefault(); void createNoteFromWikiLinkMenu(); }}
+					>
+						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/><polyline points="13 2 13 9 20 9"/><path d="M12 12v6M9 15h6"/></svg>
+						<span class="wiki-link-title-col">
+							<span class="wiki-link-title">Create note "{wikiLinkCreateTitle}"</span>
+						</span>
+					</button>
+				{/if}
 			{/if}
 		</div>
 	</div>
@@ -8591,6 +9649,9 @@
 
 	.editor-toolbar {
 		display: flex;
+		/* In a narrow pane the buttons move to their own row instead of squeezing the title away. */
+		flex-wrap: wrap;
+		row-gap: 4px;
 		align-items: center;
 		justify-content: space-between;
 		padding: 12px 20px 4px;
@@ -8633,6 +9694,8 @@
 
 	.editor-title {
 		flex: 1;
+		/* The title used to be the only thing that could shrink, down to nothing. */
+		min-width: min(12rem, 100%);
 	}
 
 	.editor-title input {
@@ -8701,6 +9764,22 @@
 		cursor: pointer;
 	}
 
+	.note-tag-link {
+		display: inline-flex;
+		border: none;
+		background: none;
+		padding: 0;
+		margin: 0;
+		font: inherit;
+		color: inherit;
+		cursor: pointer;
+		border-radius: 4px;
+	}
+
+	.note-tag-link:hover {
+		color: var(--accent);
+	}
+
 	.note-tags-add {
 		font-size: 11px;
 		color: var(--text-tertiary);
@@ -8716,6 +9795,7 @@
 		display: flex;
 		align-items: center;
 		gap: 8px;
+		margin-left: auto;
 	}
 
 	.save-indicator {
@@ -9327,6 +10407,9 @@
 	}
 	.note-search-btn:disabled { opacity: 0.4; cursor: default; }
 	.note-search-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+	.note-replace-toggle svg { transition: transform 0.12s ease; }
+	.note-replace-toggle.open svg { transform: rotate(90deg); }
+	.note-replace-btn { font-size: 12px; height: 24px; padding: 0 8px; }
 	.note-search-option { min-width: 24px; justify-content: center; font-size: 12px; height: 24px; }
 	.note-search-option[aria-pressed="true"] { background: var(--accent); color: var(--bg-primary); }
 	.note-search-option.whole-word { text-decoration: underline; text-underline-offset: 3px; }
@@ -9355,6 +10438,8 @@
 		position: relative;
 	}
 
+	.editor-body.history-hidden { display: none; }
+
 	/* Inset the scrollbar off the window's right edge so the window resize handle
 	   (ResizeHandles in +layout) has clean space and doesn't swallow the scrollbar. */
 	.editor-container:not(.mobile) .editor-body {
@@ -9366,7 +10451,7 @@
 	}
 
 	.history-panel {
-		width: 240px;
+		width: 220px;
 		border-left: 1px solid var(--border-light);
 		background: var(--bg-secondary);
 		display: flex;
@@ -9379,6 +10464,7 @@
 		display: flex;
 		align-items: center;
 		justify-content: space-between;
+		flex-shrink: 0;
 		padding: 12px 14px;
 		border-bottom: 1px solid var(--border-light);
 	}
@@ -9425,14 +10511,27 @@
 
 	.history-list {
 		flex: 1;
+		min-height: 0;
 		overflow-y: auto;
 		padding: 4px 6px;
 	}
 
+
+	.history-retry-btn {
+		margin-top: 8px;
+		padding: 6px 10px;
+		border: 1px solid var(--border-color);
+		border-radius: 4px;
+		background: var(--bg-tertiary);
+		color: var(--text-primary);
+		cursor: pointer;
+	}
+
 	.history-item {
 		display: flex;
-		align-items: center;
-		justify-content: space-between;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 5px;
 		width: 100%;
 		padding: 8px 10px;
 		border: none;
@@ -9466,28 +10565,30 @@
 		color: var(--text-tertiary);
 	}
 
-	.history-actions {
-		padding: 8px 10px;
-		border-top: 1px solid var(--border-light);
-	}
-
-	.history-restore-btn {
+	.history-picker { display: none; }
+	.history-picker label { font-size: 12px; color: var(--text-secondary); }
+	.history-picker select {
 		width: 100%;
-		padding: 7px 12px;
-		border: 1px solid var(--accent);
+		min-width: 0;
+		padding: 8px 10px;
+		border: 1px solid var(--border-color);
 		border-radius: 6px;
-		background: var(--accent-light);
-		color: var(--accent);
+		background: var(--bg-primary);
+		color: var(--text-primary);
 		font-size: 12px;
-		font-weight: 500;
-		cursor: pointer;
-		transition: all 0.15s;
+	}
+	.history-item:focus-visible, .history-picker select:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+	@media (max-width: 600px) {
+		.editor-body-row.reviewing-history { flex-direction: column-reverse; }
+		.history-panel { width: 100%; border-left: none; border-bottom: 1px solid var(--border-light); flex: none; }
+		.history-header { padding: 8px 12px; }
+		.history-header-actions > button { min-width: 44px; min-height: 44px; }
+		.history-list { display: none; }
+		.history-picker { display: flex; flex-direction: column; gap: 5px; padding: 0 12px 10px; }
+		.history-picker select { min-height: 44px; }
 	}
 
-	.history-restore-btn:hover {
-		background: var(--accent);
-		color: white;
-	}
 
 	.outline-panel {
 		width: 220px;
@@ -9497,6 +10598,7 @@
 		flex-direction: column;
 		overflow: hidden;
 		flex-shrink: 0;
+		min-height: 0;
 	}
 
 	.outline-header {
@@ -9541,6 +10643,9 @@
 
 	.outline-list {
 		flex: 1;
+		min-height: 0;
+		margin: 0;
+		list-style: none;
 		overflow-y: auto;
 		padding: 4px 0;
 	}
@@ -9555,15 +10660,20 @@
 		font-size: var(--editor-font-size, 14px);
 		color: var(--text-secondary);
 		cursor: pointer;
-		white-space: nowrap;
-		overflow: hidden;
-		text-overflow: ellipsis;
+		white-space: normal;
+		overflow-wrap: anywhere;
 		line-height: 1.5;
 	}
 
 	.outline-item:hover {
 		background: var(--bg-hover);
 		color: var(--text-primary);
+	}
+
+	.outline-item.current {
+		background: color-mix(in srgb, var(--accent) 12%, var(--bg-secondary));
+		color: var(--accent);
+		box-shadow: inset 3px 0 var(--accent);
 	}
 
 	.outline-level-1 { padding-left: 14px; font-weight: 600; }
@@ -9650,6 +10760,8 @@
 		font-family: 'JetBrains Mono', 'Fira Code', monospace;
 		font-size: 0.9em;
 	}
+
+	:global(.tiptap-wrapper .tiptap :not(pre) > code) { white-space: pre-wrap; }
 
 	:global(.tiptap-wrapper .tiptap pre) {
 		background: color-mix(in srgb, var(--accent) 8%, var(--bg-tertiary));
@@ -9945,6 +11057,11 @@
 		outline: none;
 	}
 	.math-modal-input:focus { border-color: var(--accent); }
+	.img-title-input {
+		min-height: 0;
+		resize: none;
+		font-family: inherit;
+	}
 	.math-modal-preview {
 		min-height: 60px;
 		padding: 14px;
@@ -10782,6 +11899,93 @@
 		max-width: 100%;
 	}
 
+	/* Image grids (#254). These come after the size rules above so grid cells can override them. */
+	:global(.tiptap-wrapper .tiptap .img-grid-wrap) {
+		margin: 1em 0;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid-header) {
+		display: none;
+		gap: 4px;
+		margin-bottom: 6px;
+	}
+	:global(.tiptap-wrapper .tiptap[contenteditable="true"] .img-grid-header) {
+		display: flex;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid-control) {
+		font-size: 11px;
+		font-weight: 600;
+		padding: 2px 8px;
+		border-radius: 6px;
+		border: 1px solid var(--border-color);
+		background: var(--bg-secondary);
+		color: var(--text-secondary);
+		cursor: pointer;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid) {
+		display: grid;
+		grid-template-columns: repeat(2, 1fr);
+		gap: 8px;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid[data-cols="3"]) {
+		grid-template-columns: repeat(3, 1fr);
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid[data-cols="4"]) {
+		grid-template-columns: repeat(4, 1fr);
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid[data-layout="masonry"]) {
+		display: block;
+		columns: 2;
+		column-gap: 8px;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid[data-layout="masonry"][data-cols="3"]) {
+		columns: 3;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid[data-layout="masonry"][data-cols="4"]) {
+		columns: 4;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid img) {
+		margin: 0;
+		width: 100%;
+		max-width: 100%;
+	}
+	/* S/M/L still applies inside a cell. */
+	:global(.tiptap-wrapper .tiptap .img-grid img[data-size="small"]) {
+		width: 55%;
+		justify-self: center;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid img[data-size="medium"]) {
+		width: 80%;
+		justify-self: center;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid[data-layout="masonry"] img) {
+		display: block;
+		break-inside: avoid;
+		margin-bottom: 8px;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid[data-layout="masonry"] img[data-size="small"]),
+	:global(.tiptap-wrapper .tiptap .img-grid[data-layout="masonry"] img[data-size="medium"]) {
+		margin-left: auto;
+		margin-right: auto;
+	}
+	:global(.tiptap-wrapper .tiptap[contenteditable="true"] .img-grid img) {
+		cursor: grab;
+	}
+	:global(.tiptap-wrapper .tiptap .img-grid.img-grid-dropping) {
+		outline: 2px dashed var(--accent);
+		outline-offset: 4px;
+	}
+	/* Phones: 3 and 4 column grids collapse to 2. */
+	@media (max-width: 640px) {
+		:global(.tiptap-wrapper .tiptap .img-grid[data-cols="3"]),
+		:global(.tiptap-wrapper .tiptap .img-grid[data-cols="4"]) {
+			grid-template-columns: repeat(2, 1fr);
+		}
+		:global(.tiptap-wrapper .tiptap .img-grid[data-layout="masonry"][data-cols="3"]),
+		:global(.tiptap-wrapper .tiptap .img-grid[data-layout="masonry"][data-cols="4"]) {
+			columns: 2;
+		}
+	}
+
 	.img-toolbar-overlay {
 		position: fixed;
 		inset: 0;
@@ -10792,6 +11996,8 @@
 		position: fixed;
 		display: flex;
 		align-items: center;
+		flex-wrap: wrap;
+		max-width: calc(100vw - 16px);
 		gap: 2px;
 		background: var(--bg-primary);
 		border: 1px solid var(--border-color);
@@ -12135,12 +13341,18 @@
 		padding: 8px 16px 6px 16px;
 		flex-shrink: 0;
 		flex-direction: column;
+		flex-wrap: nowrap;
 		align-items: stretch;
 		gap: 2px;
 	}
 
+	.editor-container.mobile .editor-title {
+		min-width: 0;
+	}
+
 	.editor-container.mobile .toolbar-actions {
 		gap: 4px;
+		margin-left: 0;
 	}
 
 	.editor-container.mobile .toolbar-actions .icon-btn {
@@ -12272,12 +13484,10 @@
 		position: relative;
 	}
 
-	.editor-container.mobile .editor-body-row:has(.history-panel) > .editor-body,
 	.editor-container.mobile .editor-body-row:has(.outline-panel) > .editor-body {
 		display: none;
 	}
 
-	.editor-container.mobile .history-panel,
 	.editor-container.mobile .outline-panel {
 		position: static;
 		flex: 1;
@@ -12287,31 +13497,28 @@
 		border-left: none;
 	}
 
+	.editor-container.mobile .outline-item { min-height: 44px; padding-top: 10px; padding-bottom: 10px; }
+	.editor-container.mobile .outline-close { min-width: 44px; min-height: 44px; justify-content: center; }
+	.editor-container.mobile :global(.resize-handle) { display: none; }
+
+	.editor-container.mobile .editor-body-row.reviewing-history { flex-direction: column-reverse; }
+	.editor-container.mobile .history-panel { width: 100%; flex: none; border-left: none; border-bottom: 1px solid var(--border-light); }
+	.editor-container.mobile .history-list { display: none; }
+	.editor-container.mobile .history-picker { display: flex; flex-direction: column; gap: 5px; padding: 0 12px 10px; }
+	.editor-container.mobile .history-picker select { min-height: 44px; }
+
 	.editor-container.mobile .history-item {
 		padding: 12px 12px;
 		min-height: 48px;
 	}
 
-	.editor-container.mobile .history-list {
-		padding-bottom: 80px;
+	.editor-container.mobile .history-create-btn,
+	.editor-container.mobile .history-close,
+	.editor-container.mobile .history-retry-btn {
+		min-width: 44px;
+		min-height: 44px;
 	}
 
-	.editor-container.mobile .history-restore-btn {
-		padding: 14px 16px;
-		font-size: 15px;
-	}
-
-	.editor-container.mobile .history-actions {
-		position: fixed;
-		bottom: 0;
-		left: 0;
-		right: 0;
-		padding: 12px;
-		padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px));
-		background: var(--bg-secondary);
-		border-top: 1px solid var(--border-light);
-		z-index: 51;
-	}
 
 	.editor-container.mobile .note-search-bar {
 		padding: 8px 12px;
@@ -12510,6 +13717,17 @@
 		color: var(--text-tertiary);
 		margin-bottom: 8px;
 	}
+
+	.info-frontmatter { flex-shrink: 0; }
+	.info-frontmatter > summary { cursor: pointer; margin-bottom: 0; padding: 2px 0; border-radius: 4px; }
+	.info-frontmatter[open] > summary { margin-bottom: 8px; }
+	.info-frontmatter > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+	.info-frontmatter-caption { margin: 0 0 8px; font-size: 11px; line-height: 1.5; color: var(--text-secondary); }
+	.info-frontmatter pre { margin: 0; font-family: var(--font-mono, monospace); font-size: 11px; line-height: 1.6; color: var(--text-primary); white-space: pre-wrap; overflow-wrap: anywhere; }
+	@media (max-width: 600px) {
+		.info-frontmatter > summary { min-height: 44px; padding: 12px 0; }
+	}
+	.editor-container.mobile .info-frontmatter > summary { min-height: 44px; padding: 12px 0; }
 
 	.info-row {
 		display: flex;

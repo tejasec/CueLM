@@ -1,8 +1,69 @@
 use crate::types::NoteMeta;
 use chrono::{NaiveDate, NaiveDateTime, Utc};
-use gray_matter::engine::YAML;
-use gray_matter::Matter;
+use gray_matter::engine::{Engine, YAML as UnboundedYaml};
+use gray_matter::{Matter, Pod};
 use serde::{Deserialize, Serialize};
+
+const MAX_FRONTMATTER_BYTES: usize = 64 * 1024;
+const MAX_FRONTMATTER_ALIASES: usize = 16;
+const MAX_FRONTMATTER_INDENT: usize = 200;
+const MAX_FRONTMATTER_INDICATORS: usize = 32;
+
+/// YAML frontmatter engine for notes, which are untrusted input (sync, import, shared vaults).
+/// The underlying loader expands every alias by copying and recurses once per nesting level, so a
+/// note of a few hundred bytes could take gigabytes or overflow the stack and take the app down
+/// at every start. Frontmatter outside these bounds is treated as carrying no metadata.
+pub struct BoundedYaml;
+
+impl Engine for BoundedYaml {
+    fn parse(content: &str) -> Pod {
+        if frontmatter_within_bounds(content) {
+            UnboundedYaml::parse(content)
+        } else {
+            Pod::Null
+        }
+    }
+}
+
+fn frontmatter_within_bounds(content: &str) -> bool {
+    if content.len() > MAX_FRONTMATTER_BYTES {
+        return false;
+    }
+    // Aliases multiply: with few of them the expansion stays small whatever they point at.
+    let bytes = content.as_bytes();
+    let aliases = bytes
+        .iter()
+        .enumerate()
+        .filter(|&(index, &byte)| {
+            byte == b'*'
+                && (index == 0
+                    || matches!(
+                        bytes[index - 1],
+                        b' ' | b'\t' | b'\n' | b'[' | b',' | b':' | b'-' | b'{'
+                    ))
+                && bytes
+                    .get(index + 1)
+                    .is_some_and(|next| next.is_ascii_alphanumeric() || matches!(next, b'_' | b'-'))
+        })
+        .count();
+    if aliases > MAX_FRONTMATTER_ALIASES {
+        return false;
+    }
+    // Block nesting deepens by indentation, or by indicators chained on one line (`- - - x`).
+    content.lines().all(|line| {
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let mut rest = &line.as_bytes()[indent..];
+        let mut indicators = 0;
+        while let [b'-' | b'?' | b':', b' ' | b'\t', tail @ ..] = rest {
+            indicators += 1;
+            rest = tail;
+            while let [b' ' | b'\t', tail @ ..] = rest {
+                rest = tail;
+            }
+        }
+        indent <= MAX_FRONTMATTER_INDENT && indicators <= MAX_FRONTMATTER_INDICATORS
+    })
+}
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct RawFrontmatter {
@@ -40,14 +101,60 @@ pub fn parse_date_flexible(s: &str) -> Option<chrono::DateTime<Utc>> {
     None
 }
 
+/// Reads the known keys one by one. Frontmatter written by other editors is often shaped a little
+/// differently (`tags: work`, `pinned: yes`, a numeric title or id); reading it as one strict
+/// record dropped every field when a single one did not fit, and the next save then wrote a new id,
+/// the file name as title and no tags over the originals.
+fn read_frontmatter(data: Option<Pod>) -> RawFrontmatter {
+    let Some(serde_json::Value::Object(fields)) =
+        data.and_then(|data| data.deserialize::<serde_json::Value>().ok())
+    else {
+        return RawFrontmatter::default();
+    };
+    let text = |value: &serde_json::Value| match value {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Number(number) => Some(number.to_string()),
+        serde_json::Value::Bool(flag) => Some(flag.to_string()),
+        _ => None,
+    };
+    let tags = fields.get("tags").map(|value| match value {
+        serde_json::Value::Array(items) => items.iter().filter_map(text).collect(),
+        // `tags: work` and `tags: a, b` are common outside this app.
+        other => text(other)
+            .map(|joined| {
+                joined
+                    .split(',')
+                    .map(|tag| tag.trim().to_string())
+                    .filter(|tag| !tag.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
+    });
+    let pinned = fields.get("pinned").and_then(|value| match value {
+        serde_json::Value::Bool(flag) => Some(*flag),
+        serde_json::Value::Number(number) => Some(number.as_f64() != Some(0.0)),
+        serde_json::Value::String(word) => match word.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "on" | "1" => Some(true),
+            "false" | "no" | "off" | "0" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    });
+    RawFrontmatter {
+        id: fields.get("id").and_then(text),
+        title: fields.get("title").and_then(text),
+        tags,
+        pinned,
+        created: fields.get("created").and_then(text),
+        modified: fields.get("modified").and_then(text),
+    }
+}
+
 pub fn parse_note(raw: &str, filename: &str) -> (NoteMeta, String) {
-    let matter = Matter::<YAML>::new();
+    let matter = Matter::<BoundedYaml>::new();
     let result = matter.parse(raw);
 
-    let fm: RawFrontmatter = result
-        .data
-        .and_then(|d| d.deserialize().ok())
-        .unwrap_or_default();
+    let fm = read_frontmatter(result.data);
 
     let title = fm.title.unwrap_or_else(|| filename_to_title(filename));
 
@@ -77,18 +184,15 @@ pub fn parse_note(raw: &str, filename: &str) -> (NoteMeta, String) {
     (meta, content)
 }
 
-/// Ensure the body starts with `# Title` heading for external app compatibility.
-/// If the body already starts with `# Title`, leave it as-is.
+/// Ensure the body starts with a top-level heading for external app compatibility, adding
+/// `# Title` when it has none. A body that already opens with a top-level heading is left alone
+/// even when that heading differs from the title: adding another one above it stacked a new
+/// heading on every title change (`# New`, `# Old`, ...).
 fn ensure_title_heading(body: &str, title: &str) -> String {
     let trimmed = body.trim_start();
 
-    // Check if body already starts with `# Title`
-    if let Some(rest) = trimmed.strip_prefix("# ") {
-        let first_line_end = rest.find('\n').unwrap_or(rest.len());
-        let heading_text = rest[..first_line_end].trim();
-        if heading_text.eq_ignore_ascii_case(title.trim()) {
-            return body.to_string();
-        }
+    if trimmed.starts_with("# ") {
+        return body.to_string();
     }
 
     // Don't add heading to empty notes (new/blank notes)
@@ -100,29 +204,24 @@ fn ensure_title_heading(body: &str, title: &str) -> String {
     format!("# {}\n\n{}", title, body)
 }
 
+/// The frontmatter block for a note that has none yet. Written through the YAML serializer like
+/// `merge_frontmatter`: assembled by hand, a title with a backslash or a tag such as `2024`,
+/// `true` or `a: b` came out as YAML the app could not read back.
 pub fn serialize_frontmatter(meta: &NoteMeta) -> String {
-    let tags_str = if meta.tags.is_empty() {
-        "[]".to_string()
-    } else {
-        format!(
-            "[{}]",
-            meta.tags
-                .iter()
-                .map(|t| t.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )
-    };
-
-    format!(
-        "---\nid: \"{}\"\ntitle: \"{}\"\ntags: {}\npinned: {}\ncreated: {}\nmodified: {}\n---\n",
-        meta.id,
-        meta.title.replace('"', "\\\""),
-        tags_str,
-        meta.pinned,
-        meta.created.to_rfc3339(),
-        meta.modified.to_rfc3339(),
-    )
+    let text = |value: &str| serde_yaml::Value::String(value.to_string());
+    let mut mapping = serde_yaml::Mapping::new();
+    mapping.insert(text("id"), text(&meta.id));
+    mapping.insert(text("title"), text(&meta.title));
+    mapping.insert(
+        text("tags"),
+        serde_yaml::Value::Sequence(meta.tags.iter().map(|tag| text(tag)).collect()),
+    );
+    mapping.insert(text("pinned"), serde_yaml::Value::Bool(meta.pinned));
+    mapping.insert(text("created"), text(&meta.created.to_rfc3339()));
+    mapping.insert(text("modified"), text(&meta.modified.to_rfc3339()));
+    let yaml = serde_yaml::to_string(&serde_yaml::Value::Mapping(mapping))
+        .expect("strings, booleans and a list always serialize");
+    format!("---\n{yaml}---\n")
 }
 
 pub fn update_note_raw(meta: &NoteMeta, body: &str) -> String {
@@ -134,7 +233,7 @@ pub fn update_note_raw(meta: &NoteMeta, body: &str) -> String {
 /// Merge NoteMeta fields into existing frontmatter, preserving unknown YAML keys.
 /// Falls back to serialize_frontmatter() if the original has no frontmatter.
 pub fn merge_frontmatter(original_raw: &str, meta: &NoteMeta, body: &str) -> String {
-    let matter = Matter::<YAML>::new();
+    let matter = Matter::<BoundedYaml>::new();
     let parsed = matter.parse(original_raw);
 
     // If original had no frontmatter, use the simple serializer
@@ -214,13 +313,9 @@ pub fn filename_to_title(filename: &str) -> String {
 
 /// Quick title extraction from raw note content (frontmatter only, no full parse)
 pub fn extract_title(raw: &str) -> Option<String> {
-    let matter = Matter::<YAML>::new();
+    let matter = Matter::<BoundedYaml>::new();
     let result = matter.parse(raw);
-    let fm: RawFrontmatter = result
-        .data
-        .and_then(|d| d.deserialize().ok())
-        .unwrap_or_default();
-    fm.title
+    read_frontmatter(result.data).title
 }
 
 pub fn extract_preview(content: &str, max_len: usize) -> String {
@@ -421,5 +516,216 @@ mod tests {
         let stripped = strip_html_and_markdown(input);
         eprintln!("Stripped: {:?}", stripped);
         assert!(stripped.contains("Telefoonnummer"));
+    }
+    fn alias_bomb(levels: usize, width: usize) -> String {
+        let mut note = format!(
+            "---\ntitle: Bomb\na0: &a0 [{}]\n",
+            vec!["1"; width].join(",")
+        );
+        for level in 1..levels {
+            let alias = format!("*a{}", level - 1);
+            note.push_str(&format!(
+                "a{level}: &a{level} [{}]\n",
+                vec![alias.as_str(); width].join(",")
+            ));
+        }
+        note.push_str("---\nbody\n");
+        note
+    }
+
+    /// Runs on a stack the size of the app's worker threads, where the unbounded loader overflowed.
+    fn on_worker_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(work)
+            .unwrap()
+            .join()
+            .unwrap()
+    }
+
+    #[test]
+    fn hostile_frontmatter_is_read_as_a_note_without_metadata() {
+        let nested_on_one_line = format!("---\nt: {}x\n---\nbody\n", "- ".repeat(2400));
+        let mut nested_by_indent = String::from("---\nt:\n");
+        for depth in 0..400 {
+            note_line(&mut nested_by_indent, depth);
+        }
+        nested_by_indent.push_str("---\nbody\n");
+        let oversized = format!(
+            "---\ntitle: Big\nfiller: \"{}\"\n---\nbody\n",
+            "x".repeat(MAX_FRONTMATTER_BYTES)
+        );
+        for note in [
+            alias_bomb(10, 8),
+            alias_bomb(40, 2),
+            nested_on_one_line,
+            nested_by_indent,
+            oversized,
+        ] {
+            let started = std::time::Instant::now();
+            let (title, content, extracted, merged) = on_worker_stack(move || {
+                let (meta, content) = parse_note(&note, "Fallback Name.md");
+                let merged = merge_frontmatter(&note, &meta, &content);
+                (meta.title, content, extract_title(&note), merged)
+            });
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            // No metadata is taken from it, and the body is still split off as usual.
+            assert_eq!(title, "Fallback Name");
+            assert_eq!(content, "body");
+            assert_eq!(extracted, None);
+            assert!(
+                merged.ends_with("body"),
+                "{}",
+                &merged[merged.len().saturating_sub(40)..]
+            );
+        }
+    }
+
+    fn note_line(note: &mut String, depth: usize) {
+        note.push_str(&" ".repeat(depth));
+        note.push_str("-\n");
+    }
+
+    #[test]
+    fn ordinary_frontmatter_is_unaffected_by_the_bounds() {
+        let (meta, content) = parse_note(
+            "---\nid: abc\ntitle: \"*Starred* title: 5*3\"\ntags:\n  - one\n  - two\npinned: true\n---\n# Body\n",
+            "x.md",
+        );
+        assert_eq!(meta.id, "abc");
+        assert_eq!(meta.title, "*Starred* title: 5*3");
+        assert_eq!(meta.tags, vec!["one", "two"]);
+        assert!(meta.pinned);
+        assert_eq!(content, "# Body");
+        // A few aliases and modest nesting are ordinary YAML.
+        let (meta, _) = parse_note(
+            "---\ntitle: Shared\nbase: &base [a, b]\ntags: *base\nextra:\n  - - nested\n    - list\n---\nbody\n",
+            "x.md",
+        );
+        assert_eq!(meta.title, "Shared");
+        assert_eq!(meta.tags, vec!["a", "b"]);
+        assert!(frontmatter_within_bounds(&format!(
+            "title: {}",
+            "x".repeat(MAX_FRONTMATTER_BYTES - 16)
+        )));
+    }
+    #[test]
+    fn one_field_of_another_shape_no_longer_drops_the_rest() {
+        let note = |extra: &str| format!("---\nid: keep-me\ntitle: Kept\n{extra}\n---\nbody\n");
+        let (meta, _) = parse_note(&note("tags: work"), "File.md");
+        assert_eq!((meta.id.as_str(), meta.title.as_str()), ("keep-me", "Kept"));
+        assert_eq!(meta.tags, vec!["work"]);
+        let (meta, _) = parse_note(&note("tags: a, b ,c\npinned: yes"), "File.md");
+        assert_eq!(meta.tags, vec!["a", "b", "c"]);
+        assert!(meta.pinned);
+        assert_eq!(meta.id, "keep-me");
+        // Numbers where text is expected are read as text.
+        let (meta, _) = parse_note(
+            "---\nid: 20231014\ntitle: 2024\ntags: [1, two, true]\npinned: 0\n---\nbody\n",
+            "File.md",
+        );
+        assert_eq!(
+            (meta.id.as_str(), meta.title.as_str()),
+            ("20231014", "2024")
+        );
+        assert_eq!(meta.tags, vec!["1", "two", "true"]);
+        assert!(!meta.pinned);
+        assert_eq!(
+            extract_title("---\ntitle: 2024\ntags: work\n---\nbody\n").as_deref(),
+            Some("2024")
+        );
+        // A field that makes no sense is skipped on its own.
+        let (meta, _) = parse_note(&note("tags: {a: b}\npinned: maybe"), "File.md");
+        assert_eq!(meta.id, "keep-me");
+        assert!(meta.tags.is_empty());
+        assert!(!meta.pinned);
+        // Saving keeps the identity and writes the tags as a list.
+        let (meta, content) = parse_note(&note("tags: work\naliases: [x]"), "File.md");
+        let saved = merge_frontmatter(&note("tags: work\naliases: [x]"), &meta, &content);
+        let (again, _) = parse_note(&saved, "File.md");
+        assert_eq!(
+            (again.id.as_str(), again.title.as_str()),
+            ("keep-me", "Kept")
+        );
+        assert_eq!(again.tags, vec!["work"]);
+        assert!(saved.contains("aliases:"));
+    }
+
+    #[test]
+    fn new_frontmatter_reads_back_whatever_the_title_and_tags_contain() {
+        for (title, tags) in [
+            ("C:\\Users\\tom", vec!["2024", "true"]),
+            ("Plain", vec!["foo: bar", "a,b"]),
+            ("Say \"hi\" and 'bye'", vec!["#hash", "- dash"]),
+            ("\\sum x", vec!["null", "~", "1.5"]),
+            (
+                "Tab\there: colon # hash",
+                vec!["[x]", "{y}", "*star", "&amp"],
+            ),
+            ("- leading dash", vec![]),
+            ("", vec!["yes"]),
+        ] {
+            let meta = NoteMeta {
+                id: "the-id".into(),
+                title: title.into(),
+                tags: tags.iter().map(|tag| tag.to_string()).collect(),
+                pinned: true,
+                created: Utc::now(),
+                modified: Utc::now(),
+            };
+            let raw = update_note_raw(&meta, "body\n");
+            let (back, content) = parse_note(&raw, "Fallback.md");
+            assert_eq!(back.id, "the-id", "{raw}");
+            assert_eq!(back.title, title, "{raw}");
+            assert_eq!(back.tags, meta.tags, "{raw}");
+            assert!(back.pinned);
+            assert_eq!(back.created.timestamp(), meta.created.timestamp());
+            assert!(content.ends_with("body"));
+        }
+    }
+
+    #[test]
+    fn a_title_heading_is_added_only_when_the_body_has_no_top_level_heading() {
+        let meta = |title: &str| NoteMeta {
+            id: "id".into(),
+            title: title.into(),
+            tags: vec![],
+            pinned: false,
+            created: Utc::now(),
+            modified: Utc::now(),
+        };
+        let body_of = |raw: String| parse_note(&raw, "x.md").1;
+        // No heading yet: the title becomes one.
+        assert_eq!(
+            body_of(update_note_raw(&meta("New"), "Text.\n")),
+            "# New\n\nText."
+        );
+        // A heading that differs from the title is not buried under a second one.
+        assert_eq!(
+            body_of(update_note_raw(&meta("New"), "# Old\n\nText.\n")),
+            "# Old\n\nText."
+        );
+        let original = "---\nid: id\ntitle: Old\n---\n# Old\n\nText.\n";
+        assert_eq!(
+            body_of(merge_frontmatter(
+                original,
+                &meta("New"),
+                "# Old\n\nText.\n"
+            )),
+            "# Old\n\nText."
+        );
+        // Saving again and again never grows the note.
+        let once = merge_frontmatter(original, &meta("New"), "# Old\n\nText.\n");
+        let (_, body) = parse_note(&once, "x.md");
+        assert_eq!(
+            body_of(merge_frontmatter(&once, &meta("Newer"), &body)),
+            "# Old\n\nText."
+        );
+        // Lower-level headings and empty notes behave as before.
+        assert_eq!(
+            body_of(update_note_raw(&meta("New"), "## Section\n")),
+            "# New\n\n## Section"
+        );
+        assert!(update_note_raw(&meta("New"), "\n").ends_with("---\n\n"));
     }
 }

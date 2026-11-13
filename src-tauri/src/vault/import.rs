@@ -3,8 +3,8 @@ use std::fs::OpenOptions;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::vault::frontmatter::BoundedYaml;
 use chrono::Utc;
-use gray_matter::engine::YAML;
 use gray_matter::Matter;
 use regex::Regex;
 use uuid::Uuid;
@@ -15,6 +15,9 @@ use crate::vault::operations::replace_file_atomically;
 
 pub fn import(vault_path: &str) -> Result<ImportResult, String> {
     let vault = Path::new(vault_path);
+    // Folders that are empty before the import are notebooks the user made; only folders the
+    // import itself empties are removed afterwards.
+    let already_empty = empty_dirs(vault)?;
 
     let file_index = build_file_index(vault)?;
 
@@ -204,16 +207,18 @@ pub fn import(vault_path: &str) -> Result<ImportResult, String> {
         }
     }
 
-    cleanup_empty_dirs(vault)?;
+    cleanup_empty_dirs(vault, &already_empty)?;
 
     Ok(result)
 }
 
-fn is_excluded_dir(path: &Path) -> bool {
-    matches!(
-        path.file_name().and_then(|name| name.to_str()),
-        Some(".cuelm" | ".obsidian" | ".trash" | ".stfolder" | ".claude")
-    )
+/// Hidden files and folders are never imported, moved or cleaned up. The app's own `.cuelm`
+/// and Obsidian's `.obsidian` and `.trash` are among them, and so is `.git`: every file that is
+/// not a note becomes an attachment and its original is deleted, which took a repository apart.
+fn is_hidden_entry(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with('.'))
 }
 
 fn vault_entries(
@@ -221,9 +226,7 @@ fn vault_entries(
 ) -> impl Iterator<Item = Result<walkdir::DirEntry, walkdir::Error>> + '_ {
     walkdir::WalkDir::new(vault)
         .into_iter()
-        .filter_entry(|entry| {
-            entry.depth() == 0 || !entry.file_type().is_dir() || !is_excluded_dir(entry.path())
-        })
+        .filter_entry(|entry| entry.depth() == 0 || !is_hidden_entry(entry.path()))
 }
 
 fn scanned_files(vault: &Path) -> Result<Vec<PathBuf>, String> {
@@ -259,7 +262,7 @@ fn build_file_index(vault: &Path) -> Result<HashMap<String, String>, String> {
 }
 
 fn rename_deprecated_properties(raw: &str) -> String {
-    let matter = Matter::<YAML>::new();
+    let matter = Matter::<BoundedYaml>::new();
     let result = matter.parse(raw);
 
     if result.matter.trim().is_empty() {
@@ -298,7 +301,7 @@ fn rename_deprecated_properties(raw: &str) -> String {
 }
 
 fn normalize_frontmatter(raw: &str, path: &Path) -> (NoteMeta, String) {
-    let matter = Matter::<YAML>::new();
+    let matter = Matter::<BoundedYaml>::new();
     let result = matter.parse(raw);
     let yaml_str = result.matter.trim();
 
@@ -782,7 +785,20 @@ fn resolve_relative_ref(base: &Path, reference: &str) -> Option<String> {
     Some(rel.to_string_lossy().replace('\\', "/"))
 }
 
-fn cleanup_empty_dirs(root: &Path) -> Result<(), String> {
+fn empty_dirs(root: &Path) -> Result<HashSet<PathBuf>, String> {
+    let mut empty = HashSet::new();
+    for entry in vault_entries(root) {
+        let entry = entry.map_err(|e| format!("Scanning {}: {e}", root.display()))?;
+        if entry.file_type().is_dir()
+            && std::fs::read_dir(entry.path()).is_ok_and(|mut entries| entries.next().is_none())
+        {
+            empty.insert(entry.into_path());
+        }
+    }
+    Ok(empty)
+}
+
+fn cleanup_empty_dirs(root: &Path, keep: &HashSet<PathBuf>) -> Result<(), String> {
     let mut dirs: Vec<_> = vault_entries(root)
         .filter_map(|entry| match entry {
             Ok(entry) if entry.file_type().is_dir() => Some(Ok(entry.into_path())),
@@ -795,7 +811,7 @@ fn cleanup_empty_dirs(root: &Path) -> Result<(), String> {
     dirs.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
 
     for dir in dirs {
-        if dir == root {
+        if dir == root || keep.contains(&dir) {
             continue;
         }
         let mut entries =
@@ -883,29 +899,118 @@ fn pathdiff(target: &str, base: &str) -> Result<String, ()> {
 }
 
 fn percent_decode(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut chars = s.bytes();
-    while let Some(b) = chars.next() {
-        if b == b'%' {
-            let hi = chars.next();
-            let lo = chars.next();
-            if let (Some(h), Some(l)) = (hi, lo) {
-                if let Ok(byte) = u8::from_str_radix(&format!("{}{}", h as char, l as char), 16) {
-                    result.push(byte as char);
-                    continue;
-                }
-            }
-            result.push('%');
-        } else {
-            result.push(b as char);
-        }
-    }
-    result
+    // Keep the complete original reference if escaped bytes are not valid UTF-8.
+    urlencoding::decode(s)
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| s.to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn percent_decode_preserves_unicode_plus_and_malformed_escapes() {
+        for (input, expected) in [
+            ("café 雪+.png", "café 雪+.png"),
+            ("caf%C3%A9%20%E9%9B%AA+.png", "café 雪+.png"),
+            ("bad%GG%20name.png", "bad%GG name.png"),
+            ("tail%", "tail%"),
+            ("tail%2", "tail%2"),
+            ("雪%FF%20+%GG", "雪%FF%20+%GG"),
+            ("%E9%9B", "%E9%9B"),
+        ] {
+            assert_eq!(percent_decode(input), expected, "input {input:?}");
+        }
+    }
+
+    #[test]
+    fn import_leaves_hidden_files_and_existing_empty_folders_alone() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        // A git-backed vault with dotfiles, an empty notebook, and a folder of attachments only.
+        std::fs::create_dir_all(root.join(".git/objects/ab")).unwrap();
+        std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(root.join(".git/objects/ab/cdef"), b"blob").unwrap();
+        std::fs::write(root.join(".gitignore"), ".obsidian/workspace.json\n").unwrap();
+        std::fs::create_dir_all(root.join(".stversions")).unwrap();
+        std::fs::write(root.join(".stversions/old.png"), b"old").unwrap();
+        std::fs::create_dir(root.join("Empty notebook")).unwrap();
+        std::fs::create_dir(root.join("Pictures")).unwrap();
+        std::fs::write(root.join("Pictures/photo.png"), b"png").unwrap();
+        std::fs::write(root.join("Note.md"), "# Note\n\n![p](Pictures/photo.png)\n").unwrap();
+
+        let result = import(root.to_str().unwrap()).unwrap();
+
+        assert_eq!(result.attachments_moved, 1);
+        assert_eq!(
+            std::fs::read_to_string(root.join(".git/HEAD")).unwrap(),
+            "ref: refs/heads/main\n"
+        );
+        assert_eq!(
+            std::fs::read(root.join(".git/objects/ab/cdef")).unwrap(),
+            b"blob"
+        );
+        assert!(root.join(".gitignore").is_file());
+        assert!(root.join(".stversions/old.png").is_file());
+        // Nothing hidden was copied into the attachments either.
+        assert!(!root.join(".cuelm/attachments/.git").exists());
+        assert!(!root.join(".cuelm/attachments/.gitignore").exists());
+        // The folder the import emptied is gone; the one that was empty already is kept.
+        assert!(!root.join("Pictures").exists());
+        assert!(root.join("Empty notebook").is_dir());
+        assert!(root
+            .join(".cuelm/attachments/Pictures/photo.png")
+            .is_file());
+    }
+
+    #[test]
+    fn import_rewrites_unicode_encoded_and_malformed_attachment_references() {
+        let vault = tempfile::tempdir().unwrap();
+        let root = vault.path();
+        let note_dir = root.join("笔记");
+        std::fs::create_dir(&note_dir).unwrap();
+        let attachments = [
+            "café 雪+.png",
+            "bad%GG.png",
+            "tail%.png",
+            "tail%2.png",
+            "bytes%FF%20.png",
+        ];
+        for name in attachments {
+            std::fs::write(note_dir.join(name), name.as_bytes()).unwrap();
+        }
+        let note_path = note_dir.join("Entry.md");
+        std::fs::write(
+            &note_path,
+            "# Entry\n\n![raw](café%20雪+.png)\n\
+            [encoded](caf%C3%A9%20%E9%9B%AA+.png#preview)\n\
+            ![malformed](bad%GG.png)\n![percent](tail%.png)\n\
+            [short](tail%2.png)\n[invalid UTF-8](bytes%FF%20.png)\n",
+        )
+        .unwrap();
+
+        let result = import(root.to_str().unwrap()).unwrap();
+        assert_eq!(result.attachments_moved, attachments.len() as u64);
+        let note = std::fs::read_to_string(&note_path).unwrap();
+        for reference in [
+            "![raw](../.cuelm/attachments/笔记/café%20雪+.png)",
+            "[encoded](../.cuelm/attachments/笔记/café%20雪+.png#preview)",
+            "![malformed](../.cuelm/attachments/笔记/bad%GG.png)",
+            "![percent](../.cuelm/attachments/笔记/tail%.png)",
+            "[short](../.cuelm/attachments/笔记/tail%2.png)",
+            "[invalid UTF-8](../.cuelm/attachments/笔记/bytes%FF%20.png)",
+        ] {
+            assert!(note.contains(reference), "missing {reference:?} in {note}");
+        }
+        for name in attachments {
+            assert!(!note_dir.join(name).exists());
+            assert_eq!(
+                std::fs::read(root.join(".cuelm/attachments/笔记").join(name)).unwrap(),
+                name.as_bytes()
+            );
+        }
+    }
 
     #[test]
     fn test_normalize_tags_comma_string() {

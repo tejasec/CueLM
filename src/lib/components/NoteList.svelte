@@ -631,12 +631,15 @@
 			$notes = [entry, ...$notes];
 			onNoteMoved();
 			if (!navigationIsCurrent(token)) return;
+			// The first save must use the exact file created on disk, not wait for a watcher echo.
+			const content = await readNote(ownerVault!, entry.path);
+			if (!navigationIsCurrent(token)) return;
 			if (!(await onBeforeNoteSwitch())) return;
 			if (!navigationIsCurrent(token)) return;
-			$activeNote = { path: entry.path, meta: entry.meta, content: '\n', raw: '' };
+			$activeNote = content;
 			$activeNotePath = entry.path;
 			$editorDirty = false;
-			onNoteSelected(entry.path, '\n');
+			onNoteSelected(entry.path, content.content);
 			onNoteCreated(token);
 		} catch (e) {
 			console.error('Failed to create note:', e);
@@ -1206,9 +1209,12 @@
 		clearSelection();
 	}
 	if ((e.ctrlKey || e.metaKey) && e.key === 'a' && $sortedNotes.length > 0) {
-		// Only select all if focus is not in an input/editor
-		const tag = (e.target as HTMLElement)?.tagName;
-		if (tag !== 'INPUT' && tag !== 'TEXTAREA' && !(e.target as HTMLElement)?.closest('.ProseMirror')) {
+		// Only select all notes when Ctrl+A is not meant for a text field or either editor
+		// (the source editor is CodeMirror, and a read-only editor is not contenteditable).
+		const target = e.target as HTMLElement | null;
+		const tag = target?.tagName;
+		if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT' && !target?.isContentEditable
+			&& !target?.closest('.ProseMirror, .cm-editor')) {
 			e.preventDefault();
 			selectedPaths = new Set($sortedNotes.map(n => n.path));
 		}
@@ -1466,6 +1472,7 @@
 					class:qa-drag-below={$viewMode === 'quickaccess' && qaDragOver === noteIndex && qaDragFrom !== null && qaDragHalf === 'bottom'}
 					class:note-drag-above={canCustomReorder && noteDragOver === noteIndex && noteDragFrom !== null && noteDragHalf === 'top'}
 					class:note-drag-below={canCustomReorder && noteDragOver === noteIndex && noteDragFrom !== null && noteDragHalf === 'bottom'}
+					title={$viewMode === 'quickaccess' ? note.path : (getNotebookPath(note) ? `${getNotebookPath(note)}/${note.meta.title}` : note.meta.title)}
 					onclick={(e) => handleNoteClick(e, note)}
 					onkeydown={(e) => {
 						if (e.key === 'F2') {
@@ -1542,7 +1549,7 @@
 					ondragend={() => { qaDragFrom = null; qaDragOver = null; resetNoteDrag(); }}
 				>
 					{#if compact}
-						<div class="note-compact-row" title={getNotebookPath(note) ? `${getNotebookPath(note)}/${note.meta.title}` : note.meta.title}>
+						<div class="note-compact-row">
 							<span class="note-title">
 								{#if note.meta.pinned}
 									<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="pin-icon">
@@ -1562,7 +1569,7 @@
 							{#if showDates}<span class="note-date-compact" title={`Created ${formatDate(note.meta.created)}\nModified ${formatDate(note.meta.modified)}`}>{formatRelativeTime($sortMode === 'created' ? note.meta.created : note.meta.modified)}</span>{/if}
 						</div>
 					{:else}
-						<div class="note-title" title={getNotebookPath(note) ? `${getNotebookPath(note)}/${note.meta.title}` : note.meta.title}>
+						<div class="note-title">
 							{#if note.meta.pinned}
 								<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="pin-icon">
 									<path d="M12 17v5"/><path d="M9 2h6l-1 7h4l-2 4H8l-2-4h4L9 2z"/>
@@ -1577,11 +1584,15 @@
 						</div>
 						<div class="note-preview">{note.preview}</div>
 						<div class="note-meta">
-							{#if getNotebookPath(note)}
-								<span class="note-notebook">{getNotebookPath(note)}</span>
-								{#if showDates}<span class="note-meta-sep">&middot;</span>{/if}
+							{#if getNotebookPath(note) || showDates}
+							<span class="note-context">
+								{#if getNotebookPath(note)}
+									<span class="note-notebook">{getNotebookPath(note)}</span>
+									{#if showDates}<span class="note-meta-sep">&middot;</span>{/if}
+								{/if}
+								{#if showDates}<span class="note-date" title={`Created ${formatDate(note.meta.created)}\nModified ${formatDate(note.meta.modified)}`}>{formatRelativeTime($sortMode === 'created' ? note.meta.created : note.meta.modified)}</span>{/if}
+							</span>
 							{/if}
-							{#if showDates}<span class="note-date" title={`Created ${formatDate(note.meta.created)}\nModified ${formatDate(note.meta.modified)}`}>{formatRelativeTime($sortMode === 'created' ? note.meta.created : note.meta.modified)}</span>{/if}
 							{#if note.meta.tags.length > 0}
 								<span class="note-tags">
 									{#each note.meta.tags.slice(0, 3) as tag, i (tagIterationKey(tag, i))}
@@ -2198,9 +2209,18 @@
 
 	.note-meta {
 		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 4px 8px;
+		margin-top: 4px;
+	}
+
+	.note-context {
+		display: inline-flex;
 		align-items: center;
 		gap: 8px;
-		margin-top: 4px;
+		min-width: 0;
+		max-width: 100%;
 	}
 
 	.note-notebook {
@@ -2215,6 +2235,7 @@
 	.note-meta-sep {
 		color: var(--text-tertiary);
 		font-size: 0.78em;
+		flex-shrink: 0;
 	}
 
 	.note-compact-row .note-notebook {
@@ -2226,10 +2247,15 @@
 	.note-date {
 		font-size: 0.78em;
 		color: var(--text-tertiary);
+		flex-shrink: 0;
+		white-space: nowrap;
 	}
 
 	.note-tags {
 		display: flex;
+		flex-wrap: wrap;
+		min-width: 0;
+		max-width: 100%;
 		gap: 4px;
 	}
 

@@ -4,6 +4,7 @@
 	import { activeNotePath, appConfig } from '$lib/stores/app';
 	import { isMobile } from '$lib/platform';
 	import { applyGraphRepulsion } from '$lib/utils/graph-layout';
+	import { buildGraphTopology, getGraphNeighborhood } from '$lib/utils/graph-topology';
 
 	let { onclose, onnavigate }: {
 		onclose: () => void;
@@ -26,6 +27,7 @@
 	let nodeIndexMap: Map<string, number> = new Map();
 	let connectedSet: Set<number> = new Set();
 	let nodeDegree: number[] = [];
+	let incidentEdges = $state.raw<number[][]>([]);
 	let searchMatchSet = $state.raw<Set<number> | null>(null);
 	let folderColorMap = new Map<string, string>();
 
@@ -41,6 +43,8 @@
 	let hoveredNeighborSet: Set<number> = new Set();
 	let hoveredEdgeSet: Set<number> = new Set();
 	let activeNodeIdx = $state(-1);
+	// Svelte caches this until the active node or graph topology changes.
+	let localNeighborhood = $derived(getGraphNeighborhood(activeNodeIdx, edges, incidentEdges));
 	let navigatedFromGraph = false;
 
 	// Physics runs in short yielded batches; the completed graph is static.
@@ -49,6 +53,7 @@
 	const layoutChannel = new MessageChannel();
 	let layoutScheduled = false;
 	let disposed = false;
+	let drawFrame: number | null = null;
 
 	// DPI fix
 	let dpr = 1;
@@ -115,35 +120,9 @@
 	function updateHoveredState(node: GraphNode | null) {
 		hoveredNode = node;
 		hoveredIdx = node ? nodes.indexOf(node) : -1;
-		hoveredNeighborSet = new Set();
-		hoveredEdgeSet = new Set();
-		if (hoveredIdx < 0) return;
-		hoveredNeighborSet.add(hoveredIdx);
-		for (let i = 0; i < edges.length; i++) {
-			const e = edges[i];
-			if (e.sourceIdx === hoveredIdx || e.targetIdx === hoveredIdx) {
-				hoveredEdgeSet.add(i);
-				hoveredNeighborSet.add(e.sourceIdx);
-				hoveredNeighborSet.add(e.targetIdx);
-			}
-		}
-	}
-
-	// Nodes/edges visible in local mode (active note + direct neighbours)
-	function computeLocalSets(): { nodeSet: Set<number>; edgeSet: Set<number> } {
-		const nodeSet = new Set<number>();
-		const edgeSet = new Set<number>();
-		if (activeNodeIdx < 0) return { nodeSet, edgeSet };
-		nodeSet.add(activeNodeIdx);
-		for (let i = 0; i < edges.length; i++) {
-			const e = edges[i];
-			if (e.sourceIdx === activeNodeIdx || e.targetIdx === activeNodeIdx) {
-				edgeSet.add(i);
-				nodeSet.add(e.sourceIdx);
-				nodeSet.add(e.targetIdx);
-			}
-		}
-		return { nodeSet, edgeSet };
+		const neighborhood = getGraphNeighborhood(hoveredIdx, edges, incidentEdges);
+		hoveredNeighborSet = neighborhood.nodeSet;
+		hoveredEdgeSet = neighborhood.edgeSet;
 	}
 
 	function updateSearchMatch() {
@@ -175,15 +154,13 @@
 				};
 			});
 
-			connectedSet = new Set();
-			nodeDegree = new Array(nodes.length).fill(0);
-			edges = data.edges.map(e => {
-				connectedSet.add(e.source);
-				connectedSet.add(e.target);
-				nodeDegree[e.source] = (nodeDegree[e.source] || 0) + 1;
-				nodeDegree[e.target] = (nodeDegree[e.target] || 0) + 1;
-				return { sourceIdx: e.source, targetIdx: e.target, bidirectional: e.bidirectional };
-			});
+			edges = data.edges.map(e => ({
+				sourceIdx: e.source, targetIdx: e.target, bidirectional: e.bidirectional,
+			}));
+			const topology = buildGraphTopology(nodes.length, edges);
+			connectedSet = topology.connectedSet;
+			nodeDegree = topology.nodeDegree;
+			incidentEdges = topology.incidentEdges;
 
 			buildFolderColors();
 			updateSearchMatch();
@@ -196,15 +173,11 @@
 
 	function centerOnActiveNote() {
 		if (!canvas || nodes.length === 0 || activeNodeIdx < 0) return;
-		const activeNode = nodes[activeNodeIdx];
-		const neighborhood: GraphNode[] = [activeNode];
-		for (const edge of edges) {
-			if (edge.sourceIdx === activeNodeIdx) neighborhood.push(nodes[edge.targetIdx]);
-			else if (edge.targetIdx === activeNodeIdx) neighborhood.push(nodes[edge.sourceIdx]);
-		}
+		const neighborhood = localNeighborhood.nodeSet;
 		const w = canvasW, h = canvasH, padding = 100;
 		let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-		for (const n of neighborhood) {
+		for (const i of neighborhood) {
+			const n = nodes[i];
 			if (n.x < minX) minX = n.x; if (n.y < minY) minY = n.y;
 			if (n.x > maxX) maxX = n.x; if (n.y > maxY) maxY = n.y;
 		}
@@ -230,7 +203,7 @@
 
 	function focusActive() {
 		if (activeNodeIdx >= 0) centerOnActiveNote(); else fitToView();
-		draw();
+		requestDraw();
 	}
 
 	function startSimulation() {
@@ -239,7 +212,7 @@
 		physicsStep = null;
 		if (physicsRemaining === 0) {
 			loading = false;
-			draw();
+			requestDraw();
 		} else {
 			startLayoutLoop();
 		}
@@ -264,7 +237,7 @@
 			if (physicsRemaining === 0) {
 				loading = false;
 				if (activeNodeIdx >= 0) centerOnActiveNote(); else fitToView();
-				draw();
+				requestDraw();
 			} else {
 				layoutScheduled = true;
 				layoutChannel.port2.postMessage(null);
@@ -311,8 +284,16 @@
 		}
 	}
 
+	function requestDraw() {
+		if (disposed || drawFrame !== null) return;
+		drawFrame = requestAnimationFrame(() => {
+			drawFrame = null;
+			draw();
+		});
+	}
+
 	function draw() {
-		if (!canvas || loading) return;
+		if (disposed || !canvas || loading) return;
 		const ctx = canvas.getContext('2d');
 		if (!ctx) return;
 
@@ -328,14 +309,18 @@
 		const isSearching = searchMatchSet !== null;
 
 		// Local mode: restrict which nodes/edges are visible
-		const { nodeSet: localNodeSet, edgeSet: localEdgeSet } = localMode ? computeLocalSets() : { nodeSet: null as Set<number> | null, edgeSet: null as Set<number> | null };
+		const localNodeSet = localMode ? localNeighborhood.nodeSet : null;
+		const localEdgeSet = localMode ? localNeighborhood.edgeSet : null;
+		// Edge strokes and arrowheads keep their screen size when zoomed out; scaled with the
+		// graph they thin out below a pixel and the links fade away from the nodes.
+		const edgeScale = 1 / Math.min(zoom, 1);
 
 		// ── Edges ──────────────────────────────────────────────────────────────
 		if (isHovering) {
 			// Dimmed non-connected edges
 			ctx.globalAlpha = 0.06;
 			ctx.strokeStyle = borderColor;
-			ctx.lineWidth = 1;
+			ctx.lineWidth = edgeScale;
 			ctx.beginPath();
 			for (let i = 0; i < edges.length; i++) {
 				if (hoveredEdgeSet.has(i)) continue;
@@ -348,9 +333,11 @@
 			// Highlighted connected edges
 			ctx.globalAlpha = 0.8;
 			ctx.strokeStyle = accent;
-			ctx.lineWidth = 1.5;
+			ctx.lineWidth = 1.5 * edgeScale;
 			ctx.beginPath();
 			for (const i of hoveredEdgeSet) {
+				// A neighbour's links to notes outside the local graph have no node to end on.
+				if (localEdgeSet && !localEdgeSet.has(i)) continue;
 				ctx.moveTo(nodes[edges[i].sourceIdx].x, nodes[edges[i].sourceIdx].y);
 				ctx.lineTo(nodes[edges[i].targetIdx].x, nodes[edges[i].targetIdx].y);
 			}
@@ -359,16 +346,18 @@
 			// Arrowheads on highlighted edges
 			ctx.fillStyle = accent;
 			ctx.globalAlpha = 0.8;
+			const al = 7 * edgeScale, aw = 3.5 * edgeScale;
 			const drawArrow = (tipX: number, tipY: number, ux: number, uy: number) => {
-				const bx = tipX - ux * 7, by = tipY - uy * 7;
+				const bx = tipX - ux * al, by = tipY - uy * al;
 				ctx.beginPath();
 				ctx.moveTo(tipX, tipY);
-				ctx.lineTo(bx - uy * 3.5, by + ux * 3.5);
-				ctx.lineTo(bx + uy * 3.5, by - ux * 3.5);
+				ctx.lineTo(bx - uy * aw, by + ux * aw);
+				ctx.lineTo(bx + uy * aw, by - ux * aw);
 				ctx.closePath();
 				ctx.fill();
 			};
 			for (const i of hoveredEdgeSet) {
+				if (localEdgeSet && !localEdgeSet.has(i)) continue;
 				const e = edges[i];
 				const src = nodes[e.sourceIdx];
 				const tgt = nodes[e.targetIdx];
@@ -388,7 +377,7 @@
 		} else if (isSearching) {
 			// All visible edges faint
 			ctx.strokeStyle = borderColor;
-			ctx.lineWidth = 1;
+			ctx.lineWidth = edgeScale;
 			ctx.globalAlpha = 0.07;
 			ctx.beginPath();
 			for (let i = 0; i < edges.length; i++) {
@@ -410,7 +399,7 @@
 			ctx.stroke();
 		} else {
 			ctx.strokeStyle = borderColor;
-			ctx.lineWidth = isMobile ? 1.5 : 1;
+			ctx.lineWidth = (isMobile ? 1.5 : 1) * edgeScale;
 			ctx.globalAlpha = isMobile ? 0.65 : 0.35;
 			ctx.beginPath();
 			for (let i = 0; i < edges.length; i++) {
@@ -594,17 +583,17 @@
 			dragging.x = (e.clientX - rect.left - pan.x) / zoom;
 			dragging.y = (e.clientY - rect.top - pan.y) / zoom;
 			dragging.vx = 0; dragging.vy = 0;
-			draw();
+			requestDraw();
 		} else if (panning) {
 			pan.x = e.clientX - panStart.x;
 			pan.y = e.clientY - panStart.y;
-			draw();
+			requestDraw();
 		} else if (!dragging) {
 			const node = getNodeAt(e.clientX, e.clientY);
 			if (node !== hoveredNode) {
 				updateHoveredState(node);
 				if (canvas) canvas.style.cursor = node ? 'pointer' : 'grab';
-				if (!layoutScheduled) draw();
+				if (!layoutScheduled) requestDraw();
 			}
 		}
 	}
@@ -629,7 +618,7 @@
 		zoom = Math.max(0.2, Math.min(5, zoom * (e.deltaY > 0 ? 0.9 : 1.1)));
 		pan.x = mx - (mx - pan.x) * (zoom / oldZoom);
 		pan.y = my - (my - pan.y) * (zoom / oldZoom);
-		draw();
+		requestDraw();
 	}
 
 	function handleKeydown(e: KeyboardEvent) {
@@ -668,11 +657,11 @@
 				dragging.x = (t.clientX - rect.left - pan.x) / zoom;
 				dragging.y = (t.clientY - rect.top - pan.y) / zoom;
 				dragging.vx = 0; dragging.vy = 0;
-				draw();
+				requestDraw();
 			} else if (panning) {
 				pan.x = t.clientX - panStart.x;
 				pan.y = t.clientY - panStart.y;
-				draw();
+				requestDraw();
 			}
 		} else if (e.touches.length === 2) {
 			const dx = e.touches[0].clientX - e.touches[1].clientX;
@@ -687,7 +676,7 @@
 				zoom = Math.max(0.2, Math.min(5, zoom * (dist / lastTouchDist)));
 				pan.x = mx - (mx - pan.x) * (zoom / oldZoom);
 				pan.y = my - (my - pan.y) * (zoom / oldZoom);
-				draw();
+				requestDraw();
 			}
 			lastTouchDist = dist;
 		}
@@ -730,18 +719,20 @@
 			navigatedFromGraph = false;
 			centerOnActiveNote();
 		}
-		if (!layoutScheduled && canvas) untrack(draw);
+		if (!layoutScheduled && canvas) untrack(requestDraw);
 	});
 
 	// React to search query changes
 	$effect(() => {
 		const _q = searchQuery; // track
 		updateSearchMatch();
-		if (canvas && !layoutScheduled) untrack(draw);
+		if (canvas && !layoutScheduled) untrack(requestDraw);
 	});
 
 	onDestroy(() => {
 		disposed = true;
+		if (drawFrame !== null) cancelAnimationFrame(drawFrame);
+		drawFrame = null;
 		layoutChannel.port1.onmessage = null;
 		layoutChannel.port1.close();
 		layoutChannel.port2.close();
@@ -775,7 +766,7 @@
 			<div class="graph-stats">
 				{#if !loading}
 					{#if localMode && activeNodeIdx >= 0}
-						{computeLocalSets().nodeSet.size} notes · {computeLocalSets().edgeSet.size} links
+						{localNeighborhood.nodeSet.size} notes · {localNeighborhood.edgeSet.size} links
 					{:else}
 						{nodes.length} notes · {edges.length} links
 					{/if}

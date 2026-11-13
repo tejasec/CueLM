@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { onMount, onDestroy, tick, untrack } from 'svelte';
+	import { MediaQuery } from 'svelte/reactivity';
 	import { listen } from '@tauri-apps/api/event';
 	import Sidebar from './Sidebar.svelte';
 	import NoteList from './NoteList.svelte';
@@ -57,6 +58,7 @@
 		notebookOrder,
 		noteOrder,
 		syncState,
+		type SyncSummary,
 		platformIsMobile,
 		activeVaultConfig,
 		activateVaultData,
@@ -66,6 +68,19 @@
 	const appWindow = getCurrentWindow();
 	const isMac = navigator.platform.startsWith('Mac');
 	const isMobile = $derived($platformIsMobile);
+	// A tablet in landscape has room for the editor next to the navigation: the notebooks or the
+	// note list stay on the left instead of replacing the note. Narrower windows (phones, a tablet
+	// in portrait or in a split screen) keep one panel at a time.
+	const wideMobileQuery = new MediaQuery('(min-width: 900px)');
+	const tabletLayout = $derived(isMobile && wideMobileQuery.current);
+	// Kept on the device: the vault state is shared with desktops, where collapsing means something else.
+	let tabletNavHidden = $state(localStorage.getItem('helix-tablet-nav-hidden') === '1');
+	const tabletNavShown = $derived(tabletLayout && !tabletNavHidden);
+
+	function setTabletNavHidden(hidden: boolean) {
+		tabletNavHidden = hidden;
+		localStorage.setItem('helix-tablet-nav-hidden', hidden ? '1' : '0');
+	}
 	import { loadVaultState, saveVaultState, readNote, deleteNote, createDailyNote, createBackup, getPendingOpenFile, ackPendingOpenFile, addQuickAccess, removeQuickAccess, getQuickAccess, setTheme, syncNow, setTaskDone, setTaskPriority, setTaskDue, openUrl } from '$lib/api';
 	import { darkThemes, isAndroid } from '$lib/platform';
 	import { openNoteWindow } from '$lib/utils/window';
@@ -90,6 +105,77 @@
 	let sidebar = $state<Sidebar>();
 	let noteList = $state<NoteList>();
 	let editor = $state<Editor>();
+	let outlineOpen = $state(false);
+	let outlinePanelId = $state('');
+	let mobileNoteMenuOpen = $state(false);
+	let mobileNoteMenuWrapper = $state<HTMLDivElement>();
+	let mobileNoteMenuTrigger = $state<HTMLButtonElement>();
+	let mobileNoteMenu = $state<HTMLDivElement>();
+	let mobileBackButton = $state<HTMLButtonElement>();
+
+	function closeMobileNoteMenu(restoreTriggerFocus = false) {
+		const wasOpen = mobileNoteMenuOpen;
+		mobileNoteMenuOpen = false;
+		if (wasOpen && restoreTriggerFocus) mobileNoteMenuTrigger?.focus();
+	}
+
+	async function toggleMobileNoteMenu() {
+		if (mobileNoteMenuOpen) {
+			closeMobileNoteMenu(true);
+			return;
+		}
+		mobileNoteMenuOpen = true;
+		await tick();
+		if (mobileNoteMenuOpen) mobileNoteMenu?.querySelector<HTMLButtonElement>('button:not(:disabled)')?.focus();
+	}
+
+	function handleMobileNoteMenuKeydown(event: KeyboardEvent) {
+		if (event.key === 'Tab') {
+			closeMobileNoteMenu(true);
+			return;
+		}
+		if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+		const buttons = Array.from(mobileNoteMenu?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') ?? []);
+		if (!buttons.length) return;
+		event.preventDefault();
+		const current = buttons.indexOf(document.activeElement as HTMLButtonElement);
+		const next = event.key === 'Home' ? 0 : event.key === 'End' ? buttons.length - 1
+			: event.key === 'ArrowDown' ? (current + 1) % buttons.length
+			: current < 0 ? buttons.length - 1 : (current - 1 + buttons.length) % buttons.length;
+		buttons[next].focus();
+	}
+
+	$effect(() => {
+		$activeNotePath;
+		$mobileView;
+		tabletLayout;
+		mobileNoteMenuOpen = false;
+	});
+
+	$effect(() => {
+		if (!mobileNoteMenuOpen) return;
+		const handleOutsidePointerDown = (event: PointerEvent) => {
+			const target = event.target as Node;
+			if (!mobileNoteMenuWrapper?.contains(target) && !mobileBackButton?.contains(target)) closeMobileNoteMenu();
+		};
+		const handleEscape = (event: KeyboardEvent) => {
+			if (event.key !== 'Escape') return;
+			event.preventDefault();
+			event.stopPropagation();
+			closeMobileNoteMenu(true);
+		};
+		document.addEventListener('pointerdown', handleOutsidePointerDown, true);
+		document.addEventListener('keydown', handleEscape, true);
+		return () => {
+			document.removeEventListener('pointerdown', handleOutsidePointerDown, true);
+			document.removeEventListener('keydown', handleEscape, true);
+		};
+	});
+
+	function handleOutlineChange(open: boolean, panelId: string) {
+		outlineOpen = open;
+		outlinePanelId = panelId;
+	}
 	let pendingSearchReveal = $state<{ path: string; token: number } | null>(null);
 	let unlistenFileChange: (() => void) | null = null;
 	let unlistenClose: (() => void) | null = null;
@@ -214,6 +300,7 @@
 
 	function parseFrequencyMs(freq: string): number {
 		switch (freq) {
+			case '1h': return 60 * 60 * 1000;
 			case '6h': return 6 * 60 * 60 * 1000;
 			case '12h': return 12 * 60 * 60 * 1000;
 			case '7d': return 7 * 24 * 60 * 60 * 1000;
@@ -556,6 +643,14 @@
 		});
 	});
 
+	/** A tag clicked under a note's title: browse that tag's notes, like picking it in the sidebar. */
+	function showTagNotes(tag: string) {
+		$viewMode = 'tag';
+		$activeTag = tag;
+		$activeNotebook = null;
+		handleViewChanged();
+	}
+
 	function handleViewChanged() {
 		if (!ownerIsCurrent()) return;
 		beginNavigation();
@@ -639,12 +734,16 @@
 	// sidebar=0, notelist=1, editor=2. Each forward nav pushes, back pops.
 	let historyDepth = 0;
 	let navFromPopstate = false;
+	let lastMobileView = get(mobileView);
 
 	if (get(platformIsMobile)) {
 		history.replaceState({ mobileView: 'sidebar', depth: 0 }, '');
 
 		$effect(() => {
 			const view = $mobileView;
+			// Going to the notebooks or the note list brings a hidden column back.
+			if (view !== 'editor' && view !== untrack(() => lastMobileView)) untrack(() => setTabletNavHidden(false));
+			lastMobileView = view;
 			if (navFromPopstate) {
 				navFromPopstate = false;
 				return;
@@ -672,7 +771,8 @@
 				return;
 			}
 			// If a modal is open, close it instead of navigating
-			if ($showSettings || $showInfo || $showSearch || $showCommandPalette) {
+			if (mobileNoteMenuOpen || $showSettings || $showInfo || $showSearch || $showCommandPalette) {
+				closeMobileNoteMenu(true);
 				$showSettings = false;
 				$showInfo = false;
 				$showSearch = false;
@@ -683,7 +783,13 @@
 			}
 			const state = e.state;
 			const targetDepth = state?.depth ?? 0;
+			const leavingEditor = $mobileView === 'editor';
 			historyDepth = targetDepth;
+			if (tabletLayout && leavingEditor && targetDepth === 1) {
+				// The note list is already showing beside the note, so back goes on to the notebooks.
+				$mobileView = 'sidebar';
+				return;
+			}
 			navFromPopstate = true;
 			if (targetDepth === 0) $mobileView = 'sidebar';
 			else if (targetDepth === 1) $mobileView = 'notelist';
@@ -694,8 +800,12 @@
 	}
 
 	function mobileBack() {
-		if ($mobileView === 'editor') $mobileView = 'notelist';
-		else if ($mobileView === 'notelist') $mobileView = 'sidebar';
+		if (mobileNoteMenuOpen) {
+			closeMobileNoteMenu(true);
+			return;
+		}
+		if ($mobileView === 'editor' && !tabletLayout) $mobileView = 'notelist';
+		else $mobileView = 'sidebar';
 	}
 
 	async function trashOpenNote(path: string): Promise<boolean> {
@@ -726,6 +836,14 @@
 		if (e.button === 4) { e.preventDefault(); navigateHistory(1); }
 	}
 
+	// True when the event is going to a text field or editor. App-wide
+	// shortcuts must leave those keys alone so editing keeps working - for
+	// example Alt+Left/Right moves by word in the editor and in inputs.
+	function isEditableTarget(target: EventTarget | null): boolean {
+		if (!(target instanceof HTMLElement)) return false;
+		return target.isContentEditable || !!target.closest('input, textarea, .cm-editor');
+	}
+
 	function handleKeydown(e: KeyboardEvent) {
 		const mod = e.ctrlKey || e.metaKey;
 		const code = e.code;
@@ -745,6 +863,10 @@
 
 		const action = matchAction(e, $keybindings);
 		if (action) {
+			// History navigation is bound to Alt+Left/Right by default. While the
+			// user is editing, those keys belong to the editor (word movement),
+			// so skip the app shortcut and let the editable surface handle them.
+			if ((action === 'nav-back' || action === 'nav-forward') && isEditableTarget(e.target)) return;
 			e.preventDefault();
 			switch (action) {
 				case 'nav-back':
@@ -773,6 +895,9 @@
 					} else {
 						$showSearch = true;
 					}
+					return;
+				case 'replace-in-note':
+					if ($activeNotePath) editor?.openNoteSearch(true);
 					return;
 				case 'quick-open':
 					$showCommandPalette = true;
@@ -980,7 +1105,9 @@
 			if (!ownerIsCurrent()) return;
 			$sidebarWidth = state.sidebar_width;
 			$notelistWidth = state.notelist_width;
-			if (typeof state.outline_width === 'number') $outlineWidth = state.outline_width;
+			if (typeof state.outline_width === 'number' && Number.isFinite(state.outline_width)) {
+				$outlineWidth = Math.max(160, Math.min(500, state.outline_width));
+			}
 			$sidebarCollapsed = state.sidebar_collapsed;
 			$notelistCollapsed = state.notelist_collapsed ?? false;
 			$collapsedNotebooks = state.collapsed_notebooks ?? [];
@@ -1051,12 +1178,13 @@
 
 		// ── WebDAV sync: global status + auto-sync triggers ──
 		unlistenSync.push(await listen<{ vault_path: string }>('sync-progress', ({ payload }) => {
-			if (ownerIsCurrent() && payload.vault_path === ownerVault) syncState.set({ running: true, error: null });
+			if (ownerIsCurrent() && payload.vault_path === ownerVault) syncState.set({ running: true, error: null, result: null });
 		}));
 		if (!ownerIsCurrent()) { unlistenSync.pop()?.(); return; }
-		unlistenSync.push(await listen<{ vault_path: string; bookmark_id?: string | null; success: boolean; last_sync_time?: string | null }>('sync-done', ({ payload }) => {
+		unlistenSync.push(await listen<{ vault_path: string; bookmark_id?: string | null; success: boolean; summary?: SyncSummary; last_sync_time?: string | null }>('sync-done', ({ payload }) => {
 			if (!ownerIsCurrent() || payload.vault_path !== ownerVault) return;
-			syncState.set({ running: false, error: null });
+			syncState.set({ running: false, error: null,
+				result: payload.success ? { vault: payload.vault_path, summary: payload.summary ?? {} } : null });
 			if (!payload.success || !payload.last_sync_time) return;
 			const current = get(appConfig);
 			const active = activeVaultConfig(current);
@@ -1067,7 +1195,7 @@
 		}));
 		if (!ownerIsCurrent()) { unlistenSync.pop()?.(); return; }
 		unlistenSync.push(await listen<{ vault_path: string; error?: string }>('sync-error', ({ payload }) => {
-			if (ownerIsCurrent() && payload.vault_path === ownerVault) syncState.set({ running: false, error: payload.error ?? 'Sync failed' });
+			if (ownerIsCurrent() && payload.vault_path === ownerVault) syncState.set({ running: false, error: payload.error ?? 'Sync failed', result: null });
 		}));
 		if (!ownerIsCurrent()) { unlistenSync.pop()?.(); return; }
 
@@ -1124,8 +1252,18 @@
 	<div class="mobile-shell">
 		<!-- Mobile Header -->
 		<div class="mobile-header">
-			{#if $mobileView !== 'sidebar'}
-				<button class="mobile-header-btn" onclick={mobileBack} aria-label="Go back">
+			{#if tabletLayout}
+				<button class="mobile-header-btn" class:active={!tabletNavHidden} onclick={() => setTabletNavHidden(!tabletNavHidden)}
+					title={tabletNavHidden ? 'Show side panel' : 'Hide side panel'} aria-label={tabletNavHidden ? 'Show side panel' : 'Hide side panel'} aria-pressed={!tabletNavHidden}>
+					<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+						<rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/>
+					</svg>
+				</button>
+			{/if}
+			{#if tabletLayout && tabletNavHidden}
+				<!-- The hidden column has no title or back step to show. -->
+			{:else if $mobileView !== 'sidebar'}
+				<button class="mobile-header-btn" bind:this={mobileBackButton} onclick={mobileBack} aria-label="Go back">
 					<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<path d="M15 18l-6-6 6-6"/>
 					</svg>
@@ -1141,10 +1279,10 @@
 					</svg>
 				</div>
 			{/if}
-			{#if $mobileView !== 'editor'}
+			{#if tabletNavShown || (!tabletLayout && $mobileView !== 'editor')}
 				<span class="mobile-header-title">
 					{#if $mobileView === 'sidebar'}
-						CueLM
+						HelixNotes
 					{:else}
 						{#if $viewMode === 'notebook'}{$activeNotebook?.name ?? 'Notebook'}{:else if $viewMode === 'tag' && $activeTag}<TagLabel name={$activeTag} size={16} />{:else if $viewMode === 'quickaccess'}Quick Access{:else if $viewMode === 'daily'}Daily Notes{:else if $viewMode === 'tasks'}Tasks{:else if $viewMode === 'trash'}Trash{:else}All Notes{/if}
 					{/if}
@@ -1156,8 +1294,11 @@
 				{/if}
 			{/if}
 			<div class="mobile-header-actions">
-				{#if $mobileView === 'editor'}
-					<button class="mobile-header-btn" class:active={$readOnly} disabled={isTrashedNote($activeNotePath, ownerVault)} onclick={() => ($readOnly = !$readOnly)} title={$readOnly ? 'Edit' : 'View'}>
+				<button class="mobile-header-btn" onclick={() => { openUrl("https://notebook.google.com/").catch(console.error); }} title="Gemini Notebook" aria-label="Gemini Notebook">
+					<GeminiNotebookIcon size={18} />
+				</button>
+				{#if $mobileView === 'editor' || (tabletLayout && $activeNotePath)}
+					<button class="mobile-header-btn" class:active={$readOnly} disabled={isTrashedNote($activeNotePath, ownerVault)} onclick={() => ($readOnly = !$readOnly)} title={$readOnly ? 'Edit' : 'View'} aria-label={$readOnly ? 'Edit' : 'View'}>
 						<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							{#if $readOnly}
 								<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
@@ -1168,17 +1309,19 @@
 							{/if}
 						</svg>
 					</button>
-					<button class="mobile-header-btn" onclick={() => editor?.openNoteSearch()} title="Find in note">
+					<button class="mobile-header-btn" onclick={() => editor?.openNoteSearch()} title="Find in note" aria-label="Find in note">
 						<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
 						</svg>
 					</button>
-					<button class="mobile-header-btn" class:active={$activeNote?.meta.pinned} onclick={() => { if ($activeNote) { $activeNote.meta.pinned = !$activeNote.meta.pinned; editor?.markEdited(); } }} title="Pin">
+					{#snippet secondaryNoteActions(inMenu: boolean)}
+					<button class={inMenu ? 'mobile-note-menu-item' : 'mobile-header-btn'} type="button" role={inMenu ? 'menuitemcheckbox' : undefined} aria-checked={inMenu ? !!$activeNote?.meta.pinned : undefined} class:active={$activeNote?.meta.pinned} onclick={() => { if ($activeNote) { $activeNote.meta.pinned = !$activeNote.meta.pinned; editor?.markEdited(); } }} title="Pin">
 						<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<path d="M12 17v5"/><path d="M9 2h6l-1 7h4l-2 4H8l-2-4h4L9 2z"/>
 						</svg>
+						{#if inMenu}<span>Pin</span>{/if}
 					</button>
-					<button class="mobile-header-btn" class:active={isQuickAccess} onclick={async () => {
+					<button class={inMenu ? 'mobile-note-menu-item' : 'mobile-header-btn'} type="button" role={inMenu ? 'menuitemcheckbox' : undefined} aria-checked={inMenu ? isQuickAccess : undefined} class:active={isQuickAccess} onclick={async () => {
 						if (!noteRelativePath) return;
 						try {
 							if (isQuickAccess) { await removeQuickAccess(ownerVault!, noteRelativePath); } else { await addQuickAccess(ownerVault!, noteRelativePath); }
@@ -1190,53 +1333,78 @@
 						<svg width="18" height="18" viewBox="0 0 24 24" fill={isQuickAccess ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
 						</svg>
+						{#if inMenu}<span>Quick Access</span>{/if}
 					</button>
-					<button class="mobile-header-btn" onclick={() => editor?.toggleOutlinePanel()} title="Outline">
+					<button class={inMenu ? 'mobile-note-menu-item' : 'mobile-header-btn'} type="button" role={inMenu ? 'menuitem' : undefined} class:active={outlineOpen} onclick={() => editor?.toggleOutlinePanel()}
+						title="Outline" aria-label="Outline" aria-expanded={outlineOpen} aria-controls={outlinePanelId || undefined}>
 						<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<line x1="4" y1="6" x2="20" y2="6"/><line x1="8" y1="12" x2="20" y2="12"/><line x1="8" y1="18" x2="20" y2="18"/><circle cx="4" cy="12" r="1" fill="currentColor"/><circle cx="4" cy="18" r="1" fill="currentColor"/>
 						</svg>
+						{#if inMenu}<span>Outline</span>{/if}
 					</button>
-					<button class="mobile-header-btn" onclick={() => editor?.toggleHistoryPanel()} title="History">
+					<button class={inMenu ? 'mobile-note-menu-item' : 'mobile-header-btn'} type="button" role={inMenu ? 'menuitem' : undefined} onclick={() => editor?.toggleHistoryPanel()} title="History">
 						<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>
 						</svg>
+						{#if inMenu}<span>History</span>{/if}
 					</button>
 					{#if $appConfig?.enable_wiki_links}
-					<button class="mobile-header-btn" onclick={() => editor?.toggleGraphView()} title="Graph View">
+					<button class={inMenu ? 'mobile-note-menu-item' : 'mobile-header-btn'} type="button" role={inMenu ? 'menuitem' : undefined} onclick={() => editor?.toggleGraphView()} title="Graph View">
 						<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="18" r="3"/>
 							<line x1="8.5" y1="7.5" x2="15.5" y2="16.5"/><line x1="15.5" y1="7.5" x2="8.5" y2="16.5"/>
 						</svg>
+						{#if inMenu}<span>Graph View</span>{/if}
 					</button>
 					{/if}
 					{#if $appConfig?.ai_provider}
-					<button class="mobile-header-btn" onclick={() => editor?.triggerAiMenu()} title="AI Actions">
+					<button class={inMenu ? 'mobile-note-menu-item' : 'mobile-header-btn'} type="button" role={inMenu ? 'menuitem' : undefined} onclick={() => editor?.triggerAiMenu()} title="AI Actions">
 						<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<path d="M12 8V4l-2-2"/><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M9 13v2"/><path d="M15 13v2"/>
 						</svg>
+						{#if inMenu}<span>AI Actions</span>{/if}
 					</button>
 					{/if}
 					{#if activeVaultConfig($appConfig)?.sync_provider === 'webdav'}
-					<button class="mobile-header-btn" class:active={$syncState.running} onclick={triggerSyncNow} disabled={$syncState.running} title={$syncState.error ? `Sync error: ${$syncState.error}` : ($syncState.running ? 'Syncing...' : 'Sync now')}>
+					<button class={inMenu ? 'mobile-note-menu-item' : 'mobile-header-btn'} type="button" role={inMenu ? 'menuitem' : undefined} class:active={$syncState.running} onclick={triggerSyncNow} disabled={$syncState.running} title={$syncState.error ? `Sync error: ${$syncState.error}` : ($syncState.running ? 'Syncing...' : 'Sync now')}>
 						<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class:sync-spin={$syncState.running}>
 							<path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0115-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 01-15 6.7L3 16"/>
 						</svg>
+						{#if inMenu}<span>{$syncState.running ? 'Syncing...' : $syncState.error ? 'Sync error: retry' : 'Sync now'}</span>{/if}
 					</button>
 					{/if}
-					<button class="mobile-header-btn" class:active={$sourceMode} onclick={() => ($sourceMode = !$sourceMode)} title={$sourceMode ? 'Rich Editor' : 'Source Mode'}>
+					<button class={inMenu ? 'mobile-note-menu-item' : 'mobile-header-btn'} type="button" role={inMenu ? 'menuitem' : undefined} class:active={$sourceMode} onclick={() => ($sourceMode = !$sourceMode)} title={$sourceMode ? 'Rich Editor' : 'Source Mode'}>
 						<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<polyline points="16 18 22 12 16 6" /><polyline points="8 6 2 12 8 18" />
 						</svg>
+						{#if inMenu}<span>{$sourceMode ? 'Rich Editor' : 'Source Mode'}</span>{/if}
 					</button>
-				{:else}
+					{/snippet}
+					{#if tabletLayout}
+						{@render secondaryNoteActions(false)}
+					{:else}
+						<div class="mobile-note-menu-wrapper" bind:this={mobileNoteMenuWrapper}>
+							<button class="mobile-header-btn" class:active={mobileNoteMenuOpen} type="button" bind:this={mobileNoteMenuTrigger}
+								title="More note actions" aria-label="More note actions" aria-haspopup="menu" aria-expanded={mobileNoteMenuOpen} aria-controls="mobile-note-menu" onclick={toggleMobileNoteMenu}>
+								<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+									<circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/>
+								</svg>
+							</button>
+							{#if mobileNoteMenuOpen}
+								<div class="mobile-note-menu" id="mobile-note-menu" bind:this={mobileNoteMenu} role="menu" aria-label="Note actions" tabindex="-1"
+									onkeydown={handleMobileNoteMenuKeydown} onclickcapture={() => closeMobileNoteMenu(true)}>
+									{@render secondaryNoteActions(true)}
+								</div>
+							{/if}
+						</div>
+					{/if}
+				{/if}
+				{#if tabletLayout || $mobileView !== 'editor'}
 					<button class="mobile-header-btn" onclick={() => ($showSearch = true)} title="Search">
 						<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<circle cx="11" cy="11" r="8" />
 							<line x1="21" y1="21" x2="16.65" y2="16.65" />
 						</svg>
-					</button>
-					<button class="mobile-header-btn" onclick={() => { openUrl('https://notebook.google.com/').catch(console.error); }} title="Gemini Notebook">
-						<GeminiNotebookIcon size={18} />
 					</button>
 						<button class="mobile-header-btn" onclick={handleDailyNote} title="Daily Note">
 						<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -1264,15 +1432,15 @@
 		</div>
 
 		<!-- Mobile Content -->
-		<div class="mobile-content">
-			<div class="mobile-panel" class:active={$mobileView === 'sidebar'}>
+		<div class="mobile-content" class:tablet={tabletLayout} class:nav-hidden={tabletLayout && tabletNavHidden}>
+			<div class="mobile-panel" class:active={$mobileView === 'sidebar' && (!tabletLayout || tabletNavShown)}>
 				<Sidebar bind:this={sidebar} onViewChanged={handleViewChanged} onBeforeNoteChange={() => editor?.flushSave() ?? Promise.resolve(true)} onBeforePathMutation={() => editor?.beginPathMutation() ?? Promise.resolve(() => {})} onPathsMoved={handlePathsMoved} />
 			</div>
-			<div class="mobile-panel" class:active={$mobileView === 'notelist'}>
+			<div class="mobile-panel" class:active={tabletLayout ? tabletNavShown && $mobileView !== 'sidebar' : $mobileView === 'notelist'}>
 				<NoteList bind:this={noteList} onNoteSelected={handleNoteSelected} onBeforeNoteSwitch={() => editor?.flushSave() ?? Promise.resolve(true)} onBeforeNoteDuplicate={() => editor?.forceSave() ?? Promise.resolve(true)} onBeforePathMutation={() => editor?.beginPathMutation() ?? Promise.resolve(() => {})} onPathsMoved={handlePathsMoved} onUpdateActiveNote={updateActiveNoteMetadata} onTagsChanged={handleTagsChanged} onRefreshTags={() => { if (!isMobile) void sidebar?.refreshTags(); }} onNoteMoved={() => sidebar?.refresh()} onNoteCreated={(token) => { editor?.focusTitle(token); }} onToggleTask={toggleTask} onSetTaskPriority={changeTaskPriority} onSetTaskDue={changeTaskDue} />
 			</div>
-			<div class="mobile-panel" class:active={$mobileView === 'editor'}>
-				<Editor bind:this={editor} onMoveToTrash={trashOpenNote} />
+			<div class="mobile-panel mobile-editor-panel" class:active={$mobileView === 'editor' || tabletLayout}>
+				<Editor bind:this={editor} onMoveToTrash={trashOpenNote} onOutlineChange={handleOutlineChange} onShowTag={showTagNotes} />
 			</div>
 		</div>
 
@@ -1349,7 +1517,7 @@
 			{/if}
 
 			<div class="editor-panel">
-				<Editor bind:this={editor} onMoveToTrash={trashOpenNote} />
+				<Editor bind:this={editor} onMoveToTrash={trashOpenNote} onShowTag={showTagNotes} />
 				{#if $viewMode === 'tasks' && !taskNoteOpened}
 					<div class="tasks-editor-placeholder">
 						<svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -1525,8 +1693,8 @@
 	.mobile-header {
 		display: flex;
 		align-items: center;
-		height: 52px;
-		padding: 0 8px;
+		min-height: 52px;
+		padding: 8px;
 		background: var(--bg-secondary);
 		border-bottom: 1px solid var(--border-color);
 		flex-shrink: 0;
@@ -1570,12 +1738,16 @@
 	.mobile-header-actions {
 		display: flex;
 		align-items: center;
+		justify-content: flex-end;
+		flex-wrap: wrap;
+		min-width: 0;
 		gap: 2px;
 		margin-left: auto;
 	}
 
 	.mobile-header-btn {
 		display: flex;
+		flex-shrink: 0;
 		align-items: center;
 		justify-content: center;
 		width: 34px;
@@ -1600,6 +1772,70 @@
 		color: var(--accent);
 	}
 
+	.mobile-note-menu-wrapper {
+		position: relative;
+		flex-shrink: 0;
+	}
+
+	.mobile-note-menu {
+		position: absolute;
+		top: calc(100% + 8px);
+		right: 0;
+		z-index: 1000;
+		width: min(260px, calc(100vw - 24px));
+		max-height: calc(100dvh - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px) - 72px);
+		overflow-y: auto;
+		overscroll-behavior: contain;
+		padding: 6px;
+		border: 1px solid var(--border-color);
+		border-radius: 10px;
+		background: var(--bg-secondary);
+		box-shadow: 0 12px 30px rgba(0, 0, 0, 0.2);
+	}
+
+	.mobile-note-menu-item {
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		width: 100%;
+		min-height: 42px;
+		padding: 8px 10px;
+		border: none;
+		border-radius: 7px;
+		background: none;
+		color: var(--text-primary);
+		font: inherit;
+		font-size: 14px;
+		text-align: left;
+		cursor: pointer;
+	}
+
+	.mobile-note-menu-item svg {
+		width: 18px;
+		height: 18px;
+		flex-shrink: 0;
+	}
+
+	.mobile-note-menu-item:hover {
+		background: var(--bg-hover);
+	}
+
+	.mobile-note-menu-item.active {
+		color: var(--accent);
+		background: var(--accent-light);
+	}
+
+	.mobile-note-menu-item:disabled {
+		opacity: 0.5;
+		cursor: default;
+	}
+
+	.mobile-header-btn:focus-visible,
+	.mobile-note-menu-item:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: -2px;
+	}
+
 	.mobile-content {
 		flex: 1;
 		overflow: hidden;
@@ -1619,6 +1855,23 @@
 	.mobile-panel.active {
 		visibility: visible;
 		pointer-events: auto;
+	}
+
+	.mobile-content.tablet .mobile-panel {
+		right: auto;
+		width: 320px;
+		border-right: 1px solid var(--border-color);
+	}
+
+	.mobile-content.tablet .mobile-editor-panel {
+		left: 320px;
+		right: 0;
+		width: auto;
+		border-right: none;
+	}
+
+	.mobile-content.tablet.nav-hidden .mobile-editor-panel {
+		left: 0;
 	}
 
 </style>

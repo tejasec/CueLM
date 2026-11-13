@@ -4,7 +4,7 @@
 	import { getAppConfig, openVault, restoreExternalVault, setFontSize } from '$lib/api';
 	import { darkThemes, isIOS, isMobile } from '$lib/platform';
 	import { getWheelFontSizeAction } from '$lib/utils/editor-zoom';
-	import { getCurrentWebview } from '@tauri-apps/api/webview';
+	import { applyUiScale, defaultUiScale } from '$lib/ui-scale';
 	import { listen } from '@tauri-apps/api/event';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import VaultPicker from '$lib/components/VaultPicker.svelte';
@@ -119,7 +119,8 @@
 			} else if (event.key === '0') {
 				event.preventDefault();
 				event.stopPropagation();
-				setEditorFontSize(defaultEditorFontSize);
+				// Back to the size chosen in Appearance, not the built-in default.
+				setEditorFontSize($appConfig?.preferred_font_size ?? defaultEditorFontSize);
 			}
 		};
 
@@ -187,7 +188,7 @@
 				? (prefersDark ? config.system_dark_theme || 'dark' : config.system_light_theme || 'light')
 				: rawTheme;
 			const root = document.documentElement;
-			const namedThemes = ['solarized-light', 'solarized-dark', 'catppuccin', 'nord', 'tokyo-night', 'github-light', 'github-dark', 'dracula', 'blueberry', 'forest-green', 'gruvbox', 'midnight-tide', 'cherry-blossom', 'synthwave', 'ember', 'moonlit', 'light-coffee', 'dark-coffee', 'cotton-candy', 'crimson', 'cloud', 'peach', 'material-dark', 'material-light', 'monokai', 'rose-pine', 'everforest', 'horizon', 'cyberpunk', 'black', 'one-dark'];
+			const namedThemes = ['solarized-light', 'solarized-dark', 'catppuccin', 'nord', 'tokyo-night', 'github-light', 'github-dark', 'dracula', 'blueberry', 'forest-green', 'gruvbox', 'midnight-tide', 'cherry-blossom', 'synthwave', 'ember', 'moonlit', 'light-coffee', 'dark-coffee', 'cotton-candy', 'crimson', 'cloud', 'peach', 'material-dark', 'material-light', 'monokai', 'rose-pine', 'everforest', 'horizon', 'cyberpunk', 'black', 'one-dark', 'matrix', 'amber-crt', 'sepia', 'deep-ocean', 'sandstone', 'lavender', 'graphite', 'nebula', 'wine', 'jade'];
 			root.classList.remove('dark');
 			root.removeAttribute('data-theme');
 			if (namedThemes.includes(themeValue)) {
@@ -215,6 +216,8 @@
 					opensans: '"Open Sans", -apple-system, sans-serif',
 					literata: '"Literata", Georgia, serif',
 					mono: '"JetBrains Mono", "Fira Code", "Cascadia Code", monospace',
+					ubuntu: '"Ubuntu", -apple-system, sans-serif',
+					'ubuntu-mono': '"Ubuntu Mono", monospace',
 				};
 				const stack = fontStacks[config.font_family];
 				if (stack) document.documentElement.style.setProperty('--editor-font-family', stack);
@@ -256,14 +259,9 @@
 				}
 			}
 
-			// Apply saved interface scale to every desktop window; no-ops gracefully elsewhere.
-			if (config.ui_scale && config.ui_scale !== 1) {
-				try {
-					await getCurrentWebview().setZoom(config.ui_scale);
-				} catch (e) {
-					console.error('Failed to apply interface scale:', e);
-				}
-			}
+			// Apply saved interface scale (or the platform default) to desktop windows and Android.
+			const uiScale = config.ui_scale ?? defaultUiScale;
+			if (uiScale !== 1) await applyUiScale(uiScale);
 			await revealStartupWindow();
 			removeEditorZoomShortcuts = installEditorZoomShortcuts();
 

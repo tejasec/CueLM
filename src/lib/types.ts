@@ -63,6 +63,7 @@ export interface VaultConfig {
   sync_on_open?: boolean;
   sync_on_change?: boolean;
   sync_interval_minutes?: number;
+  sync_folder_requests?: number;
   last_sync_time?: string | null;
   last_backup_time?: string | null;
 }
@@ -113,6 +114,7 @@ export interface AppConfig {
   system_dark_theme: string;
   accent_color: string | null;
   font_size: number | null;
+  preferred_font_size?: number | null;
   scroll_to_change_font_size: boolean;
   toolbar_layout: ToolbarLayout | null;
   font_family: string | null;
@@ -250,6 +252,8 @@ export interface BackupEntry {
   path: string;
   size: number;
   created: string;
+  /** Made from a different vault folder; all vaults share one backup folder. */
+  other_vault?: boolean;
 }
 
 export interface VersionEntry {
