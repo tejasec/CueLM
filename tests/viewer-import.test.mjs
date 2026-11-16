@@ -4,6 +4,7 @@ import test from 'node:test';
 import { createContext, Script } from 'node:vm';
 import { parse } from 'svelte/compiler';
 import { transformWithEsbuild } from 'vite';
+import { formatMessage } from '../src/lib/i18n/core.ts';
 
 const source = await readFile(new URL('../src/lib/components/Editor.svelte', import.meta.url), 'utf8');
 const declaration = parse(source, { modern: true }).instance.content.body.find(node =>
@@ -26,6 +27,7 @@ function fixture(path = '/external/External.md') {
   const messages = [];
   const files = new Map([[path, original]]);
   const context = createContext({
+    uiText: (key, values) => formatMessage('en', key, values),
     beginEditorNoteNavigation: () => () => current,
     $viewerNote: { path, content: original.content }, $activeNote: original,
     $appConfig: { active_vault: '/vault' }, $readOnly: true, $focusMode: true,

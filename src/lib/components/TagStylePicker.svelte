@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { t as ui, label as uiLabel } from '$lib/i18n';
 	import { onMount, onDestroy } from 'svelte';
 	import { open as openDialog } from '@tauri-apps/plugin-dialog';
 	import { readFile } from '@tauri-apps/plugin-fs';
@@ -103,7 +104,7 @@
 		try {
 			const selected = await openDialog({
 				multiple: false,
-				filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico'] }]
+				filters: [{ name: $ui('ui.images'), extensions: ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico'] }]
 			});
 			if (!selected || !ownerIsCurrent() || tag !== target || !latest()) return;
 			const filePath = selected as string;
@@ -138,23 +139,23 @@
 />
 
 <div class="icon-picker-overlay" class:mobile={isMobile}>
-	<button class="icon-picker-backdrop" aria-label="Close tag appearance picker" onclick={onclose}></button>
+	<button class="icon-picker-backdrop" aria-label={$ui("ui.close_tag_appearance_picker")} onclick={onclose}></button>
 	<div
 		bind:this={dialogEl}
 		class="icon-picker"
 		role="dialog"
 		aria-modal="true"
-		aria-label={`Choose an icon and color for ${tag}`}
+		aria-label={$ui("ui.choose_an_icon_and_color_for", { value0: tag })}
 		tabindex="-1"
 	>
 		<header class="icon-picker-header">
 			<div>
-				<h3>Tag appearance</h3>
+				<h3>{$ui("ui.tag_appearance")}</h3>
 				<p>
 					<TagLabel name={tag} size={14} />
 				</p>
 			</div>
-			<button type="button" class="icon-picker-close" aria-label="Close tag appearance picker" onclick={onclose}>
+			<button type="button" class="icon-picker-close" aria-label={$ui("ui.close_tag_appearance_picker")} onclick={onclose}>
 				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
 			</button>
 		</header>
@@ -165,27 +166,27 @@
 					type="button"
 					class="icon-picker-option"
 					class:active={activeIcon === encodeBuiltinNotebookIcon(option.id)}
-					aria-label={option.label}
-					title={option.label}
+					aria-label={$uiLabel(option.label)}
+					title={$uiLabel(option.label)}
 					onclick={() => handleBuiltinIcon(option.id)}
 				>
 					<NotebookGlyph icon={option.id} size={20} />
-					<span>{option.label}</span>
+					<span>{$uiLabel(option.label)}</span>
 				</button>
 			{/each}
 			<button type="button" class="icon-picker-more" aria-expanded={expanded} onclick={() => showAll = !expanded}>
-				{expanded ? 'Fewer icons' : 'More icons'}
+				{expanded ? $ui("ui.fewer_icons") : $ui("ui.more_icons")}
 			</button>
 		</div>
 		<div class="color-section">
-			<span class="color-label">Color</span>
+			<span class="color-label">{$ui("ui.color")}</span>
 			<div class="swatches">
 				<button
 					type="button"
 					class="swatch none"
 					class:active={!activeColor}
-					aria-label="Use default color"
-					title="Default color"
+					aria-label={$ui("ui.use_default_color")}
+					title={$ui("ui.default_color")}
 					onclick={() => persist({ kind: 'color', value: null })}
 				></button>
 				{#each TAG_COLOR_PRESETS as preset (preset)}
@@ -194,28 +195,28 @@
 						class="swatch"
 						class:active={activeColor?.toLowerCase() === preset}
 						style:background={preset}
-						aria-label={`Use ${preset}`}
+						aria-label={$ui("ui.use", { value0: preset })}
 						title={preset}
 						onclick={() => persist({ kind: 'color', value: preset })}
 					></button>
 				{/each}
-				<label class="swatch custom" title="Custom color">
-					<input type="color" value={colorInputValue} oninput={onColorInput} aria-label="Custom tag color" />
+				<label class="swatch custom" title={$ui("ui.custom_color")}>
+					<input type="color" value={colorInputValue} oninput={onColorInput} aria-label={$ui("ui.custom_tag_color")} />
 				</label>
 			</div>
 		</div>
 		<div class="icon-picker-actions">
 			<button type="button" onclick={handleCustomIcon}>
 				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><path d="m21 15-5-5L5 21" /></svg>
-				Custom image...
+				{$ui("ui.custom_image")}
 			</button>
 			{#if hasStyle}
 				<button type="button" class="remove" onclick={handleReset}>
 					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13" /></svg>
-					Use default
+					{$ui("ui.use_default")}
 				</button>
 			{/if}
-			<p class="icon-picker-recommendation">Icons and colors are optional. Recommended image size: <strong>1:1</strong></p>
+			<p class="icon-picker-recommendation">{$ui("ui.icons_and_colors_are_optional_recommended_image_size")} <strong>1:1</strong></p>
 		</div>
 	</div>
 </div>

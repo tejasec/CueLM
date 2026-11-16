@@ -20,7 +20,7 @@ export async function openNoteWindow(vaultPath: string, notePath: string, noteTi
 
 	const noteWindow = new WebviewWindow(label, {
 		url,
-		title: `${noteTitle} - CueLM`,
+		title: `${noteTitle} - HelixNotes`,
 		width: 900,
 		height: 700,
 		minWidth: 500,

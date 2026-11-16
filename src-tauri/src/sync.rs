@@ -1,17 +1,17 @@
 // WebDAV sync provider.
 //
 // Model: the vault stays local; this mirrors it to/from a user-configured WebDAV
-// remote (Nextcloud/ownCloud/NAS). A local manifest (.cuelm/sync_state.json)
+// remote (Nextcloud/ownCloud/NAS). A local manifest (.helixnotes/sync_state.json)
 // records what was in sync last time, so we can do a three-way diff (local vs remote
 // vs manifest) and resolve each file as upload/download/delete, with keep-both
 // conflict copies so nothing is ever lost.
 //
-// Synced set: every `*.md` in the vault tree, `.cuelm/attachments/`,
-// `.cuelm/notebook_icons.json`, and `.cuelm/tag_styles.json`. Search indexes,
+// Synced set: every `*.md` in the vault tree, `.helixnotes/attachments/`,
+// `.helixnotes/notebook_icons.json`, `.helixnotes/tag_styles.json` and the daily template. Search indexes,
 // trash, history, other metadata, and the manifest itself remain local-only.
 
 use crate::state::AppState;
-use crate::vault::operations::cuelm_dir;
+use crate::vault::operations::helixnotes_dir;
 use crate::vault::watcher::changed_entry;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -21,6 +21,9 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use tauri::{Emitter, Manager};
 use walkdir::WalkDir;
+
+#[cfg(test)]
+mod daily_template_tests;
 
 /// Folder listings requested at once unless the settings say otherwise. A handful hides most of
 /// the round-trip time and stays polite to a small server.
@@ -87,7 +90,7 @@ struct ManifestEntry {
 }
 
 fn manifest_path(vault: &str) -> PathBuf {
-    cuelm_dir(vault).join("sync_state.json")
+    helixnotes_dir(vault).join("sync_state.json")
 }
 
 /// A local filesystem failure, named as such with the operation and the file. The bare OS error
@@ -252,7 +255,7 @@ fn conflict_relpath(relpath: &str, stamp: &str) -> String {
 // title. A note without a title of its own already takes it from the file name.
 fn conflict_copy(relpath: &str, bytes: Vec<u8>, stamp: &str) -> Vec<u8> {
     use crate::vault::{frontmatter, operations};
-    if !relpath.ends_with(".md") {
+    if !relpath.ends_with(".md") || relpath.starts_with(".helixnotes/") {
         return bytes;
     }
     let Ok(raw) = std::str::from_utf8(&bytes) else {
@@ -284,7 +287,7 @@ fn write_local(
     }
     if matches!(
         relpath,
-        ".cuelm/notebook_icons.json" | ".cuelm/tag_styles.json"
+        ".helixnotes/notebook_icons.json" | ".helixnotes/tag_styles.json"
     ) {
         let content = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
         crate::vault::operations::attachment_metadata_references(
@@ -334,22 +337,23 @@ struct LocalFile {
     path: PathBuf,
 }
 
-/// The synced set: `*.md` anywhere outside `.cuelm/`, everything under
-/// `.cuelm/attachments/`, plus notebook icon and tag style mappings. Applied to BOTH local
+/// The synced set: `*.md` anywhere outside `.helixnotes/`, everything under
+/// `.helixnotes/attachments/`, plus the daily template, notebook icon and tag style mappings. Applied to BOTH local
 /// and remote so pointing at a folder with unrelated files never imports them.
 fn is_synced_relpath(rel: &str) -> bool {
     // On a case-insensitive disk `.HelixNotes/history/x.md` lands in the app's own folder, so any
     // other spelling of it is never synced, whatever lies below.
     let first = rel.split('/').next().unwrap_or_default();
-    if first != ".cuelm"
-        && (first.to_lowercase() == ".cuelm" || first.to_uppercase() == ".HELIXNOTES")
+    if first != ".helixnotes"
+        && (first.to_lowercase() == ".helixnotes" || first.to_uppercase() == ".HELIXNOTES")
     {
         return false;
     }
-    if rel.starts_with(".cuelm/") {
-        rel.starts_with(".cuelm/attachments/")
-            || rel == ".cuelm/notebook_icons.json"
-            || rel == ".cuelm/tag_styles.json"
+    if rel.starts_with(".helixnotes/") {
+        rel.starts_with(".helixnotes/attachments/")
+            || rel == ".helixnotes/notebook_icons.json"
+            || rel == ".helixnotes/tag_styles.json"
+            || rel == crate::vault::daily_template::RELATIVE_PATH
     } else {
         rel.ends_with(".md")
     }
@@ -1134,6 +1138,7 @@ pub fn test_connection(cfg: WebdavConfig) -> Result<String, String> {
 pub fn run_sync(
     app: tauri::AppHandle,
     vault: String,
+    bookmark_id: Option<String>,
     cfg: WebdavConfig,
 ) -> Result<SyncSummary, String> {
     use std::sync::atomic::Ordering;
@@ -1147,7 +1152,7 @@ pub fn run_sync(
 
     let _ = app.emit(
         "sync-progress",
-        serde_json::json!({ "vault_path": vault, "status": "listing" }),
+        serde_json::json!({ "vault_path": vault, "bookmark_id": bookmark_id, "status": "listing" }),
     );
     let remote: HashMap<String, RemoteFile> = client
         .list()?
@@ -1178,7 +1183,7 @@ pub fn run_sync(
 
     let _ = app.emit(
         "sync-progress",
-        serde_json::json!({ "vault_path": vault, "status": "syncing" }),
+        serde_json::json!({ "vault_path": vault, "bookmark_id": bookmark_id, "status": "syncing" }),
     );
     let mut changes = HashMap::new();
     // Mute the watcher across local writes; its deferred batch also preserves
@@ -1205,7 +1210,7 @@ pub fn run_sync(
         .lock()
         .ok()
         .is_some_and(|config| config.active_vault.as_deref() == Some(vault.as_str()));
-    let metadata_root = cuelm_dir(&vault);
+    let metadata_root = helixnotes_dir(&vault);
     for (path, event_type) in changes {
         let is_note = path.extension().and_then(|extension| extension.to_str()) == Some("md")
             && !path.starts_with(&metadata_root);
@@ -1552,7 +1557,7 @@ mod tests {
         operations::ensure_vault_structure(root).unwrap();
         operations::patch_tag_style(root, "Work", TagStyleChange::Color(Some("#123456".into())))
             .unwrap();
-        let rel = ".cuelm/tag_styles.json";
+        let rel = ".helixnotes/tag_styles.json";
         let path = vault.path().join(rel);
         let hash = sha256_hex(&fs::read(&path).unwrap());
         let guard = tokio::sync::Mutex::new(());
@@ -1683,14 +1688,14 @@ mod tests {
     #[test]
     fn local_scan_hashes_large_attachments_and_independent_files() {
         let vault = tempfile::tempdir().unwrap();
-        fs::create_dir_all(vault.path().join(".cuelm/attachments")).unwrap();
+        fs::create_dir_all(vault.path().join(".helixnotes/attachments")).unwrap();
         let attachment: Vec<u8> = (0..HASH_BUFFER_SIZE * 2 + 31)
             .map(|i| (i % 256) as u8)
             .collect();
         let files = [
-            (".cuelm/attachments/large.bin", attachment.as_slice()),
+            (".helixnotes/attachments/large.bin", attachment.as_slice()),
             (
-                ".cuelm/attachments/small.bin",
+                ".helixnotes/attachments/small.bin",
                 b"\0\xff\x80".as_slice(),
             ),
             ("empty.md", b"".as_slice()),
@@ -1760,19 +1765,19 @@ mod tests {
     fn syncs_notebook_icon_mapping_and_assets_only() {
         for path in [
             "Notes/plan.md",
-            ".cuelm/attachments/notebook-icon.png",
-            ".cuelm/notebook_icons.json",
-            ".cuelm/tag_styles.json",
+            ".helixnotes/attachments/notebook-icon.png",
+            ".helixnotes/notebook_icons.json",
+            ".helixnotes/tag_styles.json",
         ] {
             assert!(is_synced_relpath(path), "expected {path} to be synced");
         }
 
         for path in [
             "Notes/image.png",
-            ".cuelm/sync_state.json",
-            ".cuelm/notebook_icons.json.bak",
-            ".cuelm/tag_styles.json.bak",
-            ".cuelm/attachments-old/icon.png",
+            ".helixnotes/sync_state.json",
+            ".helixnotes/notebook_icons.json.bak",
+            ".helixnotes/tag_styles.json.bak",
+            ".helixnotes/attachments-old/icon.png",
         ] {
             assert!(!is_synced_relpath(path), "expected {path} to stay local");
         }
@@ -1940,8 +1945,8 @@ mod tests {
     fn remote_paths_cannot_leave_the_vault() {
         // Literal and percent-encoded traversal, as a hostile server could list it.
         for href in [
-            "/dav/.cuelm/attachments/..%2F..%2F..%2Fescaped.md",
-            "/dav/.cuelm/attachments/../../../escaped.md",
+            "/dav/.helixnotes/attachments/..%2F..%2F..%2Fescaped.md",
+            "/dav/.helixnotes/attachments/../../../escaped.md",
             "/dav/..%2Fescaped.md",
             "/dav/Notes/./x.md",
             "/dav/Notes//x.md",
@@ -1969,7 +1974,7 @@ mod tests {
             "Notes/é ü.md",
             "Notes/A: B.md",
             "Notes/v1.2.md",
-            ".cuelm/attachments/x.png",
+            ".helixnotes/attachments/x.png",
         ] {
             assert!(validate_relpath_for(rel, false).is_ok(), "{rel}");
         }
@@ -1992,7 +1997,7 @@ mod tests {
         let mut changes = HashMap::new();
         for rel in [
             "../escaped.md",
-            ".cuelm/attachments/../../../escaped.md",
+            ".helixnotes/attachments/../../../escaped.md",
             "/abs.md",
         ] {
             assert!(
@@ -2022,7 +2027,7 @@ mod tests {
         };
         // One hostile entry fails the whole listing, so nothing from it is acted on.
         for href in [
-            "/dav/.cuelm/attachments/..%2F..%2F..%2FLibrary%2Fx.plist",
+            "/dav/.helixnotes/attachments/..%2F..%2F..%2FLibrary%2Fx.plist",
             "/dav/../x.md",
             "/elsewhere/x.md",
         ] {
@@ -2042,8 +2047,8 @@ mod tests {
         ] {
             assert!(!is_synced_relpath(rel), "{rel}");
         }
-        assert!(is_synced_relpath(".cuelm/attachments/x.png"));
-        assert!(!is_synced_relpath(".cuelm/history/id/x.md"));
+        assert!(is_synced_relpath(".helixnotes/attachments/x.png"));
+        assert!(!is_synced_relpath(".helixnotes/history/id/x.md"));
         assert!(is_synced_relpath("Notes/.HelixNotes.md"));
         assert!(is_synced_relpath("Sub/.HelixNotes/x.md"));
     }
@@ -2123,7 +2128,7 @@ mod tests {
     fn corrupt_manifest_and_unreadable_vault_stop_without_treating_files_as_deleted() {
         let vault = tempfile::tempdir().unwrap();
         let root = vault.path().to_str().unwrap();
-        fs::create_dir_all(cuelm_dir(root)).unwrap();
+        fs::create_dir_all(helixnotes_dir(root)).unwrap();
         fs::write(manifest_path(root), b"{invalid").unwrap();
         assert!(load_manifest(root)
             .err()
@@ -2135,8 +2140,8 @@ mod tests {
         let old = load_manifest(root).unwrap();
         let rebased = baseline_for_endpoint(old, "new account");
         assert!(rebased.files.is_empty());
-        fs::remove_dir_all(cuelm_dir(root)).unwrap();
-        fs::write(cuelm_dir(root), b"not a directory").unwrap();
+        fs::remove_dir_all(helixnotes_dir(root)).unwrap();
+        fs::write(helixnotes_dir(root), b"not a directory").unwrap();
         assert!(save_manifest(root, &rebased).is_err());
         assert_eq!(fs::read(vault.path().join("note.md")).unwrap(), b"local");
     }

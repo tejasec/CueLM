@@ -19,7 +19,9 @@ const {
   isPathInDirectory,
   isTrashedNote,
   resolvePathFromFile,
-  resolveVaultFilePath
+  resolveVaultFilePath,
+  resolveFileReference,
+  noteAssetRoot
 } = await import(
   `data:text/javascript;base64,${Buffer.from(code).toString('base64')}`
 );
@@ -53,22 +55,22 @@ test('converts Windows asset URLs back to portable attachment paths', () => {
   );
   assert.equal(
     assetSourceToMarkdown(
-      'http://asset.localhost/C%3A%5CUsers%5Cuser%5CVault%5C.cuelm%5Cattachments%5Cimage.png',
+      'http://asset.localhost/C%3A%5CUsers%5Cuser%5CVault%5C.helixnotes%5Cattachments%5Cimage.png',
       'C:\\Users\\user\\Vault\\Note.md',
       'C:\\Users\\user\\Vault'
     ),
-    '.cuelm/attachments/image.png'
+    '.helixnotes/attachments/image.png'
   );
 });
 
 test('preserves portable asset paths on Linux and macOS', () => {
   assert.equal(
     assetSourceToMarkdown(
-      'asset://localhost/%2Fhome%2Fuser%2FVault%2F.cuelm%2Fattachments%2Fimage.png',
+      'asset://localhost/%2Fhome%2Fuser%2FVault%2F.helixnotes%2Fattachments%2Fimage.png',
       '/home/user/Vault/Note.md',
       '/home/user/Vault'
     ),
-    '.cuelm/attachments/image.png'
+    '.helixnotes/attachments/image.png'
   );
   assert.equal(
     assetSourceToMarkdown(
@@ -105,8 +107,8 @@ test('resolves vault files consistently across platforms', () => {
     'C:/Vault/assets/image.png'
   );
   assert.equal(
-    resolveVaultFilePath('.cuelm/attachments/image.png', 'C:\\Vault\\notes\\Note.md', 'C:\\Vault'),
-    'C:/Vault/.cuelm/attachments/image.png'
+    resolveVaultFilePath('.helixnotes/attachments/image.png', 'C:\\Vault\\notes\\Note.md', 'C:\\Vault'),
+    'C:/Vault/.helixnotes/attachments/image.png'
   );
   assert.equal(
     resolveVaultFilePath('../assets/image.png', '/vault/notes/Note.md', '/vault'),
@@ -116,6 +118,28 @@ test('resolves vault files consistently across platforms', () => {
     resolveVaultFilePath('../assets/image.png', '\\\\server\\share\\Vault\\notes\\Note.md', '\\\\server\\share\\Vault'),
     '//server/share/Vault/assets/image.png'
   );
+});
+
+test('document URI suffixes are excluded from filesystem paths without double-decoding filename escapes', () => {
+  assert.deepEqual(resolveFileReference('.helixnotes/attachments/report%2520%29.pdf#page=2', '/vault/Notes/Note.md', '/vault'), {
+    path: '/vault/.helixnotes/attachments/report%20).pdf', suffix: '#page=2'
+  });
+  assert.deepEqual(resolveFileReference('../files/report%23%3F.pdf?mode=fit#page=2', '/vault/Notes/Note.md', '/vault'), {
+    path: '/vault/files/report#?.pdf', suffix: '?mode=fit#page=2'
+  });
+});
+
+test('older imported managed links stay inside their vault after moving to another notebook depth', () => {
+  for (const note of ['/vault/Projects/Nested/Note.md', '/vault/Note.md', '/vault/Archive/Note.md']) {
+    assert.equal(resolveFileReference('../../.helixnotes/attachments/report.pdf#page=2', note, '/vault').path, '/vault/.helixnotes/attachments/report.pdf');
+  }
+});
+
+test('external source roots use configured ownership without borrowing the active vault', () => {
+  assert.equal(noteAssetRoot('/source/Notes/Note.md', '/destination', ['/source']), '/source');
+  assert.equal(noteAssetRoot('/external/Note.md', '/destination', ['/source']), null);
+  assert.equal(noteAssetRoot('/destination-extra/Note.md', '/destination'), null);
+  assert.equal(noteAssetRoot('C:\\SOURCE\\Note.md', 'C:\\Destination', ['c:/Source']), 'c:/Source');
 });
 
 test('restored Windows and UNC notes remain vault-owned across separator and case differences', () => {
@@ -134,10 +158,10 @@ test('vault ownership normalizes trailing separators and dot segments without ac
 });
 
 test('trash previews are protected without blocking ordinary notebooks or other vaults', () => {
-  assert.equal(isTrashedNote('/vault/.cuelm/trash/deleted.md', '/vault'), true);
-  assert.equal(isTrashedNote('C:\\Vault\\.cuelm\\trash\\deleted.md', 'c:/vault/'), true);
+  assert.equal(isTrashedNote('/vault/.helixnotes/trash/deleted.md', '/vault'), true);
+  assert.equal(isTrashedNote('C:\\Vault\\.helixnotes\\trash\\deleted.md', 'c:/vault/'), true);
   assert.equal(isTrashedNote('/vault/Trash/note.md', '/vault'), false);
-  assert.equal(isTrashedNote('/vault/.cuelm/trash-backup/note.md', '/vault'), false);
-  assert.equal(isTrashedNote('/other/.cuelm/trash/deleted.md', '/vault'), false);
+  assert.equal(isTrashedNote('/vault/.helixnotes/trash-backup/note.md', '/vault'), false);
+  assert.equal(isTrashedNote('/other/.helixnotes/trash/deleted.md', '/vault'), false);
   assert.equal(isTrashedNote(null, '/vault'), false);
 });

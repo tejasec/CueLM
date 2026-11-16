@@ -1,4 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { Language } from './i18n/core';
+import type { EditorMode } from './editor/mode';
 import type { ExternalNoteReference } from "./editor/externalNote";
 import type {
   AppConfig,
@@ -18,23 +20,25 @@ import type {
   BackupEntry,
   VersionEntry,
   TaskItem,
-  ExternalVaultResult,
+  VaultIdentity,
   StartupView,
   ToolbarLayout,
   PendingOpenFile,
   RecordingEntry,
 } from "./types";
 
-export async function openVault(path: string): Promise<void> {
-  return invoke("open_vault", { path });
+// Activation returns the committed configuration in the same IPC response. A second
+// config read must not fail after the native vault has already changed.
+export async function openVault(path: string, options: { existing?: boolean; expected?: VaultIdentity } = {}): Promise<AppConfig> {
+  return invoke("open_vault", { path, requireExisting: options.existing ?? false, expected: options.expected ?? null });
 }
 
-export async function chooseExternalVault(): Promise<ExternalVaultResult | null> {
+export async function chooseExternalVault(): Promise<AppConfig | null> {
   return invoke("choose_external_vault");
 }
 
-export async function restoreExternalVault(bookmarkId: string): Promise<ExternalVaultResult> {
-  return invoke("restore_external_vault", { bookmarkId });
+export async function restoreExternalVault(bookmarkId: string, expected?: VaultIdentity): Promise<AppConfig> {
+  return invoke("restore_external_vault", { bookmarkId, expected: expected ?? null });
 }
 
 export async function removeVault(path: string, bookmarkId?: string | null): Promise<void> {
@@ -51,6 +55,10 @@ export async function completeWindowClose(): Promise<void> {
 
 export async function cancelWindowClose(): Promise<void> {
   return invoke("cancel_window_close");
+}
+
+export async function setLanguage(language: Language): Promise<void> {
+  return invoke("set_language", { language });
 }
 
 export async function setTheme(theme: string): Promise<void> {
@@ -190,6 +198,24 @@ export async function duplicateNote(vaultPath: string, path: string): Promise<No
 
 export async function createDailyNote(vaultPath: string, date?: string): Promise<NoteEntry> {
   return invoke("create_daily_note", { vaultPath, date: date ?? null });
+}
+
+export interface DailyNoteTemplate {
+  raw: string | null;
+  content: string;
+  enabled: boolean;
+}
+
+export async function getDailyNoteTemplate(vaultPath: string): Promise<DailyNoteTemplate> {
+  return invoke("get_daily_note_template", { vaultPath });
+}
+
+export async function setDailyNoteTemplate(vaultPath: string, template: string | null, expectedTemplate: string | null): Promise<DailyNoteTemplate> {
+  return invoke("set_daily_note_template", { vaultPath, template, expectedTemplate });
+}
+
+export async function importDailyNoteTemplate(vaultPath: string, title: string, expectedTemplate: string | null): Promise<DailyNoteTemplate | null> {
+  return invoke("import_daily_note_template", { vaultPath, title, expectedTemplate });
 }
 
 export async function renameNote(
@@ -347,6 +373,10 @@ export async function importTagIcon(
   data: number[],
 ): Promise<TagStyle> {
   return invoke("import_tag_icon", { vaultPath, tag, name, data });
+}
+
+export async function setNewNoteEditorMode(mode: EditorMode): Promise<void> {
+  return invoke('set_new_note_editor_mode', { mode });
 }
 
 export async function setGeneralSettings(
@@ -507,12 +537,12 @@ export async function playRecordingInAudioRecorder(recordingsPath: string, fileP
   return openFile(filePath);
 }
 
-export async function renameRecording(vaultPath: string, oldPath: string, newName: string): Promise<string> {
-  return invoke("rename_recording", { vaultPath, oldPath, newName });
+export async function renameRecording(oldPath: string, newName: string, vaultPath?: string | null): Promise<string> {
+  return invoke("rename_recording", { oldPath, newName, vaultPath: vaultPath || null });
 }
 
-export async function deleteRecording(vaultPath: string, filePath: string): Promise<void> {
-  return invoke("delete_recording", { vaultPath, filePath });
+export async function deleteRecording(filePath: string, vaultPath?: string | null): Promise<void> {
+  return invoke("delete_recording", { filePath, vaultPath: vaultPath || null });
 }
 
 export function syncNativeTheme(): void {
@@ -533,7 +563,6 @@ export function syncNativeTheme(): void {
     bridge.setAppTheme(isDark, accent, bg);
   }
 }
-
 
 export async function copyFileTo(
   source: string,
@@ -690,13 +719,23 @@ export async function testAiConnection(): Promise<void> {
   return invoke("test_ai_connection");
 }
 
+export interface AiModel { id: string; name: string; vision: boolean | null }
+export interface AiImageContext { vaultPath: string; notePath: string; paths: string[] }
+export interface AiRequestConfig { provider: string | null; model: string; baseUrl: string | null }
+
+export async function fetchAiModels(provider: string, apiKey: string): Promise<AiModel[]> {
+  return invoke("fetch_ai_models", { provider, apiKey });
+}
+
 export async function aiAsk(
   action: string,
   text: string,
   customPrompt: string | null,
   requestId: string,
+  imageContext: AiImageContext | null = null,
+  expectedConfig: AiRequestConfig | null = null,
 ): Promise<void> {
-  return invoke("ai_ask", { action, text, customPrompt, requestId });
+  return invoke("ai_ask", { action, text, customPrompt, requestId, imageContext, expectedConfig });
 }
 
 export async function getInstallType(): Promise<string> {

@@ -14,6 +14,37 @@ CueLM provides a unified solution: **at its foundation, it is a complete, distra
 
 ---
 
+## Features
+
+- Markdown editor with toolbar, slash commands, source mode, code highlighting, Find and Replace
+- Side-by-side image grids, image reordering and hover text
+- **Tasks view**: aggregate `- [ ]` checklists from across all notes, set priority and due dates, filter Today or Overdue tasks, work in a list or a calendar (drag a task to reschedule)
+- `[[Wiki-links]]` and graph view
+- Full-text search (Tantivy), CJK-aware for Chinese, Japanese, and Korean
+- Outline panel, daily notes with calendar view, tags with autocomplete, drag-and-drop
+- Live KaTeX math editor (`/math`, `/imath`) with modal preview, double-click to edit
+- Mermaid diagrams (opt-in render, copy as PNG, save as PNG/SVG)
+- Encrypted secret blocks (`/secret`) stored as portable `helix-secret` markdown fences
+- Insert date/time (`/date`, `/time`, `/now`) with 12-hour or 24-hour timestamps, color swatches (`/color`), configurable week start
+- Manual notebook sorting (drag to reorder above, into, or below)
+- External `.md` viewer mode with import-to-vault flow
+- PDF preview, Obsidian import, "Show in File Manager"
+- [Editable Live preview](docs/live-preview.md) alongside rich text and Markdown source, with one compact editor-mode selector and a three-button new-note preference
+- [Quick vault switching](docs/vault-switching.md) from the title bar, with saved-vault paths, Add vault and Manage Vaults
+- AI writing tools (Ollama / OpenAI-compatible / Anthropic / OpenAI)
+- [Provider model discovery and opt-in image input](docs/ai-models-and-images.md)
+- **Optional WebDAV sync** to your own server (Nextcloud, ownCloud, a NAS): manual or automatic, with keep-both conflict copies
+- Version history with main-area diffs and rendered read-only snapshots, automatic backups
+- Multi-window, file associations, focus mode, view mode
+- Themes (light, dark, and built-in palettes), accent colors, fonts including bundled Ubuntu and Ubuntu Mono, 80-200% interface scale
+- [Daily-note templates](docs/daily-note-templates.md), with per-vault Markdown import/editing and date/title placeholders, applied only to new notes
+- Interface languages: English, Russian, Dutch, German, Spanish, French, Italian, Portuguese (Portugal) and Portuguese (Brazil), with live switching
+- [MCP integration](docs/mcp.md) in Settings, with a packaged helper, per-vault read-only access and opt-in native note editing; no Node.js installation required
+- **Native Lecture Recording & Waveform Playback**: In-vault recording (`.aac`), foreground service persistence, and waveform scrubbing directly on Android
+- Local plain-text files, no company cloud
+
+---
+
 
 ## Core Note-Taking System
 

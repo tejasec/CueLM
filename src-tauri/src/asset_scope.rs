@@ -79,7 +79,9 @@ pub fn allow_external_note_assets<R: Runtime>(
         if std::fs::canonicalize(&attachments)
             .is_ok_and(|canonical| canonical == attachments && canonical.is_dir())
         {
-            let _ = app.asset_protocol_scope().allow_directory(&attachments, true);
+            let _ = app
+                .asset_protocol_scope()
+                .allow_directory(&attachments, true);
             if let Some(scope) = app.try_fs_scope() {
                 let _ = scope.allow_directory(&attachments, true);
             }

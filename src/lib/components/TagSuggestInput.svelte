@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { label as uiLabel } from '$lib/i18n';
 	import { onMount } from 'svelte';
 	import { tags } from '$lib/stores/app';
 	import TagLabel from './TagLabel.svelte';

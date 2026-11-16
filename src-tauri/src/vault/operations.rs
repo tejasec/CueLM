@@ -1,7 +1,6 @@
 use crate::types::{
-    RecordingEntry,
-    NoteContent, NoteEntry, NoteMeta, NoteTitleEntry, NotebookEntry, TagStyle, TagStyleChange,
-    TrashContents, TrashNotebookEntry, VaultState,
+    NoteContent, NoteEntry, NoteMeta, NoteTitleEntry, NotebookEntry, RecordingEntry, TagStyle,
+    TagStyleChange, TrashContents, TrashNotebookEntry, VaultState,
 };
 use crate::vault::frontmatter;
 use chrono::{DateTime, Local, Locale, Utc};
@@ -14,12 +13,13 @@ use std::path::{Component, Path, PathBuf};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+#[allow(dead_code)]
 pub fn cuelm_dir(vault_path: &str) -> PathBuf {
     Path::new(vault_path).join(".cuelm")
 }
 
 pub fn helixnotes_dir(vault_path: &str) -> PathBuf {
-    cuelm_dir(vault_path)
+    Path::new(vault_path).join(".helixnotes")
 }
 
 fn canonicalize_path(path: &Path, label: &str) -> Result<PathBuf, String> {
@@ -33,10 +33,12 @@ fn ensure_vault_content_path(
 ) -> Result<PathBuf, String> {
     let vault = canonicalize_path(Path::new(vault_path), "vault path")?;
     let requested = canonicalize_path(requested_path, "vault item path")?;
-    let metadata = vault.join(".cuelm");
+    let metadata = vault.join(".helixnotes");
+    let cuelm_metadata = vault.join(".cuelm");
 
     if !requested.starts_with(&vault)
         || requested.starts_with(&metadata)
+        || requested.starts_with(&cuelm_metadata)
         || (!allow_root && requested == vault)
     {
         return Err("Path must stay inside the active vault".to_string());
@@ -283,7 +285,7 @@ fn move_without_replacing(src: &Path, dest: &Path) -> Result<(), String> {
     if same_object {
         let parent = src.parent().ok_or("Item has no parent directory")?;
         let staging = loop {
-            let candidate = parent.join(format!(".cuelm-rename-{}", Uuid::new_v4()));
+            let candidate = parent.join(format!(".helixnotes-rename-{}", Uuid::new_v4()));
             match rename_exclusive(src, &candidate) {
                 Ok(()) => break candidate,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -570,7 +572,10 @@ pub fn scan_recordings(vault_path: &str) -> Result<Vec<RecordingEntry>, String> 
         if path.is_file() {
             if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
                 let ext_lower = ext.to_lowercase();
-                if matches!(ext_lower.as_str(), "m4a" | "wav" | "3gp" | "mp3" | "ogg" | "aac" | "flac") {
+                if matches!(
+                    ext_lower.as_str(),
+                    "m4a" | "wav" | "3gp" | "mp3" | "ogg" | "aac" | "flac"
+                ) {
                     let meta = entry.metadata().ok();
                     let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
                     let modified = meta
@@ -589,7 +594,11 @@ pub fn scan_recordings(vault_path: &str) -> Result<Vec<RecordingEntry>, String> 
                     let (parent_name, display_name) = if let Some(idx) = stem.find("__sub__") {
                         let parent = stem[..idx].to_string();
                         let child_stem = &stem[idx + 7..];
-                        let ext_suffix = path.extension().and_then(|e| e.to_str()).map(|e| format!(".{}", e)).unwrap_or_default();
+                        let ext_suffix = path
+                            .extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| format!(".{}", e))
+                            .unwrap_or_default();
                         (Some(parent), format!("{}{}", child_stem, ext_suffix))
                     } else {
                         (None, name.clone())
@@ -610,11 +619,15 @@ pub fn scan_recordings(vault_path: &str) -> Result<Vec<RecordingEntry>, String> 
         }
     }
 
-    entries.sort_by(|a, b| b.modified.cmp(&a.modified));
+    entries.sort_by_key(|a| std::cmp::Reverse(a.modified));
     Ok(entries)
 }
 
-pub fn rename_recording(vault_path: &str, old_path: &str, new_name: &str) -> Result<String, String> {
+pub fn rename_recording(
+    vault_path: &str,
+    old_path: &str,
+    new_name: &str,
+) -> Result<String, String> {
     let rec_dir = Path::new(vault_path).join("Recordings");
     let src = PathBuf::from(old_path);
     if !src.exists() || !src.is_file() {
@@ -637,7 +650,11 @@ pub fn rename_recording(vault_path: &str, old_path: &str, new_name: &str) -> Res
         .to_string();
 
     let clean_new_name = new_name.trim();
-    let clean_new_stem = if !ext.is_empty() && clean_new_name.to_lowercase().ends_with(&format!(".{}", ext.to_lowercase())) {
+    let clean_new_stem = if !ext.is_empty()
+        && clean_new_name
+            .to_lowercase()
+            .ends_with(&format!(".{}", ext.to_lowercase()))
+    {
         &clean_new_name[..clean_new_name.len() - (ext.len() + 1)]
     } else {
         clean_new_name
@@ -647,22 +664,23 @@ pub fn rename_recording(vault_path: &str, old_path: &str, new_name: &str) -> Res
         return Err("Recording name cannot be empty".to_string());
     }
 
-    let (new_file_name, is_parent, old_parent_stem, new_parent_stem) = if let Some(idx) = old_stem.find("__sub__") {
-        let parent_part = &old_stem[..idx];
-        let new_file = if ext.is_empty() {
-            format!("{}__sub__{}", parent_part, clean_new_stem)
+    let (new_file_name, is_parent, old_parent_stem, new_parent_stem) =
+        if let Some(idx) = old_stem.find("__sub__") {
+            let parent_part = &old_stem[..idx];
+            let new_file = if ext.is_empty() {
+                format!("{}__sub__{}", parent_part, clean_new_stem)
+            } else {
+                format!("{}__sub__{}.{}", parent_part, clean_new_stem, ext)
+            };
+            (new_file, false, String::new(), String::new())
         } else {
-            format!("{}__sub__{}.{}", parent_part, clean_new_stem, ext)
+            let new_file = if ext.is_empty() {
+                clean_new_stem.to_string()
+            } else {
+                format!("{}.{}", clean_new_stem, ext)
+            };
+            (new_file, true, old_stem.clone(), clean_new_stem.to_string())
         };
-        (new_file, false, String::new(), String::new())
-    } else {
-        let new_file = if ext.is_empty() {
-            clean_new_stem.to_string()
-        } else {
-            format!("{}.{}", clean_new_stem, ext)
-        };
-        (new_file, true, old_stem.clone(), clean_new_stem.to_string())
-    };
 
     let new_path = rec_dir.join(&new_file_name);
     if src != new_path {
@@ -681,8 +699,13 @@ pub fn rename_recording(vault_path: &str, old_path: &str, new_name: &str) -> Res
                     let child_stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("");
                     if child_stem.starts_with(&prefix_match) {
                         let child_rest = &child_stem[prefix_match.len()..];
-                        let child_ext = p.extension().and_then(|s| s.to_str()).map(|e| format!(".{}", e)).unwrap_or_default();
-                        let new_child_name = format!("{}__sub__{}{}", new_parent_stem, child_rest, child_ext);
+                        let child_ext = p
+                            .extension()
+                            .and_then(|s| s.to_str())
+                            .map(|e| format!(".{}", e))
+                            .unwrap_or_default();
+                        let new_child_name =
+                            format!("{}__sub__{}{}", new_parent_stem, child_rest, child_ext);
                         let new_child_path = rec_dir.join(new_child_name);
                         let _ = fs::rename(&p, &new_child_path);
                     }
@@ -728,7 +751,6 @@ pub fn delete_recording(vault_path: &str, file_path: &str) -> Result<(), String>
     fs::remove_file(&src).map_err(|e| e.to_string())?;
     Ok(())
 }
-
 
 pub fn count_root_notes(vault_path: &str) -> Result<usize, String> {
     let root = Path::new(vault_path);
@@ -1100,7 +1122,7 @@ pub(crate) fn replace_file_atomically(path: &Path, content: &[u8]) -> Result<(),
     };
     let parent = path.parent().ok_or("File has no parent directory")?;
     let mut temporary = tempfile::Builder::new()
-        .prefix(".cuelm-save-")
+        .prefix(".helixnotes-save-")
         .tempfile_in(parent)
         .map_err(|error| error.to_string())?;
     temporary
@@ -1315,8 +1337,10 @@ pub fn create_daily_note(
     };
 
     let dir = Path::new(vault_path).join("Daily");
-    if fs::symlink_metadata(&dir).is_err() {
-        fs::create_dir(&dir).map_err(|e| e.to_string())?;
+    match fs::create_dir(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error.to_string()),
     }
     let dir = ensure_vault_content_dir(vault_path, &dir)?;
     let file_path = dir.join(format!("{}.md", date_str));
@@ -1345,14 +1369,23 @@ pub fn create_daily_note(
         modified: now,
     };
 
-    let raw = frontmatter::update_note_raw(&meta, "\n");
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&file_path)
-    {
-        Ok(mut file) => file.write_all(raw.as_bytes()).map_err(|e| e.to_string())?,
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+    let body = super::daily_template::read(vault_path)?
+        .filter(|raw| super::daily_template::is_enabled(raw))
+        .map(|raw| super::daily_template::expand(&raw, &date_str, &meta.title))
+        .unwrap_or_else(|| "\n".to_string());
+    // A template owns its body layout: do not insert another heading or copy its metadata.
+    let raw = format!("{}{}", frontmatter::serialize_frontmatter(&meta), body);
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".helixnotes-daily-")
+        .tempfile_in(&dir)
+        .map_err(|e| e.to_string())?;
+    temporary
+        .write_all(raw.as_bytes())
+        .map_err(|e| e.to_string())?;
+    temporary.as_file().sync_all().map_err(|e| e.to_string())?;
+    match temporary.persist_noclobber(&file_path) {
+        Ok(_) => {}
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
             if fs::symlink_metadata(&file_path)
                 .map_err(|e| e.to_string())?
                 .file_type()
@@ -1363,7 +1396,7 @@ pub fn create_daily_note(
             ensure_note_path(vault_path, &file_path)?;
             return read_note_entry(&file_path, vault_root);
         }
-        Err(error) => return Err(error.to_string()),
+        Err(error) => return Err(error.error.to_string()),
     }
 
     let relative = file_path
@@ -1894,8 +1927,8 @@ fn relinked_href(
         || decoded
             .trim_start_matches("./")
             .trim_start_matches("../")
-            .starts_with(".cuelm/")
-        || decoded.contains("/.cuelm/")
+            .starts_with(".helixnotes/")
+        || decoded.contains("/.helixnotes/")
     {
         return None;
     }
@@ -2467,7 +2500,7 @@ pub fn restore_notebook(vault_path: &str, trash_path: &str) -> Result<String, St
         ancestor.push(component);
         if fs::symlink_metadata(&ancestor).is_ok() {
             let canonical = canonicalize_path(&ancestor, "notebook destination")?;
-            if !canonical.starts_with(&vault) || canonical.starts_with(vault.join(".cuelm")) {
+            if !canonical.starts_with(&vault) || canonical.starts_with(vault.join(".helixnotes")) {
                 return Err("Path must stay inside the active vault".to_string());
             }
             if !canonical.is_dir() {
@@ -2576,7 +2609,7 @@ pub fn save_attachment(vault_path: &str, name: &str, data: &[u8]) -> Result<Stri
 
     let safe_name = sanitize_filename(name);
     let mut temporary = tempfile::Builder::new()
-        .prefix(".cuelm-asset-")
+        .prefix(".helixnotes-asset-")
         .tempfile_in(&attachments_dir)
         .map_err(|error| error.to_string())?;
     temporary
@@ -2590,7 +2623,7 @@ pub fn save_attachment(vault_path: &str, name: &str, data: &[u8]) -> Result<Stri
     loop {
         let filename = format!("{}_{}", Uuid::new_v4(), safe_name);
         match persist_without_replacing(temporary, attachments_dir.join(&filename)) {
-            Ok(_) => return Ok(format!(".cuelm/attachments/{filename}")),
+            Ok(_) => return Ok(format!(".helixnotes/attachments/{filename}")),
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
                 temporary = error.file;
             }
@@ -2628,7 +2661,7 @@ pub fn import_note(
     if !source.starts_with(&source_root) {
         return Err("Source attachment root does not own the note".into());
     }
-    let source_attachments = source_root.join(".cuelm/attachments");
+    let source_attachments = source_root.join(".helixnotes/attachments");
     let raw = fs::read_to_string(&source).map_err(|error| error.to_string())?;
     if raw != expected_raw {
         return Err("The source note changed on disk. Reopen it before importing.".into());
@@ -2673,7 +2706,7 @@ pub fn import_note(
         {
             return Err("Import attachments must be relative non-Markdown files".into());
         }
-        let base = if decoded.starts_with(".cuelm/attachments/") || reference.pdf {
+        let base = if decoded.starts_with(".helixnotes/attachments/") || reference.pdf {
             source_root.as_path()
         } else {
             source.parent().ok_or("Source note has no parent")?
@@ -2689,7 +2722,7 @@ pub fn import_note(
         let components: Vec<_> = relative_target.components().collect();
         let helix_attachment = components
             .first()
-            .is_some_and(|part| part.as_os_str() == ".cuelm")
+            .is_some_and(|part| part.as_os_str() == ".helixnotes")
             && components
                 .get(1)
                 .is_some_and(|part| part.as_os_str() == "attachments");
@@ -2706,7 +2739,7 @@ pub fn import_note(
     if !references.is_empty() {
         fs::create_dir_all(&attachments).map_err(|error| error.to_string())?;
         if canonicalize_path(&attachments, "attachment destination")?
-            != vault.join(".cuelm/attachments")
+            != vault.join(".helixnotes/attachments")
         {
             return Err("Attachment destination must not use symbolic links".into());
         }
@@ -2727,7 +2760,7 @@ pub fn import_note(
                         .to_string_lossy(),
                 );
                 let mut temporary = tempfile::Builder::new()
-                    .prefix(".cuelm-import-")
+                    .prefix(".helixnotes-import-")
                     .tempfile_in(&attachments)
                     .map_err(|error| error.to_string())?;
                 let mut file = fs::File::open(&target).map_err(|error| error.to_string())?;
@@ -2760,7 +2793,7 @@ pub fn import_note(
                     }
                 };
                 let relative =
-                    format!(".cuelm/attachments/{}", urlencoding::encode(&filename));
+                    format!(".helixnotes/attachments/{}", urlencoding::encode(&filename));
                 copied.insert(target, relative.clone());
                 relative
             };
@@ -2787,7 +2820,7 @@ pub fn import_note(
         rewritten.push_str(&raw[previous..]);
         let filename = source.file_name().ok_or("Source note has no filename")?;
         let mut temporary = tempfile::Builder::new()
-            .prefix(".cuelm-import-")
+            .prefix(".helixnotes-import-")
             .tempfile_in(&directory)
             .map_err(|error| error.to_string())?;
         temporary
@@ -3407,7 +3440,7 @@ mod rename_link_tests {
         let read = |rel: &str| fs::read_to_string(root.join(rel)).unwrap();
         write(
             "Work/Plan.md",
-            "# Plan\n[s](Sibling.md) [o](../Other/Linking.md#Top) ![](../.cuelm/attachments/a.png) [w](https://example.com/x.md) [gone](Missing.md)\n",
+            "# Plan\n[s](Sibling.md) [o](../Other/Linking.md#Top) ![](../.helixnotes/attachments/a.png) [w](https://example.com/x.md) [gone](Missing.md)\n",
         );
         write(
             "Work/Sibling.md",
@@ -3429,7 +3462,7 @@ mod rename_link_tests {
         // The moved note's own relative links point from its new folder; the rest stays.
         assert_eq!(
             read("Archive/Plan.md"),
-            "# Plan\n[s](../Work/Sibling.md) [o](../Other/Linking.md#Top) ![](../.cuelm/attachments/a.png) [w](https://example.com/x.md) [gone](Missing.md)\n"
+            "# Plan\n[s](../Work/Sibling.md) [o](../Other/Linking.md#Top) ![](../.helixnotes/attachments/a.png) [w](https://example.com/x.md) [gone](Missing.md)\n"
         );
         // A bare name in the old folder becomes a path; title links still find the note.
         assert_eq!(
@@ -3448,7 +3481,7 @@ mod rename_link_tests {
         assert_eq!(links.renames.len(), 1);
         assert_eq!(
             read("Archive/Plan.md"),
-            "# Plan\n[s](../Projects/Sibling.md) [o](../Other/Linking.md#Top) ![](../.cuelm/attachments/a.png) [w](https://example.com/x.md) [gone](Missing.md)\n"
+            "# Plan\n[s](../Projects/Sibling.md) [o](../Other/Linking.md#Top) ![](../.helixnotes/attachments/a.png) [w](https://example.com/x.md) [gone](Missing.md)\n"
         );
         // Links between notes that moved together still work as they are.
         assert_eq!(
@@ -3704,12 +3737,12 @@ mod tests {
     #[test]
     fn all_tags_excludes_only_root_metadata_subtree_and_hidden_filenames() {
         let parent = tempfile::tempdir().unwrap();
-        let root = parent.path().join(".cuelm");
+        let root = parent.path().join(".helixnotes");
         let fixtures = [
             ("Root.md", "root"),
-            (".cuelm/history/Stored.md", "excluded"),
-            ("Notebook/.cuelm/Nested.md", "nested"),
-            (".cuelm-other/Visible.md", "similar"),
+            (".helixnotes/history/Stored.md", "excluded"),
+            ("Notebook/.helixnotes/Nested.md", "nested"),
+            (".helixnotes-other/Visible.md", "similar"),
             (".obsidian/Visible.md", "obsidian"),
             ("assets/Visible.md", "assets"),
             (".other/Visible.md", "other"),
@@ -3753,10 +3786,10 @@ mod tests {
         )
         .unwrap();
         symlink(outside.path(), vault.path().join("Directory")).unwrap();
-        fs::create_dir(vault.path().join(".cuelm")).unwrap();
+        fs::create_dir(vault.path().join(".helixnotes")).unwrap();
         symlink(
             outside.path().join("External.md"),
-            vault.path().join(".cuelm/Excluded.md"),
+            vault.path().join(".helixnotes/Excluded.md"),
         )
         .unwrap();
 

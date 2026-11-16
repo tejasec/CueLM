@@ -1,4 +1,7 @@
 <script lang="ts">
+	import { t as ui, label as uiLabel, tr as uiText, locale, setUiText, setUiLabel } from '$lib/i18n';
+	import AiImageOptions from './AiImageOptions.svelte';
+	import { aiImageCandidates, protectAiMedia, restoreAiMedia, type AiImageCandidate } from '$lib/utils/ai-media';
 	import { onDestroy, tick, untrack } from 'svelte';
 	import { get } from 'svelte/store';
 	import { Editor } from '@tiptap/core';
@@ -34,7 +37,7 @@
 	import { readFile } from '@tauri-apps/plugin-fs';
 	import { openFile, openUrl, copyFileTo, copyImageToClipboard as copyImageToClipboardCmd, writeBytesTo, copyPngToClipboard, copyTextToClipboard } from '$lib/api';
 	import { save as saveDialog } from '@tauri-apps/plugin-dialog';
-	import { activeNote, activeNotePath, appConfig, editorDirty, sourceMode, focusMode, readOnly, quickAccessPaths, notes, navHistory, canGoBack, canGoForward, viewerNote, viewMode, notebooks, outlineWidth } from '$lib/stores/app';
+	import { activeNote, activeNotePath, appConfig, editorDirty, sourceMode, livePreviewMode, focusMode, readOnly, quickAccessPaths, notes, navHistory, canGoBack, canGoForward, viewerNote, viewMode, notebooks, outlineWidth } from '$lib/stores/app';
 	import { saveNote, importNote, createNote, saveImage, saveAttachment, readClipboardImage, readClipboardContents, addQuickAccess, removeQuickAccess, getQuickAccess, getNoteVersions, getNoteVersionContent, createVersion, aiAsk, getAllNoteTitles, readNote, renameNote, setToolbarLayout } from '$lib/api';
 	import type { NoteContent, VersionEntry, AiStreamEvent, NoteTitleEntry, TaskItem as TaskRecord, FileEvent, SearchTarget, ToolbarLayout } from '$lib/types';
 	import { listen } from '@tauri-apps/api/event';
@@ -46,6 +49,7 @@
 	import { RevisionSaveQueue, type SaveRevision } from '$lib/utils/revision-save';
 	import { isCurrentVaultEvent } from '$lib/utils/note-list-updates';
 	import { beginNoteNavigation, isCurrentNoteNavigation, cancelNoteNavigation } from '$lib/utils/note-navigation';
+	import { registerMcpEditor } from '$lib/utils/mcp-editor';
 	import { encryptSecretText, decryptSecretText, readSecretTitle } from '$lib/utils/secrets';
 	import { WrapSelectedText } from '$lib/editor/extensions/wrapSelectedText';
 	import { CodeBlockInputScroll } from '$lib/editor/extensions/codeBlockInputScroll';
@@ -53,6 +57,8 @@
 	import { defaultGridCols, expandImageRange, reorderTarget, serializeImgGrid } from '$lib/editor/imageGrid';
 	import { calloutGroup, calloutIcon, calloutLabel, CALLOUT_MENU, transformCalloutBlockquotes, serializeCallout } from '$lib/editor/callouts';
 	import SourceEditor from './SourceEditor.svelte';
+	import EditorModePicker from './EditorModePicker.svelte';
+	import { newNoteEditorMode, selectEditorMode } from '$lib/editor/mode';
 	import { SourceController } from '$lib/editor/source/controller';
 	import { findDocumentMatches, findSourceMatches, closestSearchMatch, type NoteSearchMatch, replaceableMatches } from '$lib/editor/search';
 	import { keybindings, bindingToKeys } from '$lib/keybindings';
@@ -66,7 +72,7 @@
 	import { documentHeadings, sourceHeadings, activeHeadingIndex, mapDocumentHeadings, mapSourceHeadings, type OutlineHeading } from '$lib/editor/outline';
 	import { createEditorMarkdownParser } from '$lib/editor/markdownParser';
 	import { collectClipboardPayload, isEmptyPayload, needsNativeClipboard, withNativeClipboard, type ClipboardPastePayload } from '$lib/utils/clipboard-paste';
-	import { applySingleLineSpacing } from '$lib/utils/clipboard-copy';
+	import { createSingleLineClipboardSerializer } from '$lib/utils/clipboard-copy';
 	import { externalNoteReferences } from '$lib/editor/externalNote';
 	import { tagIterationKey } from '$lib/utils/tag-styles';
 	import { replaceWithWikiLink } from '$lib/editor/wikiLinks';
@@ -126,16 +132,7 @@
 	const CopyLineSpacing = Extension.create({
 		name: 'copyLineSpacing',
 		addProseMirrorPlugins() {
-			const serializer = DOMSerializer.fromSchema(this.editor.schema);
-			const serializeFragment = serializer.serializeFragment.bind(serializer);
-			serializer.serializeFragment = (fragment, options, target) => {
-				const dom = serializeFragment(fragment, options, target);
-				const wrapper = document.createElement('div');
-				wrapper.appendChild(dom);
-				const template = document.createElement('template');
-				template.innerHTML = applySingleLineSpacing(wrapper.innerHTML);
-				return template.content;
-			};
+			const serializer = createSingleLineClipboardSerializer(this.editor.schema);
 			return [new Plugin({
 				key: new PluginKey('copyLineSpacing'),
 				props: { clipboardSerializer: serializer },
@@ -183,6 +180,11 @@
 		},
 	});
 	let editorReady = $state(false);
+	$effect(() => {
+		void $locale;
+		// Refresh translated decorations without a transaction, save, selection reset or rebuild.
+		if (editorReady && editor && !editor.isDestroyed) editor.view.updateState(editor.state);
+	});
 	const trashPreview = $derived(isTrashedNote($activeNotePath, $appConfig?.active_vault));
 	// CM retains an immutable document; edits never bind a full source string to Svelte.
 	const source = new SourceController((changes, edited) => {
@@ -196,6 +198,7 @@
 			scheduleOutlineActive();
 		}
 	}, { paste: handleFilePaste, drop: handleFileDrop, scroll: scheduleOutlineActive });
+	const sourceAssetContext = $derived(`${$activeNotePath ?? ''}|${currentNoteAssetRoot() ?? ''}`);
 	let loadedPath = '';
 	type NoteScrollPosition = { rich: number; source: number };
 	const MAX_NOTE_SCROLL_POSITIONS = 200;
@@ -284,10 +287,7 @@
 	export async function revealSearchTarget(target: SearchTarget | null, canReveal: () => boolean) {
 		if (!target || !canReveal()) return;
 		closeNoteSearch(false);
-		
-		window.removeEventListener("cuelm-open-note", handleOpenNote);
 		clearTargetReveal();
-
 		const request = ++targetRevealRequest;
 		const snapshot = saves.capture();
 		const path = loadedPath;
@@ -300,7 +300,7 @@
 		try {
 			await tick();
 			if (!current() || !$activeNote) return;
-			const changed = () => { searchRevealNotice = 'The indexed passage has changed. Search again after saving.'; };
+			const changed = () => { searchRevealNotice = uiText("ui.the_indexed_passage_has_changed_search_again_after_saving"); };
 			const revealTitle = () => {
 				searchTitleReveal = true;
 				const surface = $sourceMode ? source.view?.scrollDOM : editorElement?.closest('.editor-body');
@@ -312,7 +312,7 @@
 				if (target.field === 'title') revealTitle();
 				else {
 					searchTagsReveal = true;
-					searchRevealNotice = `Matched tag: ${target.text}`;
+					searchRevealNotice = uiText("ui.matched_tag", { value0: target.text });
 				}
 				return;
 			}
@@ -355,7 +355,7 @@
 				await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 				if (!current()) return;
 				source.load(stripTitleH1(body));
-				searchRevealNotice = 'Match is in Markdown source.';
+				searchRevealNotice = uiText("ui.match_is_in_markdown_source");
 			}
 			if (!current() || !source.view) return;
 			if (visible.markdown !== source.state.doc.toString()) {
@@ -370,10 +370,7 @@
 		} finally {
 			if (request === targetRevealRequest) {
 				if (current()) targetRevealTimer = setTimeout(clearTargetReveal, 4000);
-				else 
-		window.removeEventListener("cuelm-open-note", handleOpenNote);
-		clearTargetReveal();
-
+				else clearTargetReveal();
 			}
 		}
 	}
@@ -410,10 +407,7 @@
 	}
 
 	function revealTaskTarget(target: TaskRevealTarget): boolean {
-		
-		window.removeEventListener("cuelm-open-note", handleOpenNote);
 		clearTargetReveal();
-
 		if ($sourceMode) {
 			if (!source.view) return false;
 			const range = sourceTaskRange(target.sourceOrdinal);
@@ -511,6 +505,9 @@
 	let aiEmptyNote = $state(false);
 	let aiOriginalMarkdown = $state('');
 	let aiMediaPlaceholders = $state<Map<string, string>>(new Map());
+	let aiImages = $state<AiImageCandidate[]>([]);
+	let aiSelectedImages = $state<string[]>([]);
+	let aiDestination = $derived(`${$appConfig?.ai_provider ?? ''}${$appConfig?.ai_provider === 'ollama' ? ` (${$appConfig.ollama_base_url || 'http://localhost:11434'})` : $appConfig?.ai_provider === 'openai_compatible' ? ` (${$appConfig.openai_compatible_base_url || ''})` : ''} · ${$appConfig?.ai_model ?? ''}`);
 	let aiStreamUnlisten: (() => void) | null = null;
 	let aiOrigin: EditorOrigin | null = null;
 	let aiGeneration = 0;
@@ -748,7 +745,7 @@
 		const q = slashMenu.query.toLowerCase();
 		if (!q) return commands;
 		return commands.filter(cmd =>
-			cmd.label.toLowerCase().includes(q) ||
+			($uiLabel(cmd.label).toLocaleLowerCase($locale).includes(q) || cmd.label.toLowerCase().includes(q)) ||
 			cmd.aliases.some(a => a.includes(q))
 		);
 	});
@@ -855,15 +852,15 @@
 		const origin = secretOrigin;
 		if (!origin || !canInsert(origin) || !isOriginCurrent(origin, true)) return;
 		if (!secretModal.text) {
-			secretModal.error = 'Secret text is required.';
+			secretModal.error = uiText("ui.secret_text_is_required");
 			return;
 		}
 		if (!secretModal.passphrase) {
-			secretModal.error = 'Passphrase is required.';
+			secretModal.error = uiText("ui.passphrase_is_required");
 			return;
 		}
 		if (secretModal.passphrase !== secretModal.confirmPassphrase) {
-			secretModal.error = 'Passphrases do not match.';
+			secretModal.error = uiText("ui.passphrases_do_not_match");
 			return;
 		}
 		secretModal.busy = true;
@@ -971,7 +968,7 @@
 		viewerImportBusy = true;
 		try {
 			const raw = $activeNote?.raw;
-			if (raw === undefined || $activeNote?.path !== v.path) throw new Error('Reopen the source note before importing.');
+			if (raw === undefined || $activeNote?.path !== v.path) throw new Error(uiText("error.reopenSource"));
 			const content = await importNote(vaultRoot, v.path, folderPath || null, raw, externalNoteReferences(raw));
 			if (!isCurrent()) return;
 			const dest = content.path;
@@ -984,11 +981,11 @@
 			$activeNotePath = dest;
 			$editorDirty = false;
 			loadNote(dest, content.content);
-			viewerFlash('Imported');
+			viewerFlash(uiText("ui.imported"));
 		} catch (e: any) {
 			if (!isCurrent()) return;
 			console.error('[Viewer] import failed', e);
-			viewerFlash('Import failed: ' + (e?.message || String(e)));
+			viewerFlash(uiText("error.import", { error: (e?.message || String(e)) }));
 		} finally {
 			viewerImportBusy = false;
 		}
@@ -1195,7 +1192,7 @@
 
 		const badge = document.createElement('span');
 		badge.className = 'secret-block-badge';
-		badge.textContent = 'AES-GCM';
+		setUiText(badge, "ui.aes_gcm");
 
 		header.append(title, badge);
 
@@ -1204,13 +1201,13 @@
 
 		const input = document.createElement('input');
 		input.type = 'password';
-		input.placeholder = 'Passphrase';
+		setUiText(input, "ui.passphrase", {}, "placeholder");
 		input.autocomplete = 'current-password';
 		input.size = 1;
 
 		const unlock = document.createElement('button');
 		unlock.type = 'submit';
-		unlock.textContent = 'Unlock';
+		setUiText(unlock, "ui.unlock");
 
 		const error = document.createElement('div');
 		error.className = 'secret-block-error';
@@ -1250,16 +1247,16 @@
 
 		const copy = document.createElement('button');
 		copy.type = 'button';
-		copy.textContent = 'Copy';
+		setUiText(copy, "ui.copy");
 		copy.addEventListener('click', async () => {
 			await navigator.clipboard.writeText(plaintext);
-			copy.textContent = 'Copied';
-			setTimeout(() => { copy.textContent = 'Copy'; }, 1200);
+			setUiText(copy, "ui.copied");
+			setTimeout(() => { setUiText(copy, "ui.copy"); }, 1200);
 		});
 
 		const lock = document.createElement('button');
 		lock.type = 'button';
-		lock.textContent = 'Lock';
+		setUiText(lock, "ui.lock");
 		lock.addEventListener('click', () => renderSecretNode(dom, payload));
 
 		actions.append(copy, lock);
@@ -1456,20 +1453,20 @@
 				const iconBtn = document.createElement('button');
 				iconBtn.type = 'button';
 				iconBtn.className = 'callout-icon';
-				iconBtn.title = 'Change type';
+				setUiText(iconBtn, "ui.change_type", {}, "title");
 				iconBtn.innerHTML = calloutIcon(node.attrs.type);
 
 				const titleInput = document.createElement('input');
 				titleInput.className = 'callout-title';
 				titleInput.value = node.attrs.title || '';
-				titleInput.placeholder = calloutLabel(node.attrs.type);
+				setUiLabel(titleInput, calloutLabel(node.attrs.type), 'placeholder');
 				titleInput.spellcheck = false;
 				titleInput.readOnly = !editor.isEditable;
 
 				const foldBtn = document.createElement('button');
 				foldBtn.type = 'button';
 				foldBtn.className = 'callout-fold';
-				foldBtn.title = 'Fold / unfold';
+				setUiText(foldBtn, "ui.fold_unfold", {}, "title");
 				foldBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>';
 
 				const content = document.createElement('div');
@@ -1526,7 +1523,7 @@
 						if (updated.type.name !== 'callout') return false;
 						apply(updated);
 						iconBtn.innerHTML = calloutIcon(updated.attrs.type);
-						titleInput.placeholder = calloutLabel(updated.attrs.type);
+						setUiLabel(titleInput, calloutLabel(updated.attrs.type), 'placeholder');
 						titleInput.readOnly = !editor.isEditable;
 						if (document.activeElement !== titleInput) titleInput.value = updated.attrs.title || '';
 						return true;
@@ -1802,7 +1799,7 @@
 				const btn = document.createElement('button');
 				btn.type = 'button';
 				btn.className = 'mermaid-render-btn mermaid-render-btn-small';
-				btn.textContent = '↻ Retry';
+				setUiText(btn, "ui.retry_ba143d");
 				btn.onclick = (e) => {
 					e.preventDefault();
 					e.stopPropagation();
@@ -1872,7 +1869,7 @@
 				const blob = await svgToPngBlob(svgEl);
 				const buf = new Uint8Array(await blob.arrayBuffer());
 				await copyPngToClipboard(buf);
-				flashToast(container, 'Copied');
+				flashToast(container, uiText("ui.copied"));
 			} catch (e: any) {
 				console.error('[Mermaid] copy failed', e);
 				// SecurityError fallback: canvas tainted by WebKitGTK — copy SVG source as text instead
@@ -1882,12 +1879,12 @@
 						if (!clone.getAttribute('xmlns')) clone.setAttribute('xmlns', 'http://www.w3.org/2000/svg');
 						const svgString = new XMLSerializer().serializeToString(clone);
 						await navigator.clipboard.writeText(svgString);
-						flashToast(container, 'Copied SVG source (PNG blocked by browser security)');
+						flashToast(container, uiText("ui.copiedSVG"));
 					} catch (e2: any) {
-						flashToast(container, 'Copy failed: ' + (e2?.message || String(e2)));
+						flashToast(container, uiText("error.copy", { error: (e2?.message || String(e2)) }));
 					}
 				} else {
-					flashToast(container, 'Copy failed: ' + (e?.message || String(e)));
+					flashToast(container, uiText("error.copy", { error: (e?.message || String(e)) }));
 				}
 			}
 		}
@@ -1899,8 +1896,8 @@
 				const dest = await saveDialog({
 					defaultPath: 'diagram.png',
 					filters: [
-						{ name: 'PNG Image', extensions: ['png'] },
-						{ name: 'SVG Image', extensions: ['svg'] },
+						{ name: $uiLabel('PNG Image'), extensions: ['png'] },
+						{ name: $uiLabel('SVG Image'), extensions: ['svg'] },
 					],
 				});
 				if (!dest) return;
@@ -1915,14 +1912,14 @@
 					const buf = new Uint8Array(await blob.arrayBuffer());
 					await writeBytesTo(dest, buf);
 				}
-				flashToast(container, 'Saved');
+				flashToast(container, uiText("ui.saved"));
 			} catch (e: any) {
 				console.error('[Mermaid] save failed', e);
 				// SecurityError fallback: canvas tainted by WebKitGTK — tell user to use SVG format
 				if (e instanceof DOMException && (e.name === 'SecurityError' || e.code === 18)) {
-					flashToast(container, 'PNG blocked by browser security — try SVG format');
+					flashToast(container, uiText("error.pngBlocked"));
 				} else {
-					flashToast(container, 'Save failed: ' + (e?.message || String(e)));
+					flashToast(container, uiText("error.save", { error: (e?.message || String(e)) }));
 				}
 			}
 		}
@@ -1935,8 +1932,8 @@
 					const copyBtn = document.createElement('button');
 					copyBtn.type = 'button';
 					copyBtn.className = 'mermaid-render-action';
-					copyBtn.title = 'Copy as PNG';
-					copyBtn.textContent = 'Copy';
+					setUiText(copyBtn, "ui.copy_as_png", {}, "title");
+					setUiText(copyBtn, "ui.copy");
 					copyBtn.onclick = (e) => { e.preventDefault(); e.stopPropagation(); copyDiagram(container); };
 					toolbar.appendChild(copyBtn);
 				}
@@ -1944,14 +1941,14 @@
 				const saveBtn = document.createElement('button');
 				saveBtn.type = 'button';
 				saveBtn.className = 'mermaid-render-action';
-				saveBtn.title = 'Save as PNG or SVG';
-				saveBtn.textContent = 'Save';
+				setUiText(saveBtn, "ui.save_as_png_or_svg", {}, "title");
+				setUiText(saveBtn, "ui.save");
 				saveBtn.onclick = (e) => { e.preventDefault(); e.stopPropagation(); saveDiagram(container); };
 
 				const reRenderBtn = document.createElement('button');
 				reRenderBtn.type = 'button';
 				reRenderBtn.className = 'mermaid-render-action';
-				reRenderBtn.title = 'Re-render diagram';
+				setUiText(reRenderBtn, "ui.re_render_diagram", {}, "title");
 				reRenderBtn.textContent = '↻';
 				reRenderBtn.onclick = (e) => {
 					e.preventDefault();
@@ -1980,13 +1977,13 @@
 
 				const mermaid = await loadMermaid();
 				if (!mermaid) {
-					showError(container, 'Mermaid library failed to load.');
+					showError(container, uiText("error.mermaidLibrary"));
 					return;
 				}
 				try {
 					const parseOk = await mermaid.parse(source, { suppressErrors: true });
 					if (!parseOk) {
-						showError(container, 'Invalid mermaid syntax.');
+						showError(container, uiText("error.mermaidSyntax"));
 						return;
 					}
 					const id = `mermaid-${++renderCounter}`;
@@ -2000,7 +1997,7 @@
 						addToolbar(container, source);
 					}
 				} catch (e: any) {
-					showError(container, 'Render failed: ' + (e?.message || String(e)));
+					showError(container, uiText("error.render", { error: (e?.message || String(e)) }));
 				}
 			}
 
@@ -2021,7 +2018,7 @@
 				const btn = document.createElement('button');
 				btn.type = 'button';
 				btn.className = 'mermaid-render-btn';
-				btn.textContent = '▶  Render diagram';
+				setUiText(btn, "ui.render_diagram");
 				btn.onclick = (e) => {
 					e.preventDefault();
 					e.stopPropagation();
@@ -2066,7 +2063,9 @@
 		addProseMirrorPlugins() {
 			return [new Plugin({
 				key: new PluginKey('placeholder'),
-				props: { decorations: (state) => this.editor.isEditable ? focusedPlaceholderDecorations(state) : null },
+				props: { decorations: (state) => this.editor.isEditable ? focusedPlaceholderDecorations(state, {
+						body: uiText('source.placeholder'), section: uiText('editor.sectionTitle'),
+					}) : null },
 			})];
 		},
 	});
@@ -3616,7 +3615,7 @@
 
 	async function reloadConflictedNote() {
 		if (!saveError?.conflict || !$activeNotePath || !$appConfig?.active_vault) return;
-		if (!window.confirm('Discard your unsaved draft and reload this note from disk? Choose Save a copy to keep the draft.')) return;
+		if (!window.confirm($ui('confirm.discardDraft'))) return;
 		const origin = captureOrigin();
 		try {
 			await saves.idle();
@@ -3860,7 +3859,7 @@
 		historyError = null;
 		historyLoading = false;
 		if (!origin.noteId || !origin.vault) {
-			historyError = 'Version history is unavailable for this note.';
+			historyError = uiText("ui.version_history_is_unavailable_for_this_note");
 			return;
 		}
 		historyLoading = true;
@@ -3868,7 +3867,7 @@
 			const versions = await getNoteVersions(origin.vault, origin.noteId);
 			if (!current()) return;
 			if (!isOriginCurrent(origin)) {
-				historyError = 'The editor changed while versions were loading. Retry to reload them.';
+				historyError = uiText("ui.the_editor_changed_while_versions_were_loading_retry_to_reload_them");
 				return;
 			}
 			historyVersions = versions;
@@ -3876,7 +3875,7 @@
 			if (versions[0]) void previewVersion(versions[0]);
 		} catch (e) {
 			console.error('Failed to load versions:', e);
-			if (current()) historyError = `Could not load versions: ${String(e)}`;
+			if (current()) historyError = uiText("ui.could_not_load_versions", { value0: String(e) });
 		} finally {
 			if (current()) historyLoading = false;
 		}
@@ -3895,13 +3894,13 @@
 			const content = await getNoteVersionContent(origin.vault, origin.noteId, v.timestamp);
 			if (!current()) return;
 			if (!isOriginCurrent(origin)) {
-				historyPreviewError = 'The editor changed while this version was loading. Select it again to retry.';
+				historyPreviewError = uiText("ui.the_editor_changed_while_this_version_was_loading_select_it_ag_206d36");
 				return;
 			}
 			historyPreview = content;
 		} catch (e) {
 			console.error('Failed to load version:', e);
-			if (current()) historyPreviewError = `Could not load this version: ${String(e)}`;
+			if (current()) historyPreviewError = uiText("ui.could_not_load_this_version", { value0: String(e) });
 		} finally {
 			if (current()) historyPreviewLoading = false;
 		}
@@ -3910,7 +3909,7 @@
 	function restoreVersion() {
 		if (!$activeNote || !$activeNotePath || !historySelected || historyPreview === null || historyPreviewLoading) return;
 		if (!canInsert(captureOrigin())) return;
-		if ($editorDirty && !window.confirm('Restore this version and replace your unsaved draft?')) return;
+		if ($editorDirty && !window.confirm($ui('confirm.restoreDraft'))) return;
 		try {
 			const body = splitSnapshot(historyPreview).body;
 			if ($sourceMode) {
@@ -3939,10 +3938,10 @@
 		}
 	}
 
-	const historyDateFormatter = new Intl.DateTimeFormat(undefined, {
+	const historyDateFormatter = $derived(new Intl.DateTimeFormat($locale, {
 		year: 'numeric', month: 'short', day: 'numeric',
 		hour: '2-digit', minute: '2-digit', second: '2-digit', fractionalSecondDigits: 3,
-	});
+	}));
 
 	function formatVersionDate(iso: string): string {
 		const date = new Date(iso);
@@ -4032,7 +4031,10 @@
 		externalOperationBusy = true;
 		source.configure(true, !isMobile && ($appConfig?.show_line_numbers ?? false));
 		editor?.setEditable(false);
+		let released = false;
 		return () => {
+			if (released || editorDisposed) return;
+			released = true;
 			externalOperationBusy = false;
 			source.configure($readOnly || !!$viewerNote, !isMobile && ($appConfig?.show_line_numbers ?? false));
 			editor?.setEditable(!$readOnly && !$viewerNote);
@@ -4086,7 +4088,7 @@
 		loadFailure = path;
 	}
 
-	export function loadNote(path: string, content: string, taskTarget?: TaskRecord) {
+	export function loadNote(path: string, content: string, taskTarget?: TaskRecord, preservePresentation = false) {
 		loadFailure = null;
 		imageRetries.clear();
 		cancelProgressiveLoad();
@@ -4114,10 +4116,7 @@
 		$editorDirty = false;
 		rememberLoadedNoteScroll();
 		const scrollPosition = taskTarget ? undefined : noteScrollPositions.get(path);
-		
-		window.removeEventListener("cuelm-open-note", handleOpenNote);
 		clearTargetReveal();
-
 		const revealRequest = ++targetRevealRequest;
 		const revealTarget = taskTarget ? resolveTaskTarget(taskTarget, content) : null;
 		loadedPath = path;
@@ -4126,15 +4125,13 @@
 		isLoadingNote = true;
 		isLargeDoc = content.length > LARGE_DOC_CHARS;
 		// Viewer mode (external file) always forces read-only. New notes stay editable and
-		// can opt into source mode without changing how existing notes choose their mode.
+		// use the saved editor preference without changing existing notes' presentation.
 		const isViewer = !!get(viewerNote);
 		const isNewNote = $activeNote?.meta.title === 'Untitled' && !content.replace(/^---[\s\S]*?---\s*/, '').trim();
-		if (isNewNote && ($appConfig?.new_notes_in_source_mode ?? false)) {
-			$sourceMode = true;
-		}
+		if (isNewNote && !isViewer && !preservePresentation) selectEditorMode(newNoteEditorMode($appConfig));
 		lastSourceMode = $sourceMode;
 		const shouldBeReadOnly = isViewer || isTrashedNote(path, $appConfig?.active_vault)
-			? true : (isNewNote ? false : ($appConfig?.default_view_mode ?? false));
+			? true : preservePresentation ? $readOnly : (isNewNote ? false : ($appConfig?.default_view_mode ?? false));
 		$readOnly = shouldBeReadOnly;
 		if (editor) editor.setEditable(!shouldBeReadOnly && !externalOperationBusy);
 		const editorBody = editorElement?.closest('.editor-body') as HTMLElement | null;
@@ -4688,7 +4685,7 @@
 				endToolbarCustomization(!!formattingBar?.contains(document.activeElement));
 			}
 		} catch (error) {
-			if (session === toolbarEditSession) toolbarSaveError = `Could not save toolbar: ${String(error)}`;
+			if (session === toolbarEditSession) toolbarSaveError = uiText("ui.could_not_save_toolbar", { value0: String(error) });
 		} finally {
 			toolbarSaving = false;
 			toolbarPendingPreference = null;
@@ -4744,7 +4741,7 @@
 	function customizeToolbarItem(node: HTMLElement, options: { id: ToolbarButtonId; selected: boolean }) {
 		const button = node.querySelector('button');
 		const update = ({ id, selected }: typeof options) => {
-			button?.setAttribute('aria-label', toolbarLabels[id]);
+			if (button) setUiLabel(button, toolbarLabels[id], 'aria-label');
 			button?.setAttribute('aria-pressed', String(selected));
 			button?.setAttribute('aria-describedby', toolbarHintId);
 			button?.setAttribute('aria-keyshortcuts', 'ArrowLeft ArrowRight ArrowUp ArrowDown Home End');
@@ -5158,10 +5155,7 @@
 
 	export function openNoteSearch(replace = false) {
 		++targetRevealRequest;
-		
-		window.removeEventListener("cuelm-open-note", handleOpenNote);
 		clearTargetReveal();
-
 		// Asking for replace while find is already showing moves on to the replace field.
 		const toReplace = replace && noteSearchOpen && !!noteSearchQuery;
 		noteSearchOpen = true;
@@ -5855,6 +5849,9 @@
 				},
 			},
 			onTransaction: ({ transaction, appendedTransactions }) => {
+				// Source-mode DOM teardown can synchronously emit a rich-editor blur.
+				// Do not mutate menu state from that template teardown transaction.
+				if ($sourceMode && !transaction.docChanged && !appendedTransactions.some(tr => tr.docChanged)) return;
 				if (imageToolbar && (transaction.docChanged || appendedTransactions.some((tr) => tr.docChanged))) closeStaleImageToolbar();
 				if (showOutline && !$sourceMode && outlineOrigin && isOriginCurrent(outlineOrigin)
 					&& (transaction.docChanged || appendedTransactions.some(tr => tr.docChanged))) {
@@ -6527,7 +6524,8 @@
 			const btn = document.createElement('button');
 			btn.type = 'button';
 			btn.className = 'callout-type-option';
-			btn.innerHTML = `<span class="callout-type-icon" style="color: rgb(var(--callout-${item.type}))">${calloutIcon(item.type, 16)}</span><span>${item.label}</span>`;
+			btn.innerHTML = `<span class="callout-type-icon" style="color: rgb(var(--callout-${item.type}))">${calloutIcon(item.type, 16)}</span><span></span>`;
+			setUiLabel(btn.lastElementChild!, item.label);
 			btn.addEventListener('mousedown', (e) => e.preventDefault());
 			btn.addEventListener('click', () => { onPick(item.type); close(); });
 			menu.appendChild(btn);
@@ -6537,13 +6535,14 @@
 		customBtn.type = 'button';
 		customBtn.className = 'callout-type-option';
 		customBtn.innerHTML = '<span class="callout-type-icon" style="color: var(--text-secondary)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg></span><span>Custom…</span>';
+		setUiText(customBtn.lastElementChild!, 'ui.custom_type');
 		customBtn.addEventListener('mousedown', (e) => e.preventDefault());
 		customBtn.addEventListener('click', () => {
 			menu.classList.add('is-custom');
 			menu.innerHTML = '';
 			const input = document.createElement('input');
 			input.className = 'callout-type-custom-input';
-			input.placeholder = 'Type name, then Enter';
+			setUiText(input, "ui.type_name_then_enter", {}, "placeholder");
 			input.spellcheck = false;
 			input.addEventListener('keydown', (e) => {
 				if (e.key === 'Enter') {
@@ -6814,11 +6813,19 @@
 
 	// ── AI Actions ──
 
+	function protectCurrentAiText() {
+		const protectedText = protectAiMedia(aiSelectedText);
+		aiSelectedText = protectedText.text;
+		aiMediaPlaceholders = protectedText.media;
+	}
+
 	function openAiMenu() {
 		if ((!$sourceMode && !editor) || $readOnly || $viewerNote) return;
 		closeAiMenu();
 		aiOrigin = captureOrigin();
 		closeTextContextMenu();
+		const fullNote = $sourceMode ? restoreTitleH1(source.state.doc.toString()) : editorToMarkdown();
+		if (aiOrigin.path && aiOrigin.vault) aiImages = aiImageCandidates(fullNote, aiOrigin.path, aiOrigin.vault);
 
 		if ($sourceMode) {
 			const { from: start, to: end } = source.state.selection.main;
@@ -6850,7 +6857,8 @@
 				aiSelectionFrom = 0;
 				aiSelectionTo = 0;
 			}
-			aiMenu = isMobile ? { x: 0, y: 0 } : { x: Math.max(4, window.innerWidth / 2 - 110), y: 100 };
+			protectCurrentAiText();
+			aiMenu = isMobile ? { x: 0, y: 0 } : { x: Math.max(4, window.innerWidth / 2 - 160), y: 100 };
 			return;
 		}
 		if (!editor) return;
@@ -6861,7 +6869,9 @@
 		const hasSelection = from !== to;
 
 		if (hasSelection) {
-			const selectedText = editor.state.doc.textBetween(from, to, '\n');
+			const selectionContainer = document.createElement('div');
+			selectionContainer.appendChild(DOMSerializer.fromSchema(editor.schema).serializeFragment(editor.state.selection.content().content));
+			const selectedText = htmlToMarkdown(selectionContainer.innerHTML);
 			if (!selectedText.trim()) return;
 			aiSelectionFrom = from;
 			aiSelectionTo = to;
@@ -6881,35 +6891,13 @@
 				aiSelectionTo = editor.state.doc.content.size;
 				aiOriginalMarkdown = fullMarkdown;
 
-				// Replace images, PDF embeds, and HTML tags with placeholders so AI doesn't mangle them
-				const placeholders = new Map<string, string>();
-				let idx = 0;
-				let textForAi = fullMarkdown;
-				// Images: ![alt](src)
-				textForAi = textForAi.replace(/!\[[^\]]*\]\([^)]*\)/g, (match) => {
-					const key = `__MEDIA_${idx++}__`;
-					placeholders.set(key, match);
-					return key;
-				});
-				// PDF embeds
-				textForAi = textForAi.replace(/<div[^>]*class="pdf-embed"[^>]*>[\s\S]*?<\/div>/gi, (match) => {
-					const key = `__MEDIA_${idx++}__`;
-					placeholders.set(key, match);
-					return key;
-				});
-				// Inline HTML img tags
-				textForAi = textForAi.replace(/<img[^>]*\/?>/gi, (match) => {
-					const key = `__MEDIA_${idx++}__`;
-					placeholders.set(key, match);
-					return key;
-				});
-				aiMediaPlaceholders = placeholders;
-				aiSelectedText = textForAi.trim();
+				aiSelectedText = fullMarkdown.trim();
 				if (!aiSelectedText) return;
 				aiWholeNote = true;
 			}
 		}
 
+		protectCurrentAiText();
 		aiResult = null;
 		aiError = null;
 		aiLoading = false;
@@ -6958,13 +6946,15 @@
 		aiEmptyNote = false;
 		aiOriginalMarkdown = '';
 		aiMediaPlaceholders = new Map();
+		aiImages = [];
+		aiSelectedImages = [];
 	}
 
 	async function runAiAction(action: string, customPrompt?: string) {
 		const origin = aiOrigin;
 		if (!origin || !canInsert(origin)) return;
 		if (!isOriginCurrent(origin, true)) {
-			aiError = 'The note changed. Reopen AI Actions to use its current content.';
+			aiError = uiText("ui.the_note_changed_reopen_ai_actions_to_use_its_current_content");
 			return;
 		}
 		if (!aiEmptyNote && !aiSelectedText.trim()) return;
@@ -7003,7 +6993,11 @@
 			});
 			if (!current()) { stop(); return; }
 			aiStreamUnlisten = stop;
-			await aiAsk(action, selectedText, customPrompt ?? null, requestId);
+			const paths = aiImages.filter(image => aiSelectedImages.includes(image.path)).map(image => image.path);
+			const provider = $appConfig?.ai_provider ?? null;
+			await aiAsk(action, selectedText, customPrompt ?? null, requestId,
+				paths.length ? { vaultPath: origin.vault!, notePath: origin.path!, paths } : null,
+				{ provider, model: $appConfig?.ai_model ?? '', baseUrl: provider === 'ollama' ? $appConfig?.ollama_base_url ?? null : provider === 'openai_compatible' ? $appConfig?.openai_compatible_base_url ?? null : null });
 		} catch (e) {
 			stop?.();
 			if (!current()) return;
@@ -7015,19 +7009,21 @@
 
 	async function aiApplyResult() {
 		const origin = aiOrigin;
-		if (!origin || !aiResult || aiLoading || !canInsert(origin)) return;
+		if (!origin || !aiResult || aiLoading || aiError || !canInsert(origin)) return;
 		if (!isOriginCurrent(origin, true)) {
-			aiError = 'The note changed. Reopen AI Actions before applying a new result.';
+			aiError = uiText("ui.the_note_changed_reopen_ai_actions_before_applying_a_new_result");
 			return;
 		}
 		const generation = aiGeneration;
-		const result = aiResult;
+		const result = restoreAiMedia(aiResult, aiMediaPlaceholders);
+		if (result === null) { aiError = uiText('ai.mediaMismatch'); return; }
 		if (origin.path && origin.noteId && !aiEmptyNote) {
 			try {
 				if (!(await forceSave()) || !isOriginCurrent(origin, true) || generation !== aiGeneration) return;
 				await createVersion(origin.vault!, origin.path, origin.noteId);
 			} catch (e) {
-				console.error('Failed to create version before AI apply:', e);
+				aiError = uiText('error.save', { error: String(e) });
+				return;
 			}
 		}
 		if (!isOriginCurrent(origin, true) || !canInsert(origin) || generation !== aiGeneration) return;
@@ -7059,13 +7055,8 @@
 			}
 			editor.commands.setContent(markdownToHtml(body));
 		} else if (aiWholeNote) {
-			// Restore media placeholders back to original markdown
-			let finalMarkdown = result;
-			for (const [key, original] of aiMediaPlaceholders) {
-				finalMarkdown = finalMarkdown.replace(key, original);
-			}
-			// Replace entire document - convert markdown back to HTML for TipTap
-			editor.commands.setContent(markdownToHtml(finalMarkdown));
+			// Media have already been validated/restored for both editor modes.
+			editor.commands.setContent(markdownToHtml(result));
 		} else {
 			// Replace the selected range with the AI result (convert markdown → HTML so TipTap renders it properly)
 			const html = markdownToHtml(result);
@@ -7089,6 +7080,23 @@
 		if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(href)) return null;
 		const path = resolveFileReference(href, $activeNotePath, currentNoteAssetRoot()).path;
 		return path.endsWith('.md') ? path : null;
+	}
+
+	function openPreviewLink(href: string) {
+		if (href.startsWith('#')) {
+			let target = href.slice(1);
+			try { target = decodeURIComponent(target); } catch { return; }
+			const slug = (text: string) => text.toLocaleLowerCase().replace(/\s+/g, '-');
+			const heading = sourceHeadings(source.state).find(item => slug(item.text) === slug(target));
+			if (heading) { source.select(heading.pos, heading.pos, true); source.focus(); }
+			return;
+		}
+		const notePath = resolveNoteHref(href);
+		if (notePath) { navigateToWikiLink(notePath, ''); return; }
+		if (/^(https?:|mailto:)/i.test(href)) void openUrl(href).catch(console.error);
+		else if (!/^[a-z][\w+.-]*:/i.test(href) || /^[a-z]:[\\/]/i.test(href)) {
+			void openFile(resolveHrefToAbsPath(href)).catch(console.error);
+		}
 	}
 
 	function linkMenuOpen() {
@@ -7610,7 +7618,32 @@
 	window.addEventListener('helixnotes-open-note', handleOpenNote);
 	window.addEventListener('cuelm-open-note', handleOpenNote);
 
+	const mcpEditorReady = () => !(editorDisposed || isLoadingNote || pendingContent !== null || !$activeNotePath || !loadedPath || $editorDirty || externalOperationBusy || source.view?.compositionStarted || source.view?.composing || editor?.view.composing);
+	const unregisterMcpEditor = isMobile ? () => {} : registerMcpEditor(async () => {
+		if (!mcpEditorReady()) return null;
+		const path = $activeNotePath!, vault = $appConfig?.active_vault;
+		const session = saves.capture();
+		const release = await beginPathMutation();
+		if (!release) return null;
+		let finished = false;
+		return async (finish) => {
+			if (finished) return; finished = true;
+			try {
+				const normalize = (value: string) => value.replace(/\\/g, '/');
+				if (vault && finish.vaultPath === vault && normalize(finish.path) === normalize(path) && !editorDisposed && $activeNotePath === path && saves.isCurrentSession(session) && !$editorDirty) {
+					const content = await readNote(vault, path);
+					if (!editorDisposed && $activeNotePath === path && saves.isCurrentSession(session) && !$editorDirty && content.raw !== $activeNote?.raw) {
+						$activeNote = content;
+						loadNote(path, content.content, undefined, true);
+					}
+				}
+			} catch { if (!editorDisposed) flagExternalConflict(); }
+			finally { release(); }
+		};
+	}, mcpEditorReady);
+
 	onDestroy(() => {
+		unregisterMcpEditor();
 		cancelProgressiveLoad();
 		void flushSave();
 		closeAiMenu();
@@ -7624,10 +7657,8 @@
 		searchRevealedDetails.clear();
 		if (wikiTitleRefreshTimer !== null) clearTimeout(wikiTitleRefreshTimer);
 		window.removeEventListener('helixnotes-open-note', handleOpenNote);
-		
-		window.removeEventListener("cuelm-open-note", handleOpenNote);
+		window.removeEventListener('cuelm-open-note', handleOpenNote);
 		clearTargetReveal();
-
 		destroyEditor();
 		unlistenFileChange?.();
 		unlistenPathMoved?.();
@@ -7638,7 +7669,7 @@
 </script>
 
 {#snippet tableSizePicker()}
-	<div class="fmt-dropdown table-picker-dropdown" role="dialog" aria-label="Formatting options" use:positionFormattingPopup>
+	<div class="fmt-dropdown table-picker-dropdown" role="dialog" aria-label={$ui("ui.formatting_options")} use:positionFormattingPopup>
 		<div class="table-picker-grid">
 			{#each Array(8) as _, r}
 				{#each Array(10) as _, c}
@@ -7646,7 +7677,7 @@
 						type="button"
 						class="table-picker-cell"
 						class:active={r < tablePickerHover.rows && c < tablePickerHover.cols}
-						aria-label={`Insert ${r + 1} by ${c + 1} table`}
+						aria-label={$ui("ui.insert_by_table", { value0: r + 1, value1: c + 1 })}
 						onmouseenter={() => tablePickerHover = { rows: r + 1, cols: c + 1 }}
 						onclick={() => insertTable(r + 1, c + 1)}
 					></button>
@@ -7654,7 +7685,7 @@
 			{/each}
 		</div>
 		<div class="table-picker-label">
-			{tablePickerHover.rows > 0 ? `${tablePickerHover.rows} x ${tablePickerHover.cols}` : 'Select size'}
+			{tablePickerHover.rows > 0 ? `${tablePickerHover.rows} x ${tablePickerHover.cols}` : $ui("ui.select_size")}
 		</div>
 	</div>
 {/snippet}
@@ -7662,59 +7693,59 @@
 {#snippet toolbarControl(id: ToolbarButtonId)}
 	{#if id === 'insert'}
 		<div class="fmt-dropdown-wrap">
-			<button class="fmt-btn insert-btn" onclick={(e) => toggleFormattingPicker(e, 'insert')} aria-haspopup="dialog" aria-expanded={insertDropdown || (isMobile && tablePickerOpen)} title="Insert">
+			<button class="fmt-btn insert-btn" onclick={(e) => toggleFormattingPicker(e, 'insert')} aria-haspopup="dialog" aria-expanded={insertDropdown || (isMobile && tablePickerOpen)} title={$ui("ui.insert")}>
 				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg>
 			</button>
 			{#if insertDropdown}
-				<div class="fmt-dropdown insert-dropdown" role="dialog" aria-label="Formatting options" use:positionFormattingPopup>
+				<div class="fmt-dropdown insert-dropdown" role="dialog" aria-label={$ui("ui.formatting_options")} use:positionFormattingPopup>
 					<button onclick={() => openAssetPicker('insert-image-input')}>
 						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="18" x="3" y="3" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.086-3.086a2 2 0 00-2.828 0L6 21"/></svg>
-						Image
+						{$ui("ui.image")}
 					</button>
 					{#if isAndroid}
 						<button onclick={() => openAssetPicker('insert-camera-input')}>
 							<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 00-2 2v9a2 2 0 002 2h16a2 2 0 002-2V9a2 2 0 00-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg>
-							Take Photo
+							{$ui("ui.take_photo")}
 						</button>
 					{/if}
 					<button onclick={() => openAssetPicker('insert-file-input')}>
 						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 22a2 2 0 01-2-2V4a2 2 0 012-2h8a2.4 2.4 0 011.704.706l3.588 3.588A2.4 2.4 0 0120 8v12a2 2 0 01-2 2z"/><path d="M14 2v5a1 1 0 001 1h5"/></svg>
-						File
+						{$ui("ui.file")}
 					</button>
 					{#if isMobile}
 					<button onclick={() => { insertDropdown = false; editor?.chain().focus().toggleCodeBlock().run(); }}>
 						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m10 9-3 3 3 3"/><path d="m14 15 3-3-3-3"/><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
-						Code Block
+						{$ui("ui.code_block")}
 					</button>
 					<button onclick={() => { insertDropdown = false; editor?.chain().focus().toggleBlockquote().run(); }}>
 						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 5H3"/><path d="M21 12H8"/><path d="M21 19H8"/><path d="M3 12v7"/></svg>
-						Quote
+						{$ui("ui.quote")}
 					</button>
 					<button onclick={(e) => toggleFormattingPicker(e, 'table')}>
 						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/></svg>
-						Table
+						{$ui("ui.table")}
 					</button>
 					<button onclick={() => { insertDropdown = false; insertDetails(); }}>
 						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="13" height="7" x="8" y="3" rx="1"/><path d="m2 9 3 3-3 3"/><rect width="13" height="7" x="8" y="14" rx="1"/></svg>
-						Collapsible Section
+						{$ui("ui.collapsible_section")}
 					</button>
 					<button onclick={() => { insertDropdown = false; insertCallout('note'); }}>
 						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><line x1="7" y1="5" x2="7" y2="19"/></svg>
-						Callout
+						{$ui("ui.callout")}
 					</button>
 					{/if}
 					<button onclick={() => { insertDropdown = false; editor?.chain().focus().setHorizontalRule().run(); }}>
 						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>
-						Horizontal Rule
+						{$ui("ui.horizontal_rule")}
 					</button>
 					<button onclick={() => { insertDropdown = false; openSecretInsert(); }}>
 						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="10" rx="2"/><path d="M7 11V7a5 5 0 0110 0v4"/></svg>
-						Secret
+						{$ui("ui.secret")}
 					</button>
 					{#if !isMobile}
 					<button onclick={() => { insertDropdown = false; insertTimestamp('datetime'); }}>
 						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h6"/><line x1="3" y1="10" x2="21" y2="10"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="16" y1="2" x2="16" y2="6"/><circle cx="18" cy="17" r="4"/><path d="M18 15.5v1.5l1 1"/></svg>
-						Date &amp; Time
+						{$ui("ui.date_time")}
 					</button>
 					{/if}
 				</div>
@@ -7725,45 +7756,45 @@
 		</div>
 	{:else if id === 'heading'}
 		<div class="fmt-dropdown-wrap">
-			<button class="fmt-btn" class:active={isEditorActive('heading')} onclick={(e) => toggleFormattingPicker(e, 'heading')} aria-haspopup="dialog" aria-expanded={headingDropdown} title="Heading">
+			<button class="fmt-btn" class:active={isEditorActive('heading')} onclick={(e) => toggleFormattingPicker(e, 'heading')} aria-haspopup="dialog" aria-expanded={headingDropdown} title={$ui("ui.heading")}>
 				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 12h12"/><path d="M6 20V4"/><path d="M18 20V4"/></svg>
 			</button>
 			{#if headingDropdown}
-				<div class="fmt-dropdown" role="dialog" aria-label="Formatting options" use:positionFormattingPopup>
-					<button class:active={isEditorActive('heading', { level: 1 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 1 }).run(); headingDropdown = false; }}>Heading 1</button>
-					<button class:active={isEditorActive('heading', { level: 2 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 2 }).run(); headingDropdown = false; }}>Heading 2</button>
-					<button class:active={isEditorActive('heading', { level: 3 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 3 }).run(); headingDropdown = false; }}>Heading 3</button>
-					{#if !isMobile}<button class:active={isEditorActive('heading', { level: 4 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 4 }).run(); headingDropdown = false; }}>Heading 4</button>{/if}
-					<button class:active={isEditorActive('paragraph')} onclick={() => { editor?.chain().focus().setParagraph().run(); headingDropdown = false; }}>Paragraph</button>
+				<div class="fmt-dropdown" role="dialog" aria-label={$ui("ui.formatting_options")} use:positionFormattingPopup>
+					<button class:active={isEditorActive('heading', { level: 1 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 1 }).run(); headingDropdown = false; }}>{$ui("ui.heading_1")}</button>
+					<button class:active={isEditorActive('heading', { level: 2 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 2 }).run(); headingDropdown = false; }}>{$ui("ui.heading_2")}</button>
+					<button class:active={isEditorActive('heading', { level: 3 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 3 }).run(); headingDropdown = false; }}>{$ui("ui.heading_3")}</button>
+					{#if !isMobile}<button class:active={isEditorActive('heading', { level: 4 })} onclick={() => { editor?.chain().focus().toggleHeading({ level: 4 }).run(); headingDropdown = false; }}>{$ui("ui.heading_4")}</button>{/if}
+					<button class:active={isEditorActive('paragraph')} onclick={() => { editor?.chain().focus().setParagraph().run(); headingDropdown = false; }}>{$ui("ui.paragraph")}</button>
 				</div>
 			{/if}
 		</div>
 	{:else if id === 'bold'}
-		<button class="fmt-btn" class:active={isEditorActive('bold')} onclick={() => editor?.chain().focus().toggleBold().run()} title={isMobile ? "Bold" : `Bold (${modKey}+B)`}>
+		<button class="fmt-btn" class:active={isEditorActive('bold')} onclick={() => editor?.chain().focus().toggleBold().run()} title={isMobile ? $ui("ui.bold") : $ui("ui.bold_b", { value0: modKey })}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 12h9a4 4 0 010 8H7a1 1 0 01-1-1V5a1 1 0 011-1h7a4 4 0 010 8"/></svg>
 		</button>
 	{:else if id === 'italic'}
-		<button class="fmt-btn" class:active={isEditorActive('italic')} onclick={() => editor?.chain().focus().toggleItalic().run()} title={isMobile ? "Italic" : `Italic (${modKey}+I)`}>
+		<button class="fmt-btn" class:active={isEditorActive('italic')} onclick={() => editor?.chain().focus().toggleItalic().run()} title={isMobile ? $ui("ui.italic") : $ui("ui.italic_i", { value0: modKey })}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" x2="10" y1="4" y2="4"/><line x1="14" x2="5" y1="20" y2="20"/><line x1="15" x2="9" y1="4" y2="20"/></svg>
 		</button>
 	{:else if id === 'underline'}
-		<button class="fmt-btn" class:active={isEditorActive('underline')} onclick={() => editor?.chain().focus().toggleUnderline().run()} title={isMobile ? "Underline" : `Underline (${modKey}+U)`}>
+		<button class="fmt-btn" class:active={isEditorActive('underline')} onclick={() => editor?.chain().focus().toggleUnderline().run()} title={isMobile ? $ui("ui.underline") : $ui("ui.underline_u", { value0: modKey })}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 4v6a6 6 0 0012 0V4"/><line x1="4" x2="20" y1="20" y2="20"/></svg>
 		</button>
 	{:else if id === 'strike'}
-		<button class="fmt-btn" class:active={isEditorActive('strike')} onclick={() => editor?.chain().focus().toggleStrike().run()} title={isMobile ? "Strikethrough" : `Strikethrough (${modKey}+Shift+X)`}>
+		<button class="fmt-btn" class:active={isEditorActive('strike')} onclick={() => editor?.chain().focus().toggleStrike().run()} title={isMobile ? $ui("ui.strikethrough") : $ui("ui.strikethrough_shift_x", { value0: modKey })}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4H9a3 3 0 00-2.83 4"/><path d="M14 12a4 4 0 010 8H6"/><line x1="4" x2="20" y1="12" y2="12"/></svg>
 		</button>
 	{:else if id === 'text-color'}
 		<div class="fmt-dropdown-wrap">
-			<button class="fmt-btn" onclick={(e) => toggleFormattingPicker(e, 'text-color')} aria-haspopup="dialog" aria-expanded={colorDropdown} title="Text Color">
+			<button class="fmt-btn" onclick={(e) => toggleFormattingPicker(e, 'text-color')} aria-haspopup="dialog" aria-expanded={colorDropdown} title={$ui("ui.text_color")}>
 				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 20h16"/><path d="m6 16 6-12 6 12"/><path d="M8 12h8"/></svg>
 				<span class="color-indicator" style="background: {getEditorAttributes('textStyle').color || 'var(--accent)'}"></span>
 			</button>
 			{#if colorDropdown}
-				<div class="fmt-dropdown color-grid-dropdown" role="dialog" aria-label="Formatting options" use:positionFormattingPopup>
+				<div class="fmt-dropdown color-grid-dropdown" role="dialog" aria-label={$ui("ui.formatting_options")} use:positionFormattingPopup>
 					{#each textColors as color}
-						<button class="color-swatch" title={color.name} onclick={() => setTextColor(color.value)} style="background: {color.value || 'var(--text-primary)'}">
+						<button class="color-swatch" title={$uiLabel(color.name)} onclick={() => setTextColor(color.value)} style="background: {color.value || 'var(--text-primary)'}">
 							{#if (color.value === '' && !getEditorAttributes('textStyle').color) || getEditorAttributes('textStyle').color === color.value}
 								<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
 							{/if}
@@ -7773,52 +7804,52 @@
 			{/if}
 		</div>
 	{:else if id === 'link'}
-		<button class="fmt-btn" class:active={isEditorActive('link')} onclick={addLinkFromToolbar} title={isMobile ? "Link" : `Link (${modKey}+K)`}>
+		<button class="fmt-btn" class:active={isEditorActive('link')} onclick={addLinkFromToolbar} title={isMobile ? $ui("ui.link") : $ui("ui.link_k", { value0: modKey })}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg>
 		</button>
 	{:else if id === 'bullet-list'}
-		<button class="fmt-btn" class:active={isEditorActive('bulletList')} onclick={toggleBulletList} title={isMobile ? "Bullet List" : `Bullet List (${modKey}+Shift+8)`}>
+		<button class="fmt-btn" class:active={isEditorActive('bulletList')} onclick={toggleBulletList} title={isMobile ? $ui("ui.bullet_list") : $ui("ui.bullet_list_shift_8", { value0: modKey })}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h.01"/><path d="M3 12h.01"/><path d="M3 19h.01"/><path d="M8 5h13"/><path d="M8 12h13"/><path d="M8 19h13"/></svg>
 		</button>
 	{:else if id === 'ordered-list'}
-		<button class="fmt-btn" class:active={isEditorActive('orderedList')} onclick={() => editor?.chain().focus().toggleOrderedList().run()} title={isMobile ? "Numbered List" : `Ordered List (${modKey}+Shift+7)`}>
+		<button class="fmt-btn" class:active={isEditorActive('orderedList')} onclick={() => editor?.chain().focus().toggleOrderedList().run()} title={isMobile ? $ui("ui.numbered_list") : $ui("ui.ordered_list_shift_7", { value0: modKey })}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5h10"/><path d="M11 12h10"/><path d="M11 19h10"/><path d="M4 4h1v5"/><path d="M4 9h2"/><path d="M6.5 20H3.4c0-1 2.6-1.925 2.6-3.5a1.5 1.5 0 00-2.6-1.02"/></svg>
 		</button>
 	{:else if id === 'task-list'}
-		<button class="fmt-btn" class:active={isEditorActive('taskList')} onclick={toggleTaskList} title={isMobile ? "Task List" : `Task List (${modKey}+Shift+9)`}>
+		<button class="fmt-btn" class:active={isEditorActive('taskList')} onclick={toggleTaskList} title={isMobile ? $ui("ui.task_list") : $ui("ui.task_list_shift_9", { value0: modKey })}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 5h8"/><path d="M13 12h8"/><path d="M13 19h8"/><path d="m3 17 2 2 4-4"/><path d="m3 7 2 2 4-4"/></svg>
 		</button>
 	{:else if id === 'undo'}
-		<button class="fmt-btn" onclick={() => editor?.chain().focus().undo().run()} title={isMobile ? "Undo" : `Undo (${modKey}+Z)`}>
+		<button class="fmt-btn" onclick={() => editor?.chain().focus().undo().run()} title={isMobile ? $ui("ui.undo") : $ui("ui.undo_z", { value0: modKey })}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 015.5 5.5 5.5 5.5 0 01-5.5 5.5H11"/></svg>
 		</button>
 	{:else if id === 'redo'}
-		<button class="fmt-btn" onclick={() => editor?.chain().focus().redo().run()} title={isMobile ? "Redo" : `Redo (${modKey}+Shift+Z)`}>
+		<button class="fmt-btn" onclick={() => editor?.chain().focus().redo().run()} title={isMobile ? $ui("ui.redo") : $ui("ui.redo_shift_z", { value0: modKey })}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m15 14 5-5-5-5"/><path d="M20 9H9.5A5.5 5.5 0 004 14.5 5.5 5.5 0 009.5 20H13"/></svg>
 		</button>
 	{:else if id === 'inline-code'}
-		<button class="fmt-btn" class:active={isEditorActive('code')} onclick={() => editor?.chain().focus().toggleCode().run()} title={`Inline Code (${modKey}+E)`}>
+		<button class="fmt-btn" class:active={isEditorActive('code')} onclick={() => editor?.chain().focus().toggleCode().run()} title={$ui("ui.inline_code_e", { value0: modKey })}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/></svg>
 		</button>
 	{:else if id === 'code-block'}
-		<button class="fmt-btn" class:active={isEditorActive('codeBlock')} onclick={() => editor?.chain().focus().toggleCodeBlock().run()} title={`Code Block (${modKey}+Alt+C)`}>
+		<button class="fmt-btn" class:active={isEditorActive('codeBlock')} onclick={() => editor?.chain().focus().toggleCodeBlock().run()} title={$ui("ui.code_block_alt_c", { value0: modKey })}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m10 9-3 3 3 3"/><path d="m14 15 3-3-3-3"/><rect x="3" y="3" width="18" height="18" rx="2"/></svg>
 		</button>
 	{:else if id === 'quote'}
-		<button class="fmt-btn" class:active={isEditorActive('blockquote')} onclick={() => editor?.chain().focus().toggleBlockquote().run()} title={`Quote (${modKey}+Shift+B)`}>
+		<button class="fmt-btn" class:active={isEditorActive('blockquote')} onclick={() => editor?.chain().focus().toggleBlockquote().run()} title={$ui("ui.quote_shift_b", { value0: modKey })}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 5H3"/><path d="M21 12H8"/><path d="M21 19H8"/><path d="M3 12v7"/></svg>
 		</button>
 	{:else if id === 'details'}
-		<button class="fmt-btn" class:active={isEditorActive('details')} onclick={() => insertDetails()} title={`Collapsible Section (${modKey}+.)`}>
+		<button class="fmt-btn" class:active={isEditorActive('details')} onclick={() => insertDetails()} title={$ui("ui.collapsible_section_9f8c59", { value0: modKey })}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="13" height="7" x="8" y="3" rx="1"/><path d="m2 9 3 3-3 3"/><rect width="13" height="7" x="8" y="14" rx="1"/></svg>
 		</button>
 	{:else if id === 'callout'}
-		<button class="fmt-btn" class:active={isEditorActive('callout')} onclick={() => insertCallout('note')} title="Callout">
+		<button class="fmt-btn" class:active={isEditorActive('callout')} onclick={() => insertCallout('note')} title={$ui("ui.callout")}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><line x1="7" y1="5" x2="7" y2="19"/></svg>
 		</button>
 	{:else if id === 'table'}
 		<div class="fmt-dropdown-wrap">
-			<button class="fmt-btn" onclick={(e) => toggleFormattingPicker(e, 'table')} aria-haspopup="dialog" aria-expanded={tablePickerOpen} title="Insert Table">
+			<button class="fmt-btn" onclick={(e) => toggleFormattingPicker(e, 'table')} aria-haspopup="dialog" aria-expanded={tablePickerOpen} title={$ui("ui.insert_table")}>
 				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M3 9h18"/><path d="M3 15h18"/></svg>
 			</button>
 			{#if tablePickerOpen}
@@ -7826,30 +7857,30 @@
 			{/if}
 		</div>
 	{:else if id === 'horizontal-rule'}
-		<button class="fmt-btn" onclick={() => editor?.chain().focus().setHorizontalRule().run()} title="Horizontal Rule">
+		<button class="fmt-btn" onclick={() => editor?.chain().focus().setHorizontalRule().run()} title={$ui("ui.horizontal_rule")}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 12h14"/></svg>
 		</button>
 	{:else if id === 'highlight'}
 		{#if isMobile}
-			<button class="fmt-btn" class:active={isEditorActive('highlight')} onclick={() => editor?.chain().focus().toggleHighlight({ color: highlightColors[0].value }).run()} title="Highlight">
+			<button class="fmt-btn" class:active={isEditorActive('highlight')} onclick={() => editor?.chain().focus().toggleHighlight({ color: highlightColors[0].value }).run()} title={$ui("ui.highlight")}>
 				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 11-6 6v3h9l3-3"/><path d="m22 12-4.6 4.6a2 2 0 01-2.8 0l-5.2-5.2a2 2 0 010-2.8L14 4"/></svg>
 			</button>
 		{:else}
 			<div class="fmt-dropdown-wrap">
-				<button class="fmt-btn" class:active={isEditorActive('highlight')} onclick={(e) => toggleFormattingPicker(e, 'highlight')} aria-haspopup="dialog" aria-expanded={highlightDropdown} title={isMobile ? "Highlight" : `Highlight (${modKey}+Shift+H)`}>
+				<button class="fmt-btn" class:active={isEditorActive('highlight')} onclick={(e) => toggleFormattingPicker(e, 'highlight')} aria-haspopup="dialog" aria-expanded={highlightDropdown} title={isMobile ? $ui("ui.highlight") : $ui("ui.highlight_shift_h", { value0: modKey })}>
 					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m9 11-6 6v3h9l3-3"/><path d="m22 12-4.6 4.6a2 2 0 01-2.8 0l-5.2-5.2a2 2 0 010-2.8L14 4"/></svg>
 					<span class="color-indicator" style="background: {getEditorAttributes('highlight').color || 'var(--accent)'}"></span>
 				</button>
 				{#if highlightDropdown}
-					<div class="fmt-dropdown color-grid-dropdown" role="dialog" aria-label="Formatting options" use:positionFormattingPopup>
+					<div class="fmt-dropdown color-grid-dropdown" role="dialog" aria-label={$ui("ui.formatting_options")} use:positionFormattingPopup>
 						{#each highlightColors as color}
-							<button class="color-swatch" title={color.name} onclick={() => setHighlightColor(color.value)} style="background: {color.swatch}">
+							<button class="color-swatch" title={$uiLabel(color.name)} onclick={() => setHighlightColor(color.value)} style="background: {color.swatch}">
 								{#if isEditorActive('highlight', { color: color.value })}
 									<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
 								{/if}
 							</button>
 						{/each}
-						<button class="color-swatch" title="Remove highlight" onclick={() => setHighlightColor('')} style="background: var(--bg-tertiary);">
+						<button class="color-swatch" title={$ui("ui.remove_highlight")} onclick={() => setHighlightColor('')} style="background: var(--bg-tertiary);">
 							{#if !isEditorActive('highlight')}
 								<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--text-primary)" stroke-width="3"><polyline points="20 6 9 17 4 12"/></svg>
 							{:else}
@@ -7861,16 +7892,16 @@
 			</div>
 		{/if}
 	{:else if id === 'subscript'}
-		<button class="fmt-btn" class:active={isEditorActive('subscript')} onclick={() => editor?.chain().focus().toggleSubscript().run()} title="Subscript">
+		<button class="fmt-btn" class:active={isEditorActive('subscript')} onclick={() => editor?.chain().focus().toggleSubscript().run()} title={$ui("ui.subscript")}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 5 8 8"/><path d="m12 5-8 8"/><path d="M20 19h-4c0-1.5.44-2 1.5-2.5S20 15.33 20 14c0-.47-.17-.93-.48-1.29a2.11 2.11 0 00-2.62-.44c-.42.24-.74.62-.9 1.07"/></svg>
 		</button>
 	{:else if id === 'superscript'}
-		<button class="fmt-btn" class:active={isEditorActive('superscript')} onclick={() => editor?.chain().focus().toggleSuperscript().run()} title="Superscript">
+		<button class="fmt-btn" class:active={isEditorActive('superscript')} onclick={() => editor?.chain().focus().toggleSuperscript().run()} title={$ui("ui.superscript")}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m4 19 8-8"/><path d="m12 19-8-8"/><path d="M20 12h-4c0-1.5.442-2 1.5-2.5S20 8.334 20 7.002c0-.472-.17-.93-.484-1.29a2.105 2.105 0 00-2.617-.436c-.42.239-.738.614-.899 1.06"/></svg>
 		</button>
 	{:else if id === 'alignment'}
 		<div class="fmt-dropdown-wrap">
-			<button class="fmt-btn" onclick={(e) => toggleFormattingPicker(e, 'alignment')} aria-haspopup="dialog" aria-expanded={alignDropdown} title="Text Alignment">
+			<button class="fmt-btn" onclick={(e) => toggleFormattingPicker(e, 'alignment')} aria-haspopup="dialog" aria-expanded={alignDropdown} title={$ui("ui.text_alignment")}>
 				{#if isEditorActive({ textAlign: 'center' })}
 					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 5H3"/><path d="M17 12H7"/><path d="M19 19H5"/></svg>
 				{:else if isEditorActive({ textAlign: 'right' })}
@@ -7882,22 +7913,22 @@
 				{/if}
 			</button>
 			{#if alignDropdown}
-				<div class="fmt-dropdown align-dropdown" role="dialog" aria-label="Formatting options" use:positionFormattingPopup>
+				<div class="fmt-dropdown align-dropdown" role="dialog" aria-label={$ui("ui.formatting_options")} use:positionFormattingPopup>
 					<button class:active={isEditorActive({ textAlign: 'left' })} onclick={() => { editor?.chain().focus().setTextAlign('left').run(); alignDropdown = false; }}>
 						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 5H3"/><path d="M15 12H3"/><path d="M17 19H3"/></svg>
-						Left
+						{$ui("ui.left")}
 					</button>
 					<button class:active={isEditorActive({ textAlign: 'center' })} onclick={() => { editor?.chain().focus().setTextAlign('center').run(); alignDropdown = false; }}>
 						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 5H3"/><path d="M17 12H7"/><path d="M19 19H5"/></svg>
-						Center
+						{$ui("ui.center")}
 					</button>
 					<button class:active={isEditorActive({ textAlign: 'right' })} onclick={() => { editor?.chain().focus().setTextAlign('right').run(); alignDropdown = false; }}>
 						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 5H3"/><path d="M21 12H9"/><path d="M21 19H7"/></svg>
-						Right
+						{$ui("ui.right")}
 					</button>
 					<button class:active={isEditorActive({ textAlign: 'justify' })} onclick={() => { editor?.chain().focus().setTextAlign('justify').run(); alignDropdown = false; }}>
 						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18"/><path d="M3 12h18"/><path d="M3 19h18"/></svg>
-						Justify
+						{$ui("ui.justify")}
 					</button>
 				</div>
 			{/if}
@@ -7913,7 +7944,7 @@
 					editor.chain().focus().insertContent('\t').run();
 				}
 			}
-		}} title={isMobile ? "Indent" : "Indent (Tab)"}>
+		}} title={isMobile ? $ui("ui.indent") : $ui("ui.indent_tab")}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="4" x2="21" y2="4"/><line x1="11" y1="9" x2="21" y2="9"/><line x1="11" y1="14" x2="21" y2="14"/><line x1="3" y1="19" x2="21" y2="19"/><polyline points="3 9 7 11.5 3 14"/></svg>
 		</button>
 	{:else if id === 'outdent'}
@@ -7946,15 +7977,15 @@
 					}
 				}
 			}
-		}} title={isMobile ? "Outdent" : "Outdent (Shift+Tab)"}>
+		}} title={isMobile ? $ui("ui.outdent") : $ui("ui.outdent_shift_tab")}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="4" x2="21" y2="4"/><line x1="11" y1="9" x2="21" y2="9"/><line x1="11" y1="14" x2="21" y2="14"/><line x1="3" y1="19" x2="21" y2="19"/><polyline points="7 9 3 11.5 7 14"/></svg>
 		</button>
 	{:else if id === 'date-time'}
-		<button class="fmt-btn" onclick={() => insertTimestamp('datetime')} title="Insert date and time">
+		<button class="fmt-btn" onclick={() => insertTimestamp('datetime')} title={$ui("ui.insert_date_and_time")}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h6"/><line x1="3" y1="10" x2="21" y2="10"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="16" y1="2" x2="16" y2="6"/><circle cx="18" cy="17" r="4"/><path d="M18 15.5v1.5l1 1"/></svg>
 		</button>
 	{:else if id === 'ai-actions'}
-		<button class="fmt-btn" onclick={openAiMenu} title="AI Actions">
+		<button class="fmt-btn" onclick={openAiMenu} title={$ui("ui.ai_actions")}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 				<path d="M12 8V4l-2-2"/><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M9 13v2"/><path d="M15 13v2"/>
 			</svg>
@@ -7988,10 +8019,10 @@
 					<path d="M16 16h16M16 22h12M16 28h16M16 34h8" stroke="var(--text-tertiary)" stroke-width="1.5" stroke-linecap="round" />
 				</svg>
 			</div>
-			<p>Select a note or create a new one</p>
+			<p>{$ui("ui.select_a_note_or_create_a_new_one")}</p>
 			<div class="shortcuts-hint">
-				<span><kbd>{modKey}</kbd>+<kbd>N</kbd> New note</span>
-				<span><kbd>{modKey}</kbd>+<kbd>P</kbd> Quick open</span>
+				<span><kbd>{modKey}</kbd>+<kbd>N</kbd> {$ui("ui.new_note")}</span>
+				<span><kbd>{modKey}</kbd>+<kbd>P</kbd> {$ui("ui.quick_open")}</span>
 			</div>
 		</div>
 	{:else}
@@ -8000,11 +8031,11 @@
 				<svg class="viewer-banner-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>
 				</svg>
-				<span class="viewer-banner-label">Read-only viewer</span>
+				<span class="viewer-banner-label">{$ui("ui.read_only_viewer")}</span>
 				<code class="viewer-banner-path" title={$viewerNote.path}>{$viewerNote.path}</code>
 				<div class="viewer-banner-actions">
-					<button type="button" class="viewer-banner-btn primary" onclick={() => (viewerImportPickerOpen = true)} disabled={viewerImportBusy || !$appConfig?.active_vault}>Import to vault…</button>
-					<button type="button" class="viewer-banner-btn" onclick={closeViewer}>Close</button>
+					<button type="button" class="viewer-banner-btn primary" onclick={() => (viewerImportPickerOpen = true)} disabled={viewerImportBusy || !$appConfig?.active_vault}>{$ui("ui.import_to_vault")}</button>
+					<button type="button" class="viewer-banner-btn" onclick={closeViewer}>{$ui("ui.close")}</button>
 				</div>
 				{#if viewerToast}
 					<span class="viewer-banner-toast">{viewerToast}</span>
@@ -8097,25 +8128,25 @@
 			<div class="toolbar-actions">
 				{#if $canGoBack || $canGoForward}
 				<div class="nav-history-btns">
-					<button class="nav-history-btn" disabled={!$canGoBack} onclick={() => editorNavigateHistory(-1)} title="Back (Alt+←)">
+					<button class="nav-history-btn" disabled={!$canGoBack} onclick={() => editorNavigateHistory(-1)} title={$ui("ui.back_alt")}>
 						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
 					</button>
-					<button class="nav-history-btn" disabled={!$canGoForward} onclick={() => editorNavigateHistory(1)} title="Forward (Alt+→)">
+					<button class="nav-history-btn" disabled={!$canGoForward} onclick={() => editorNavigateHistory(1)} title={$ui("ui.forward_alt")}>
 						<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
 					</button>
 				</div>
 				{/if}
 				{#if $editorDirty}
-					<span class="save-indicator">Unsaved</span>
+					<span class="save-indicator">{$ui("ui.unsaved")}</span>
 				{/if}
 				{#if $readOnly}
-					<span class="readonly-indicator">View Mode</span>
+					<span class="readonly-indicator">{$ui("ui.view_mode")}</span>
 				{/if}
 				<button
 					class="icon-btn"
 					class:active={noteSearchOpen}
 					onclick={() => noteSearchOpen ? closeNoteSearch() : openNoteSearch()}
-					title={`Find in note (${modKey}+F)`}
+					title={$ui("ui.find_in_note_f", { value0: modKey })}
 				>
 					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
@@ -8127,7 +8158,7 @@
 					class:active={!!tagMenu}
 					disabled={trashPreview}
 					onclick={toggleTagMenu}
-					title="Edit tags"
+					title={$ui("ui.edit_tags")}
 				>
 					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/>
@@ -8144,7 +8175,7 @@
 							markEdited();
 						}
 					}}
-					title={$activeNote?.meta.pinned ? 'Unpin note' : 'Pin note'}
+					title={$activeNote?.meta.pinned ? $ui("ui.unpin_note") : $ui("ui.pin_note")}
 				>
 					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<path d="M12 17v5"/>
@@ -8172,7 +8203,7 @@
 							console.error('Quick access toggle failed:', e);
 						}
 					}}
-					title={isQuickAccess ? 'Remove from Quick Access' : 'Add to Quick Access'}
+					title={isQuickAccess ? $ui("ui.remove_from_quick_access") : $ui("ui.add_to_quick_access")}
 				>
 					<svg width="16" height="16" viewBox="0 0 24 24" fill={isQuickAccess ? 'currentColor' : 'none'} stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
@@ -8182,8 +8213,8 @@
 					class="icon-btn"
 					class:active={showOutline && !showHistory}
 					onclick={toggleOutlinePanel}
-					title="Outline"
-					aria-label="Outline"
+					title={$ui("ui.outline")}
+					aria-label={$ui("ui.outline")}
 					aria-expanded={showOutline && !showHistory}
 					aria-controls={outlinePanelId}
 				>
@@ -8195,7 +8226,7 @@
 					class="icon-btn"
 					class:active={showHistory}
 					onclick={toggleHistory}
-					title="Version history"
+					title={$ui("ui.version_history")}
 				>
 					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<circle cx="12" cy="12" r="10"/>
@@ -8206,7 +8237,7 @@
 					class="icon-btn"
 					class:active={showInfo}
 					onclick={toggleInfo}
-					title="Note info"
+					title={$ui("ui.note_info")}
 				>
 					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<circle cx="12" cy="12" r="10"/>
@@ -8219,7 +8250,7 @@
 					class="icon-btn"
 					class:active={showGraph}
 					onclick={() => showGraph = !showGraph}
-					title="Graph View"
+					title={$ui("ui.graph_view")}
 				>
 					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="18" r="3"/>
@@ -8231,46 +8262,37 @@
 				<button
 					class="icon-btn"
 					onclick={openAiMenu}
-					title="AI Actions"
+					title={$ui("ui.ai_actions")}
 				>
 					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<path d="M12 8V4l-2-2"/><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M9 13v2"/><path d="M15 13v2"/>
 					</svg>
 				</button>
 				{/if}
-				<button
-					class="icon-btn"
-					class:active={$sourceMode}
-					onclick={() => ($sourceMode = !$sourceMode)}
-					title="Toggle Markdown Editor"
-				>
-					<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor">
-						<path d="M5.854 4.854a.5.5 0 10-.708-.708l-3.5 3.5a.5.5 0 000 .708l3.5 3.5a.5.5 0 00.708-.708L2.707 8l3.147-3.146zm4.292 0a.5.5 0 01.708-.708l3.5 3.5a.5.5 0 010 .708l-3.5 3.5a.5.5 0 01-.708-.708L13.293 8l-3.147-3.146z" />
-					</svg>
-				</button>
+				<EditorModePicker id={`${componentId}-editor-mode`} disabled={externalOperationBusy} />
 			</div>
 			{/if}
 		</div>
 		{/if}
 		{#if externalOperationBusy}
-			<div class="save-error" role="status">Updating note location or task… Editing will resume shortly.</div>
+			<div class="save-error" role="status">{$ui("ui.updating_note_location_or_task_editing_will_resume_shortly")}</div>
 		{/if}
 		{#if saveError && $editorDirty && !$viewerNote && saveError.path === $activeNotePath && saveError.vault === $appConfig?.active_vault}
 			<div class="save-error" role="alert">
-				<span><strong>Save failed.</strong> {saveError.message}</span>
+				<span><strong>{$ui("ui.save_failed")}</strong> {saveError.message}</span>
 				{#if saveError.conflict}
-					<button type="button" onclick={saveConflictCopy} disabled={retryingSave} aria-label="Save draft as a copy">Save a copy</button>
-					<button type="button" onclick={reloadConflictedNote} disabled={retryingSave} aria-label="Discard draft and reload note">Reload from disk</button>
+					<button type="button" onclick={saveConflictCopy} disabled={retryingSave} aria-label={$ui("ui.save_draft_as_a_copy")}>{$ui("ui.save_a_copy")}</button>
+					<button type="button" onclick={reloadConflictedNote} disabled={retryingSave} aria-label={$ui("ui.discard_draft_and_reload_note")}>{$ui("ui.reload_from_disk")}</button>
 				{:else}
-					<button type="button" onclick={retrySave} disabled={retryingSave} aria-label="Retry saving note">
-						{retryingSave ? 'Saving…' : 'Retry'}
+					<button type="button" onclick={retrySave} disabled={retryingSave} aria-label={$ui("ui.retry_saving_note")}>
+						{retryingSave ? $ui("ui.saving") : $ui("ui.retry")}
 					</button>
 				{/if}
 			</div>
 		{/if}
 		{#if loadFailure && loadFailure === $activeNotePath && !$sourceMode}
 			<div class="save-error" role="alert">
-				<span><strong>This note could not be opened in the editor.</strong> It is shown empty and nothing will be saved from here; the file on disk is unchanged. Switch to source mode to view or edit it.</span>
+				<span><strong>{$ui("ui.this_note_could_not_be_opened_in_the_editor")}</strong> {$ui("ui.it_is_shown_empty_and_nothing_will_be_saved_from_here_the_file_c17175")}</span>
 			</div>
 		{/if}
 		{#if searchRevealNotice}
@@ -8286,7 +8308,7 @@
 						{#if i > 0}<span class="path-sep">›</span>{/if}{segment}
 					{/each}
 				{:else}
-					Unfiled Notes
+					{$ui("ui.unfiled_notes")}
 				{/if}
 			</span>
 			<span class="meta-divider">·</span>
@@ -8294,15 +8316,15 @@
 				<!-- Each tag leads to its notes; the tag button in the header edits them. -->
 				<span class="note-tags-trigger" class:search-target-meta={searchTagsReveal}>
 					{#each $activeNote.meta.tags as tag, i (tagIterationKey(tag, i))}
-						<button type="button" class="note-tag-link" onclick={() => onShowTag(tag)} title={`Show notes tagged ${tag}`}><TagLabel name={tag} size={11} tone="muted" /></button>
+						<button type="button" class="note-tag-link" onclick={() => onShowTag(tag)} title={$ui("ui.show_notes_tagged", { value0: tag })}><TagLabel name={tag} size={11} tone="muted" /></button>
 					{/each}
 				</span>
 			{:else}
-				<button class="note-tags-trigger" class:search-target-meta={searchTagsReveal} onclick={toggleTagMenu} title="Edit tags">
+				<button class="note-tags-trigger" class:search-target-meta={searchTagsReveal} onclick={toggleTagMenu} title={$ui("ui.edit_tags")}>
 					{#if $activeNote.meta.tags?.length > 0}
 						{#each $activeNote.meta.tags as tag, i (tagIterationKey(tag, i))}<TagLabel name={tag} size={11} tone="muted" />{/each}
 					{:else}
-						<span class="note-tags-add">+ Tags</span>
+						<span class="note-tags-add">{$ui("ui.tags")}</span>
 					{/if}
 				</button>
 			{/if}
@@ -8312,15 +8334,15 @@
 		<div class="editor-body-wrapper">
 			{#if noteSearchOpen}
 				<div class="note-search-bar">
-					<button type="button" class="note-search-btn note-replace-toggle" class:open={noteReplaceOpen} aria-label="Replace" aria-expanded={noteReplaceOpen} title={`Replace (${bindingToKeys($keybindings['replace-in-note']).join('+')})`} onmousedown={(e) => e.preventDefault()} onclick={() => { noteReplaceOpen = !noteReplaceOpen; }}>
+					<button type="button" class="note-search-btn note-replace-toggle" class:open={noteReplaceOpen} aria-label={$ui("ui.replace")} aria-expanded={noteReplaceOpen} title={$ui("ui.replace_438751", { value0: bindingToKeys($keybindings['replace-in-note']).join('+') })} onmousedown={(e) => e.preventDefault()} onclick={() => { noteReplaceOpen = !noteReplaceOpen; }}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 6 15 12 9 18"/></svg>
 					</button>
 					<input
 						bind:this={noteSearchInput}
 						type="text"
 						class="note-search-input"
-						placeholder="Find in note..."
-						aria-label="Find in note"
+						placeholder={$ui("ui.find_in_note_510de6")}
+						aria-label={$ui("ui.find_in_note")}
 						bind:value={noteSearchQuery}
 						onkeydown={(e) => {
 							if (e.isComposing) return;
@@ -8328,24 +8350,24 @@
 							if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeNoteSearch(); }
 						}}
 					/>
-					<button type="button" class="note-search-btn note-search-option" aria-label="Match case" aria-pressed={noteSearchMatchCase} title="Match case" onmousedown={(e) => e.preventDefault()} onclick={() => { noteSearchMatchCase = !noteSearchMatchCase; noteSearchInput?.focus({ preventScroll: true }); }}>Aa</button>
-					<button type="button" class="note-search-btn note-search-option whole-word" aria-label="Whole word" aria-pressed={noteSearchWholeWord} title="Whole word" onmousedown={(e) => e.preventDefault()} onclick={() => { noteSearchWholeWord = !noteSearchWholeWord; noteSearchInput?.focus({ preventScroll: true }); }}>ab</button>
+					<button type="button" class="note-search-btn note-search-option" aria-label={$ui("ui.match_case")} aria-pressed={noteSearchMatchCase} title={$ui("ui.match_case")} onmousedown={(e) => e.preventDefault()} onclick={() => { noteSearchMatchCase = !noteSearchMatchCase; noteSearchInput?.focus({ preventScroll: true }); }}>{$ui("ui.aa")}</button>
+					<button type="button" class="note-search-btn note-search-option whole-word" aria-label={$ui("ui.whole_word")} aria-pressed={noteSearchWholeWord} title={$ui("ui.whole_word")} onmousedown={(e) => e.preventDefault()} onclick={() => { noteSearchWholeWord = !noteSearchWholeWord; noteSearchInput?.focus({ preventScroll: true }); }}>{$ui("ui.ab")}</button>
 					<span class="note-search-count" aria-live="polite" aria-atomic="true">
 						{#if noteSearchPending}
-							Searching…
+							{$ui("ui.searching")}
 						{:else if noteSearchQuery && noteSearchResults.length > 0}
 							{noteSearchIndex + 1} / {noteSearchResults.length}
 						{:else if noteSearchQuery}
-							No results
+							{$ui("ui.no_results")}
 						{/if}
 					</span>
-					<button class="note-search-btn" onclick={noteSearchPrev} onmousedown={(e) => e.preventDefault()} disabled={!noteSearchPending && !noteSearchResults.length} aria-label="Previous match" title="Previous (Shift+Enter)">
+					<button class="note-search-btn" onclick={noteSearchPrev} onmousedown={(e) => e.preventDefault()} disabled={!noteSearchPending && !noteSearchResults.length} aria-label={$ui("ui.previous_match")} title={$ui("ui.previous_shift_enter")}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>
 					</button>
-					<button class="note-search-btn" onclick={noteSearchNext} onmousedown={(e) => e.preventDefault()} disabled={!noteSearchPending && !noteSearchResults.length} aria-label="Next match" title="Next (Enter)">
+					<button class="note-search-btn" onclick={noteSearchNext} onmousedown={(e) => e.preventDefault()} disabled={!noteSearchPending && !noteSearchResults.length} aria-label={$ui("ui.next_match")} title={$ui("ui.next_enter")}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
 					</button>
-					<button class="note-search-btn" onclick={() => closeNoteSearch()} aria-label="Close find" title="Close (Esc)">
+					<button class="note-search-btn" onclick={() => closeNoteSearch()} aria-label={$ui("ui.close_find")} title={$ui("ui.close_esc")}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 					</button>
 				</div>
@@ -8357,8 +8379,8 @@
 							bind:this={noteReplaceInput}
 							type="text"
 							class="note-search-input"
-							placeholder="Replace with..."
-							aria-label="Replace with"
+							placeholder={$ui("ui.replace_with")}
+							aria-label={$ui("ui.replace_with_dde406")}
 							bind:value={noteReplaceValue}
 							onkeydown={(e) => {
 								if (e.isComposing) return;
@@ -8366,20 +8388,20 @@
 								if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeNoteSearch(); }
 							}}
 						/>
-						<button type="button" class="note-search-btn note-replace-btn" onclick={replaceNoteMatch} onmousedown={(e) => e.preventDefault()} disabled={replaceDisabled} title="Replace (Enter)">Replace</button>
-						<button type="button" class="note-search-btn note-replace-btn" onclick={replaceAllNoteMatches} onmousedown={(e) => e.preventDefault()} disabled={replaceDisabled} title={`Replace all (${modKey}+Enter)`}>All</button>
+						<button type="button" class="note-search-btn note-replace-btn" onclick={replaceNoteMatch} onmousedown={(e) => e.preventDefault()} disabled={replaceDisabled} title={$ui("ui.replace_enter")}>{$ui("ui.replace")}</button>
+						<button type="button" class="note-search-btn note-replace-btn" onclick={replaceAllNoteMatches} onmousedown={(e) => e.preventDefault()} disabled={replaceDisabled} title={$ui("ui.replace_all_enter", { value0: modKey })}>{$ui("ui.all")}</button>
 					</div>
 				{/if}
 			{/if}
 			<div class="editor-body-row" class:reviewing-history={showHistory}>
 			<div class="editor-body" class:source-body={$sourceMode} class:history-hidden={showHistory} onscroll={scheduleOutlineActive}>
 				{#if isMobile}
-					<SourceEditor controller={source} readonly={showHistory || $readOnly || !!$viewerNote || externalOperationBusy} visible={$sourceMode} mobile />
+					<SourceEditor controller={source} readonly={showHistory || $readOnly || !!$viewerNote || externalOperationBusy} visible={$sourceMode} preview={$livePreviewMode} resolveImage={resolveImageSrc} openLink={openPreviewLink} context={sourceAssetContext} mobile />
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div class="tiptap-wrapper" class:large-doc={isLargeDoc} style={$sourceMode ? 'display:none' : ''} spellcheck="false" bind:this={editorElement} onerrorcapture={retryFailedImage} onclick={(e) => { closeLinkContextMenu(); handleEditorClick(e); }} onkeydown={(e) => { if (e.key === 'Escape') closeLinkContextMenu(); }}></div>
 				{:else}
 					{#if $sourceMode}
-						<SourceEditor controller={source} readonly={showHistory || $readOnly || !!$viewerNote || externalOperationBusy} numbers={$appConfig?.show_line_numbers ?? false} />
+						<SourceEditor controller={source} readonly={showHistory || $readOnly || !!$viewerNote || externalOperationBusy} numbers={$appConfig?.show_line_numbers ?? false} preview={$livePreviewMode} resolveImage={resolveImageSrc} openLink={openPreviewLink} context={sourceAssetContext} />
 					{:else}
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
 						<div class="tiptap-wrapper" class:large-doc={isLargeDoc} spellcheck="false" bind:this={editorElement} onerrorcapture={retryFailedImage} onclick={(e) => { closeLinkContextMenu(); handleEditorClick(e); }} onkeydown={(e) => { if (e.key === 'Escape') closeLinkContextMenu(); }} oncontextmenu={handleEditorContextMenu}></div>
@@ -8396,15 +8418,15 @@
 					onRestore={restoreVersion} renderSnapshot={(body) => markdownToHtml(body, true)} />
 				<div class="history-panel">
 					<div class="history-header">
-						<h3>Version History</h3>
+						<h3>{$ui("ui.version_history_6974ab")}</h3>
 						<div class="history-header-actions">
-							<button class="history-create-btn" onclick={handleCreateVersion} title="Save current state as a version">
+							<button class="history-create-btn" onclick={handleCreateVersion} title={$ui("ui.save_current_state_as_a_version")}>
 								<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 									<line x1="12" y1="5" x2="12" y2="19" />
 									<line x1="5" y1="12" x2="19" y2="12" />
 								</svg>
 							</button>
-							<button class="history-close" onclick={closeHistory} aria-label="Close version history">
+							<button class="history-close" onclick={closeHistory} aria-label={$ui("ui.close_version_history")}>
 								<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 									<line x1="18" y1="6" x2="6" y2="18" />
 									<line x1="6" y1="6" x2="18" y2="18" />
@@ -8413,18 +8435,18 @@
 						</div>
 					</div>
 					{#if historyLoading}
-						<div class="history-empty" role="status">Loading...</div>
+						<div class="history-empty" role="status">{$ui("ui.loading")}</div>
 					{:else if historyError}
 						<div class="history-empty" role="alert">
 							<p>{historyError}</p>
-							<button class="history-retry-btn" onclick={loadHistory}>Retry</button>
+							<button class="history-retry-btn" onclick={loadHistory}>{$ui("ui.retry")}</button>
 						</div>
 					{:else if historyVersions.length === 0}
-						<div class="history-empty">No versions yet. Versions are created automatically as you edit (at least 5 minutes apart).</div>
+						<div class="history-empty">{$ui("ui.no_versions_yet_versions_are_created_automatically_as_you_edit_5792e4")}</div>
 					{:else}
 						<div class="history-picker">
-							<label for="history-version-picker">Version</label>
-							<select id="history-version-picker" aria-label="Select snapshot version"
+							<label for="history-version-picker">{$ui("ui.version")}</label>
+							<select id="history-version-picker" aria-label={$ui("ui.select_snapshot_version")}
 								value={historySelected?.timestamp ?? ''}
 								onchange={(event) => { const version = historyVersions.find((v) => v.timestamp === event.currentTarget.value); if (version) void previewVersion(version); }}>
 								{#each historyVersions as version (version.timestamp)}
@@ -8450,13 +8472,13 @@
 				</div>
 			{/if}
 			{#if showOutline && !showHistory}
-				<ResizeHandle onResize={handleOutlineResize} label="Resize outline" value={$outlineWidth} min={160} max={500} controls={outlinePanelId} />
+				<ResizeHandle onResize={handleOutlineResize} label={$ui("ui.resize_outline")} value={$outlineWidth} min={160} max={500} controls={outlinePanelId} />
 				<!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
-				<nav id={outlinePanelId} class="outline-panel" style="width: {$outlineWidth}px" aria-label="Note outline"
+				<nav id={outlinePanelId} class="outline-panel" style="width: {$outlineWidth}px" aria-label={$ui("ui.note_outline")}
 					onkeydown={(event) => { if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); void closeOutline(); } }}>
 					<div class="outline-header">
-						<h3>Outline</h3>
-						<button class="outline-close" onclick={closeOutline} aria-label="Close outline">
+						<h3>{$ui("ui.outline")}</h3>
+						<button class="outline-close" onclick={closeOutline} aria-label={$ui("ui.close_outline")}>
 							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 								<line x1="18" y1="6" x2="6" y2="18" />
 								<line x1="6" y1="6" x2="18" y2="18" />
@@ -8464,7 +8486,7 @@
 						</button>
 					</div>
 					{#if outlineHeadings.length === 0}
-						<div class="outline-empty">No headings in this note.</div>
+						<div class="outline-empty">{$ui("ui.no_headings_in_this_note")}</div>
 					{:else}
 						<ul class="outline-list" bind:this={outlineList}>
 							{#each outlineHeadings as h, i}
@@ -8473,8 +8495,8 @@
 										class="outline-item outline-level-{h.level}"
 										class:current={i === outlineActive}
 										aria-current={i === outlineActive ? 'location' : undefined}
-										aria-label={`Heading level ${h.level}: ${h.text.trim() || 'Untitled heading'}`}
-										title={h.text.trim() || 'Untitled heading'}
+										aria-label={$ui("ui.heading_level", { value0: h.level, value1: h.text.trim() || 'Untitled heading' })}
+										title={h.text.trim() || $ui('ui.untitled_heading')}
 										onclick={() => scrollToHeading(h)}
 									>
 										{h.text.trim() || 'Untitled heading'}
@@ -8488,8 +8510,8 @@
 			{#if showInfo && $activeNote && !showHistory}
 				<div class="info-panel">
 					<div class="info-panel-header">
-						<span class="info-panel-title">Note Info</span>
-						<button class="info-close-btn" onclick={() => showInfo = false} aria-label="Close note info">
+						<span class="info-panel-title">{$ui("ui.note_info_19e2c6")}</span>
+						<button class="info-close-btn" onclick={() => showInfo = false} aria-label={$ui("ui.close_note_info")}>
 							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 								<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
 							</svg>
@@ -8497,40 +8519,40 @@
 					</div>
 
 					<div class="info-section">
-						<div class="info-section-label">Statistics</div>
+						<div class="info-section-label">{$ui("ui.statistics")}</div>
 						<div class="info-row">
-							<span class="info-key">Words</span>
-							<span class="info-value">{wordCount.toLocaleString()}</span>
+							<span class="info-key">{$ui("ui.words")}</span>
+							<span class="info-value">{wordCount.toLocaleString($locale)}</span>
 						</div>
 						<div class="info-row">
-							<span class="info-key">Characters</span>
-							<span class="info-value">{charCount.toLocaleString()}</span>
+							<span class="info-key">{$ui("ui.characters")}</span>
+							<span class="info-value">{charCount.toLocaleString($locale)}</span>
 						</div>
 						<div class="info-row">
-							<span class="info-key">Reading time</span>
-							<span class="info-value">{wordCount < 200 ? '< 1 min' : `${Math.ceil(wordCount / 200)} min`}</span>
+							<span class="info-key">{$ui("ui.reading_time")}</span>
+							<span class="info-value">{wordCount < 200 ? $ui("ui.1_min") : $ui("ui.min", { value0: Math.ceil(wordCount / 200) })}</span>
 						</div>
 					</div>
 
 					<div class="info-section info-details">
-						<div class="info-section-label">Details</div>
+						<div class="info-section-label">{$ui("ui.details")}</div>
 						<div class="info-row">
-							<span class="info-key">Modified</span>
+							<span class="info-key">{$ui("ui.modified")}</span>
 							<span class="info-value" title={$activeNote.meta.modified}>{formatVersionDate($activeNote.meta.modified)}</span>
 						</div>
 						<div class="info-row">
-							<span class="info-key">Created</span>
+							<span class="info-key">{$ui("ui.created")}</span>
 							<span class="info-value" title={$activeNote.meta.created}>{formatVersionDate($activeNote.meta.created)}</span>
 						</div>
 						{#if noteFolder}
 						<div class="info-row">
-							<span class="info-key">Location</span>
+							<span class="info-key">{$ui("ui.location")}</span>
 							<span class="info-value info-value-path" title={noteFolder}>{noteFolder}</span>
 						</div>
 						{/if}
 						{#if $activeNote.meta.tags?.length > 0}
 						<div class="info-row info-row-tags">
-							<span class="info-key">Tags</span>
+							<span class="info-key">{$ui("ui.tags_848eed")}</span>
 							<span class="info-value info-tags">
 								{#each $activeNote.meta.tags as tag, i (tagIterationKey(tag, i))}
 									<TagLabel name={tag} size={11} tone="muted" />
@@ -8541,7 +8563,7 @@
 						{#if !isMobile && $activeNotePath}
 						<div class="info-note-path">
 							<div class="info-note-path-header">
-								<span class="info-key">Path on disk</span>
+								<span class="info-key">{$ui("ui.path_on_disk")}</span>
 								<button
 									type="button"
 									class="info-copy-path-btn"
@@ -8549,16 +8571,16 @@
 									class:error={infoPathCopyState === 'error'}
 									onclick={copyActiveNotePath}
 									aria-live="polite"
-									title="Copy note path"
+									title={$ui("ui.copy_note_path")}
 								>
 									{#if infoPathCopyState === 'copied'}
 										<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 12 4 4L19 6" /></svg>
-										Copied
+										{$ui("ui.copied")}
 									{:else if infoPathCopyState === 'error'}
-										Copy failed
+										{$ui("ui.copy_failed")}
 									{:else}
 										<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2" /><path d="M15 9V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h3" /></svg>
-										Copy
+										{$ui("ui.copy")}
 									{/if}
 								</button>
 							</div>
@@ -8569,12 +8591,12 @@
 
 					{#key $activeNotePath}
 						<details class="info-section info-frontmatter">
-							<summary class="info-section-label">Frontmatter</summary>
-							<p class="info-frontmatter-caption">Last loaded or saved YAML. Unsaved changes are not shown.</p>
+							<summary class="info-section-label">{$ui("ui.frontmatter")}</summary>
+							<p class="info-frontmatter-caption">{$ui("ui.last_loaded_or_saved_yaml_unsaved_changes_are_not_shown")}</p>
 							{#if infoFrontmatter}
-								<pre aria-label="Saved frontmatter">{infoFrontmatter}</pre>
+								<pre aria-label={$ui("ui.saved_frontmatter")}>{infoFrontmatter}</pre>
 							{:else}
-								<p class="info-frontmatter-caption">No frontmatter in this note.</p>
+								<p class="info-frontmatter-caption">{$ui("ui.no_frontmatter_in_this_note")}</p>
 							{/if}
 						</details>
 					{/key}
@@ -8585,7 +8607,7 @@
 								<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 									<path d="M3 6h18"/><path d="M19 6v14H5V6"/><path d="M8 6V4h8v2"/><path d="M10 11v5"/><path d="M14 11v5"/>
 								</svg>
-								{trashingNote ? 'Moving to Trash...' : 'Move to Trash'}
+								{trashingNote ? $ui("ui.moving_to_trash") : $ui("ui.move_to_trash")}
 							</button>
 						</div>
 					{/if}
@@ -8612,13 +8634,13 @@
 				onpointerdown={preserveFormattingFocus}
 				onmousedown={preserveFormattingFocus}
 			>
-				{#if toolbarDraft}<span class="fmt-area-label">Toolbar</span>{/if}
+				{#if toolbarDraft}<span class="fmt-area-label">{$ui("ui.toolbar")}</span>{/if}
 				<div class="fmt-main-controls" class:drop-target={toolbarDrop?.area === 'main'} data-toolbar-area="main">
 					{#if toolbarDraft}
 						{#each toolbarDraft.main as id (id)}
 							{@render editableToolbarControl(id)}
 						{:else}
-							<span class="fmt-empty-drop">Drop buttons here</span>
+							<span class="fmt-empty-drop">{$ui("ui.drop_buttons_here")}</span>
 						{/each}
 					{:else}
 						{#each formattingGroups as group, index}
@@ -8630,53 +8652,53 @@
 					{/if}
 				</div>
 				{#if !isMobile}
-					<button class="fmt-btn fmt-more-button" class:active={moreOpen} bind:this={moreButton} title="More formatting" aria-label="More formatting" aria-expanded={moreOpen} aria-controls={morePanelId} onclick={toggleMore} onkeydown={moreKeydown}>
+					<button class="fmt-btn fmt-more-button" class:active={moreOpen} bind:this={moreButton} title={$ui("ui.more_formatting")} aria-label={$ui("ui.more_formatting")} aria-expanded={moreOpen} aria-controls={morePanelId} onclick={toggleMore} onkeydown={moreKeydown}>
 						<svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
 					</button>
 					{#if moreOpen}
-						<div class="fmt-more-panel" class:customizing={toolbarDraft !== null} id={morePanelId} bind:this={morePanel} role="region" aria-label={toolbarDraft ? 'Customize toolbar' : 'More formatting'}>
+						<div class="fmt-more-panel" class:customizing={toolbarDraft !== null} id={morePanelId} bind:this={morePanel} role="region" aria-label={toolbarDraft ? $ui("ui.customize_toolbar") : $ui("ui.more_formatting")}>
 							{#if toolbarDraft}
 								<div class="fmt-customize-heading">
-									<strong>Customize toolbar</strong>
-									<p>Drag buttons to reorder or move them into More.</p>
+									<strong>{$ui("ui.customize_toolbar")}</strong>
+									<p>{$ui("ui.drag_buttons_to_reorder_or_move_them_into_more")}</p>
 								</div>
-								<div class="fmt-area-label">More</div>
+								<div class="fmt-area-label">{$ui("ui.more")}</div>
 								<div class="fmt-more-controls" class:drop-target={toolbarDrop?.area === 'more'} data-toolbar-area="more">
 									{#each toolbarDraft.more as id (id)}
 										{@render editableToolbarControl(id)}
 									{:else}
-										<span class="fmt-empty-drop">Drop buttons here to keep them in More</span>
+										<span class="fmt-empty-drop">{$ui("ui.drop_buttons_here_to_keep_them_in_more")}</span>
 									{/each}
 								</div>
 								<div class="fmt-customize-selection">
 									<div class="fmt-selected-label" aria-live="polite">
-										<strong>{toolbarSelected ? toolbarLabels[toolbarSelected] : 'Select a button'}</strong>
+										<strong>{toolbarSelected ? $uiLabel(toolbarLabels[toolbarSelected]) : $ui("ui.select_a_button")}</strong>
 										{#if toolbarSelectedArea}
-											<span>{toolbarSelectedArea === 'main' ? 'Toolbar' : 'More'} · {toolbarSelectedIndex + 1} of {toolbarDraft[toolbarSelectedArea].length}</span>
+											<span>{$ui("ui.of", { value0: toolbarSelectedArea === 'main' ? $ui('ui.toolbar') : $ui('ui.more'), value1: toolbarSelectedIndex + 1, value2: toolbarDraft[toolbarSelectedArea].length })}</span>
 										{/if}
 									</div>
 									<div class="fmt-customize-moves">
-										<button type="button" disabled={toolbarSaving || !toolbarSelectedArea || toolbarSelectedIndex === 0} onclick={() => toolbarSelectedArea && moveSelectedToolbarButton(toolbarSelectedArea, toolbarSelectedIndex - 1)} aria-label="Move selected button earlier" title="Move earlier">
+										<button type="button" disabled={toolbarSaving || !toolbarSelectedArea || toolbarSelectedIndex === 0} onclick={() => toolbarSelectedArea && moveSelectedToolbarButton(toolbarSelectedArea, toolbarSelectedIndex - 1)} aria-label={$ui("ui.move_selected_button_earlier")} title={$ui("ui.move_earlier")}>
 											<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m14 6-6 6 6 6"/></svg>
 										</button>
-										<button type="button" disabled={toolbarSaving || !toolbarSelectedArea || toolbarSelectedIndex === toolbarDraft[toolbarSelectedArea].length - 1} onclick={() => toolbarSelectedArea && moveSelectedToolbarButton(toolbarSelectedArea, toolbarSelectedIndex + 2)} aria-label="Move selected button later" title="Move later">
+										<button type="button" disabled={toolbarSaving || !toolbarSelectedArea || toolbarSelectedIndex === toolbarDraft[toolbarSelectedArea].length - 1} onclick={() => toolbarSelectedArea && moveSelectedToolbarButton(toolbarSelectedArea, toolbarSelectedIndex + 2)} aria-label={$ui("ui.move_selected_button_later")} title={$ui("ui.move_later")}>
 											<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="m10 6 6 6-6 6"/></svg>
 										</button>
 										<button type="button" class="fmt-move-area" disabled={toolbarSaving || !toolbarSelectedArea} onclick={() => toolbarDraft && moveSelectedToolbarButton(toolbarSelectedArea === 'main' ? 'more' : 'main', toolbarDraft[toolbarSelectedArea === 'main' ? 'more' : 'main'].length)}>
-											Move to {toolbarSelectedArea === 'main' ? 'More' : 'toolbar'}
+											{$ui("ui.move_to", { value0: toolbarSelectedArea === 'main' ? $ui('ui.more') : $ui('ui.toolbar') })}
 										</button>
 									</div>
-									<p class="fmt-customize-hint" id={toolbarHintId}>On a button: ← / → reorder, ↑ to More, ↓ to toolbar.</p>
+									<p class="fmt-customize-hint" id={toolbarHintId}>{$ui("ui.on_a_button_reorder_to_more_to_toolbar")}</p>
 								</div>
 								{#if toolbarConflict}
-									<p class="fmt-customize-error" role="alert">The toolbar changed in another window. Cancel and customize again to use the latest layout.</p>
+									<p class="fmt-customize-error" role="alert">{$ui("ui.the_toolbar_changed_in_another_window_cancel_and_customize_aga_2d083e")}</p>
 								{:else if toolbarSaveError}
 									<p class="fmt-customize-error" role="alert">{toolbarSaveError}</p>
 								{/if}
 								<div class="fmt-customize-actions">
-									<button type="button" class="fmt-customize-reset" disabled={toolbarSaving} onclick={resetToolbarDraft} title="Restore defaults in this draft">Reset</button>
-									<button type="button" disabled={toolbarSaving} onclick={() => endToolbarCustomization(!!formattingBar?.contains(document.activeElement))}>Cancel</button>
-									<button type="button" class="fmt-customize-done" disabled={toolbarSaving || toolbarConflict || !$appConfig} onclick={saveToolbarDraft}>{toolbarSaving ? 'Saving…' : 'Done'}</button>
+									<button type="button" class="fmt-customize-reset" disabled={toolbarSaving} onclick={resetToolbarDraft} title={$ui("ui.restore_defaults_in_this_draft")}>{$ui("ui.reset")}</button>
+									<button type="button" disabled={toolbarSaving} onclick={() => endToolbarCustomization(!!formattingBar?.contains(document.activeElement))}>{$ui("ui.cancel")}</button>
+									<button type="button" class="fmt-customize-done" disabled={toolbarSaving || toolbarConflict || !$appConfig} onclick={saveToolbarDraft}>{toolbarSaving ? $ui("ui.saving") : $ui("ui.done")}</button>
 								</div>
 							{:else}
 								{#if toolbarLayout.more.length > 0}
@@ -8686,7 +8708,7 @@
 										{/each}
 									</div>
 								{/if}
-								<button type="button" class="fmt-customize-entry" disabled={toolbarSaving} onclick={beginToolbarCustomization}>Customize toolbar…</button>
+								<button type="button" class="fmt-customize-entry" disabled={toolbarSaving} onclick={beginToolbarCustomization}>{$ui("ui.customize_toolbar_b73a3b")}</button>
 							{/if}
 						</div>
 					{/if}
@@ -8718,14 +8740,14 @@
 					<polyline points="15 3 21 3 21 9" />
 					<line x1="10" y1="14" x2="21" y2="3" />
 				</svg>
-				Open Link
+				{$ui("ui.open_link")}
 			</button>
 			{#if isFileLink(linkContextMenu.href)}
 			<button onclick={linkMenuSaveAs}>
 				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
 				</svg>
-				Save As...
+				{$ui("ui.save_as")}
 			</button>
 			{/if}
 			<button onclick={linkMenuCopy}>
@@ -8733,21 +8755,21 @@
 					<rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
 					<path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" />
 				</svg>
-				Copy Link
+				{$ui("ui.copy_link")}
 			</button>
 			<button onclick={linkMenuEdit}>
 				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" />
 					<path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" />
 				</svg>
-				Edit Link
+				{$ui("ui.edit_link")}
 			</button>
 			<div class="link-context-sep"></div>
 			<button class="danger" onclick={linkMenuRemove}>
 				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M18 6L6 18M6 6l12 12" />
 				</svg>
-				Remove Link
+				{$ui("ui.remove_link")}
 			</button>
 		</div>
 	</div>
@@ -8759,27 +8781,27 @@
 		<div class="text-ctx-menu" style="left: {textContextMenu.x}px; top: {textContextMenu.y}px">
 			<button onclick={ctxCut}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><line x1="20" y1="4" x2="8.12" y2="15.88"/><line x1="14.47" y1="14.48" x2="20" y2="20"/><line x1="8.12" y1="8.12" x2="12" y2="12"/></svg>
-				Cut
+				{$ui("ui.cut")}
 				<span class="text-ctx-shortcut">{modKey}+X</span>
 			</button>
 			<button onclick={ctxCopy}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
-				Copy
+				{$ui("ui.copy")}
 				<span class="text-ctx-shortcut">{modKey}+C</span>
 			</button>
 			<button onclick={ctxCopyPlain}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h16M12 5v14M8 19h8"/></svg>
-				Copy as Plain Text
+				{$ui("ui.copy_as_plain_text")}
 			</button>
 			<button onclick={ctxPaste}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4h2a2 2 0 012 2v14a2 2 0 01-2 2H6a2 2 0 01-2-2V6a2 2 0 012-2h2"/><rect x="8" y="2" width="8" height="4" rx="1" ry="1"/></svg>
-				Paste
+				{$ui("ui.paste")}
 				<span class="text-ctx-shortcut">{modKey}+V</span>
 			</button>
 			<div class="text-ctx-sep"></div>
 			<button onclick={ctxSelectAll}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M8 7h8M8 12h8M8 17h8"/></svg>
-				Select All
+				{$ui("ui.select_all")}
 				<span class="text-ctx-shortcut">{modKey}+A</span>
 			</button>
 			<div class="text-ctx-sep"></div>
@@ -8787,90 +8809,90 @@
 			<div class="text-ctx-submenu-wrap" onmouseenter={() => ctxHeadingSubmenu = true} onmouseleave={() => ctxHeadingSubmenu = false}>
 				<button class="has-submenu">
 					<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h16M4 6v12M20 6v12"/></svg>
-					Heading
+					{$ui("ui.heading")}
 					<svg class="submenu-arrow" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 6 15 12 9 18"/></svg>
 				</button>
 				{#if ctxHeadingSubmenu}
 					<div class="text-ctx-submenu" class:flip-left={textContextMenu?.submenuLeft}>
-						<button class:active={isEditorActive('heading', { level: 1 })} onclick={() => ctxSetHeading(1)}>Heading 1</button>
-						<button class:active={isEditorActive('heading', { level: 2 })} onclick={() => ctxSetHeading(2)}>Heading 2</button>
-						<button class:active={isEditorActive('heading', { level: 3 })} onclick={() => ctxSetHeading(3)}>Heading 3</button>
-						<button class:active={isEditorActive('heading', { level: 4 })} onclick={() => ctxSetHeading(4)}>Heading 4</button>
+						<button class:active={isEditorActive('heading', { level: 1 })} onclick={() => ctxSetHeading(1)}>{$ui("ui.heading_1")}</button>
+						<button class:active={isEditorActive('heading', { level: 2 })} onclick={() => ctxSetHeading(2)}>{$ui("ui.heading_2")}</button>
+						<button class:active={isEditorActive('heading', { level: 3 })} onclick={() => ctxSetHeading(3)}>{$ui("ui.heading_3")}</button>
+						<button class:active={isEditorActive('heading', { level: 4 })} onclick={() => ctxSetHeading(4)}>{$ui("ui.heading_4")}</button>
 						<div class="text-ctx-sep"></div>
-						<button class:active={isEditorActive('paragraph')} onclick={ctxSetParagraph}>Paragraph</button>
+						<button class:active={isEditorActive('paragraph')} onclick={ctxSetParagraph}>{$ui("ui.paragraph")}</button>
 					</div>
 				{/if}
 			</div>
 			<div class="text-ctx-sep"></div>
 			<button onclick={ctxBold}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1"><path d="M6 4h8a4 4 0 014 4 4 4 0 01-4 4H6zm0 8h9a4 4 0 014 4 4 4 0 01-4 4H6z"/></svg>
-				Bold
+				{$ui("ui.bold")}
 				<span class="text-ctx-shortcut">{modKey}+B</span>
 			</button>
 			<button onclick={ctxItalic}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="19" y1="4" x2="10" y2="4"/><line x1="14" y1="20" x2="5" y2="20"/><line x1="15" y1="4" x2="9" y2="20"/></svg>
-				Italic
+				{$ui("ui.italic")}
 				<span class="text-ctx-shortcut">{modKey}+I</span>
 			</button>
 			<button onclick={ctxUnderline}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3v7a6 6 0 006 6 6 6 0 006-6V3"/><line x1="4" y1="21" x2="20" y2="21"/></svg>
-				Underline
+				{$ui("ui.underline")}
 				<span class="text-ctx-shortcut">{modKey}+U</span>
 			</button>
 			<button onclick={ctxStrike}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4H9a3 3 0 00-3 3 3 3 0 003 3h6"/><line x1="4" y1="12" x2="20" y2="12"/><path d="M8 20h7a3 3 0 003-3 3 3 0 00-3-3H8"/></svg>
-				Strikethrough
+				{$ui("ui.strikethrough")}
 			</button>
 			<button onclick={ctxHighlight}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
-				Highlight
+				{$ui("ui.highlight")}
 			</button>
 			<button onclick={ctxClearFormatting}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21"/><path d="M22 21H7"/><path d="m5 11 9 9"/></svg>
-				Clear Formatting
+				{$ui("ui.clear_formatting")}
 			</button>
 			<div class="text-ctx-sep"></div>
 			<button onclick={ctxLink}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71"/></svg>
-				Add Link
+				{$ui("ui.add_link")}
 				<span class="text-ctx-shortcut">{modKey}+K</span>
 			</button>
 			<button onclick={ctxCode}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-				Inline Code
+				{$ui("ui.inline_code")}
 			</button>
 			<button onclick={ctxCodeBlock}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><polyline points="9 8 5 12 9 16"/><polyline points="15 8 19 12 15 16"/></svg>
-				Code Block
+				{$ui("ui.code_block")}
 			</button>
 			<button onclick={ctxBlockquote}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><path d="M3 6h4v4l-2 6H3l2-6H3V6zm10 0h4v4l-2 6h-2l2-6h-2V6z"/></svg>
-				Quote
+				{$ui("ui.quote")}
 			</button>
 			<button onclick={ctxDetails}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><polyline points="10 8 14 12 10 16"/></svg>
-				Collapsible Section
+				{$ui("ui.collapsible_section")}
 			</button>
 			<button onclick={ctxCallout}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="18" height="14" rx="2"/><line x1="7" y1="5" x2="7" y2="19"/></svg>
-				Callout
+				{$ui("ui.callout")}
 			</button>
 			<button onclick={ctxTimestamp}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 7.5V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h6"/><line x1="3" y1="10" x2="21" y2="10"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="16" y1="2" x2="16" y2="6"/><circle cx="18" cy="17" r="4"/><path d="M18 15.5v1.5l1 1"/></svg>
-				Date &amp; Time
+				{$ui("ui.date_time")}
 			</button>
 			<div class="text-ctx-sep"></div>
 			<button onclick={ctxBulletList}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><circle cx="3.5" cy="6" r="1.5" fill="currentColor"/><circle cx="3.5" cy="12" r="1.5" fill="currentColor"/><circle cx="3.5" cy="18" r="1.5" fill="currentColor"/></svg>
-				Bullet List
+				{$ui("ui.bullet_list")}
 			</button>
 			<button onclick={ctxOrderedList}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="10" y1="6" x2="21" y2="6"/><line x1="10" y1="12" x2="21" y2="12"/><line x1="10" y1="18" x2="21" y2="18"/><text x="1" y="8" font-size="8" fill="currentColor" stroke="none" font-weight="600">1</text><text x="1" y="14" font-size="8" fill="currentColor" stroke="none" font-weight="600">2</text><text x="1" y="20" font-size="8" fill="currentColor" stroke="none" font-weight="600">3</text></svg>
-				Numbered List
+				{$ui("ui.numbered_list")}
 			</button>
 			<button onclick={ctxTaskList}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><polyline points="4.5 6.5 6 8 8.5 4.5"/><line x1="13" y1="6.5" x2="21" y2="6.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><line x1="13" y1="17.5" x2="21" y2="17.5"/></svg>
-				Task List
+				{$ui("ui.task_list")}
 			</button>
 			{#if $appConfig?.ai_provider}
 				<div class="text-ctx-sep"></div>
@@ -8879,7 +8901,7 @@
 						<path d="M12 2a4 4 0 014 4v1a1 1 0 001 1h1a4 4 0 010 8h-1a1 1 0 00-1 1v1a4 4 0 01-8 0v-1a1 1 0 00-1-1H6a4 4 0 010-8h1a1 1 0 001-1V6a4 4 0 014-4z" />
 						<circle cx="12" cy="12" r="2" />
 					</svg>
-					AI Actions
+					{$ui("ui.ai_actions")}
 				</button>
 			{/if}
 		</div>
@@ -8892,54 +8914,54 @@
 		<div class="table-ctx-menu" style="left: {tableContextMenu.x}px; top: {tableContextMenu.y}px; max-height: calc(100vh - {tableContextMenu.y}px - 8px); overflow-y: auto;">
 			<button onclick={tblAddRowBefore}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M3 12h18M3 18h18"/><path d="M12 3v3"/><polyline points="9 4.5 12 2 15 4.5"/></svg>
-				Add Row Above
+				{$ui("ui.add_row_above")}
 			</button>
 			<button onclick={tblAddRowAfter}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18M3 12h18M3 18h18"/><path d="M12 21v-3"/><polyline points="9 19.5 12 22 15 19.5"/></svg>
-				Add Row Below
+				{$ui("ui.add_row_below")}
 			</button>
 			<button class="danger" onclick={tblDeleteRow}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
-				Delete Row
+				{$ui("ui.delete_row")}
 			</button>
 			<div class="table-ctx-sep"></div>
 			<button onclick={tblAddColBefore}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3v18M12 3v18M18 3v18"/><path d="M3 12h3"/><polyline points="4.5 9 2 12 4.5 15"/></svg>
-				Add Column Left
+				{$ui("ui.add_column_left")}
 			</button>
 			<button onclick={tblAddColAfter}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3v18M12 3v18M18 3v18"/><path d="M21 12h-3"/><polyline points="19.5 9 22 12 19.5 15"/></svg>
-				Add Column Right
+				{$ui("ui.add_column_right")}
 			</button>
 			<button class="danger" onclick={tblDeleteCol}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"/><line x1="18" y1="6" x2="6" y2="18"/></svg>
-				Delete Column
+				{$ui("ui.delete_column")}
 			</button>
 			<div class="table-ctx-sep"></div>
 			<button onclick={tblMergeCells}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/><path d="M14 9l-4 3 4 3"/></svg>
-				Merge Cells
+				{$ui("ui.merge_cells")}
 			</button>
 			<button onclick={tblSplitCell}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M12 3v18"/><path d="M8 9l4 3-4 3"/><path d="M16 9l-4 3 4 3"/></svg>
-				Split Cell
+				{$ui("ui.split_cell")}
 			</button>
 			<div class="table-ctx-sep"></div>
 			<button onclick={tblToggleHeaderRow}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="3" y1="9" x2="21" y2="9"/><rect x="4" y="4" width="16" height="4" rx="1" fill="currentColor" opacity="0.2"/></svg>
-				Toggle Header Row
+				{$ui("ui.toggle_header_row")}
 			</button>
 			<button onclick={tblToggleHeaderCol}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/><rect x="4" y="4" width="4" height="16" rx="1" fill="currentColor" opacity="0.2"/></svg>
-				Toggle Header Column
+				{$ui("ui.toggle_header_column")}
 			</button>
 			<div class="table-ctx-sep"></div>
-			<div class="table-ctx-color-label">Cell Color</div>
+			<div class="table-ctx-color-label">{$ui("ui.cell_color")}</div>
 			<div class="table-ctx-colors">
 				{#each cellColors as color}
 					<button
 						class="table-ctx-color-swatch"
-						title={color.name}
+						title={$uiLabel(color.name)}
 						style="background: {color.value || 'var(--bg-primary)'}; {color.value === '' ? 'border: 1px dashed var(--border-color);' : ''}"
 						onclick={() => tblSetCellColor(color.value)}
 					></button>
@@ -8947,15 +8969,15 @@
 			</div>
 			<div class="table-ctx-sep"></div>
 			{#if tableContextMenu.hasStyling}
-			<button onclick={resetTableToMarkdown} title="Strip cell colors, merged cells, and custom widths, output as plain markdown">
+			<button onclick={resetTableToMarkdown} title={$ui("ui.strip_cell_colors_merged_cells_and_custom_widths_output_as_pla_e0d336")}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 11-3-6.7"/><polyline points="21 4 21 10 15 10"/></svg>
-				Reset to Markdown
+				{$ui("ui.reset_to_markdown")}
 			</button>
 			<div class="table-ctx-sep"></div>
 			{/if}
 			<button class="danger" onclick={tblDeleteTable}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2"/></svg>
-				Delete Table
+				{$ui("ui.delete_table")}
 			</button>
 		</div>
 	</div>
@@ -8965,29 +8987,29 @@
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div class="img-toolbar-overlay" onclick={(e) => closeFromOverlay(e, () => (imageToolbar = null))} onkeydown={(e) => closeOnEscape(e, () => (imageToolbar = null))}>
 		<div class="img-toolbar" class:mobile-viewer-toolbar={isAndroid} style="left: {imageToolbar.x}px; top: {imageToolbar.y}px">
-			<button class:active={imageToolbar.size === 'small'} onclick={() => setImageSize('small')} title="Small (33%)">S</button>
-			<button class:active={imageToolbar.size === 'medium'} onclick={() => setImageSize('medium')} title="Medium (50%)">M</button>
-			<button class:active={imageToolbar.size === 'full'} onclick={() => setImageSize('full')} title="Full width">L</button>
-			<button class:active={!!imageToolbar.title} onclick={openImageTitleModal} title={imageToolbar.title ? `Hover text: ${imageToolbar.title}` : 'Set hover text'} aria-label="Image hover text">T</button>
+			<button class:active={imageToolbar.size === 'small'} onclick={() => setImageSize('small')} title={$ui("ui.small_33")}>S</button>
+			<button class:active={imageToolbar.size === 'medium'} onclick={() => setImageSize('medium')} title={$ui("ui.medium_50")}>M</button>
+			<button class:active={imageToolbar.size === 'full'} onclick={() => setImageSize('full')} title={$ui("ui.full_width")}>L</button>
+			<button class:active={!!imageToolbar.title} onclick={openImageTitleModal} title={imageToolbar.title ? $ui("ui.hover_text", { value0: imageToolbar.title }) : $ui("ui.set_hover_text")} aria-label={$ui("ui.image_hover_text")}>T</button>
 			<span class="img-toolbar-sep"></span>
 			{#if imageToolbar.inGrid}
-				<button onclick={() => moveGridImage(-1)} title="Move left in grid" aria-label="Move left in grid">←</button>
-				<button onclick={() => moveGridImage(1)} title="Move right in grid" aria-label="Move right in grid">→</button>
+				<button onclick={() => moveGridImage(-1)} title={$ui("ui.move_left_in_grid")} aria-label={$ui("ui.move_left_in_grid")}>←</button>
+				<button onclick={() => moveGridImage(1)} title={$ui("ui.move_right_in_grid")} aria-label={$ui("ui.move_right_in_grid")}>→</button>
 			{:else}
-				<button onclick={wrapNearbyImagesInGrid} disabled={!imageToolbar.canGroup} title={imageToolbar.canGroup ? 'Group neighboring images into a grid' : 'Put another image right above or below this one to make a grid'}>Grid</button>
+				<button onclick={wrapNearbyImagesInGrid} disabled={!imageToolbar.canGroup} title={imageToolbar.canGroup ? $ui("ui.group_neighboring_images_into_a_grid") : $ui("ui.put_another_image_right_above_or_below_this_one_to_make_a_grid")}>{$ui("ui.grid")}</button>
 			{/if}
 			{#if isAndroid}
 				<span class="img-toolbar-sep"></span>
-				<button class="img-toolbar-view" onclick={openImageViewer} title="View and zoom image" aria-label="View and zoom image">
+				<button class="img-toolbar-view" onclick={openImageViewer} title={$ui("ui.view_and_zoom_image")} aria-label={$ui("ui.view_and_zoom_image")}>
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H5a2 2 0 00-2 2v3M16 3h3a2 2 0 012 2v3M8 21H5a2 2 0 01-2-2v-3M16 21h3a2 2 0 002-2v-3"/></svg>
 				</button>
 			{/if}
 			{#if !isMobile && !imageToolbar.src.startsWith('imgproxy:') && !imageToolbar.src.startsWith('http://imgproxy.localhost') && !imageToolbar.src.startsWith('https://imgproxy.localhost')}
 				<span class="img-toolbar-sep"></span>
-				<button onclick={copyImageToClipboard} title="Copy image">
+				<button onclick={copyImageToClipboard} title={$ui("ui.copy_image")}>
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
 				</button>
-				<button onclick={openImageInApp} title="Open in default app">
+				<button onclick={openImageInApp} title={$ui("ui.open_in_default_app")}>
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
 				</button>
 			{/if}
@@ -9002,16 +9024,16 @@
 {#if imageTitleModal}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div class="math-modal-overlay" onclick={(e) => closeFromOverlay(e, cancelImageTitleModal)} onkeydown={(e) => closeOnEscape(e, cancelImageTitleModal)}>
-		<div class="math-modal" role="dialog" aria-modal="true" aria-label="Image hover text" tabindex="-1">
+		<div class="math-modal" role="dialog" aria-modal="true" aria-label={$ui("ui.image_hover_text")} tabindex="-1">
 			<div class="math-modal-header">
-				<span>Image hover text</span>
-				<button type="button" class="math-modal-close" onclick={cancelImageTitleModal} aria-label="Close">
+				<span>{$ui("ui.image_hover_text")}</span>
+				<button type="button" class="math-modal-close" onclick={cancelImageTitleModal} aria-label={$ui("ui.close")}>
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 				</button>
 			</div>
 			<input
 				class="math-modal-input img-title-input"
-				placeholder="Shown when hovering the image. Leave empty to remove it."
+				placeholder={$ui("ui.shown_when_hovering_the_image_leave_empty_to_remove_it")}
 				bind:value={imageTitleModal.title}
 				onkeydown={(e) => {
 					if (e.key === 'Enter') { e.preventDefault(); commitImageTitleModal(); }
@@ -9020,10 +9042,10 @@
 				use:autofocus
 			/>
 			<div class="math-modal-footer">
-				<span class="math-modal-hint">Saved as ![alt](image "hover text") · Enter to apply · Esc to cancel</span>
+				<span class="math-modal-hint">{$ui("ui.saved_as_alt_image_hover_text_enter_to_apply_esc_to_cancel")}</span>
 				<div class="math-modal-actions">
-					<button type="button" onclick={cancelImageTitleModal}>Cancel</button>
-					<button type="button" class="primary" onclick={commitImageTitleModal}>Apply</button>
+					<button type="button" onclick={cancelImageTitleModal}>{$ui("ui.cancel")}</button>
+					<button type="button" class="primary" onclick={commitImageTitleModal}>{$ui("ui.apply")}</button>
 				</div>
 			</div>
 		</div>
@@ -9037,12 +9059,12 @@
 				<circle cx="12" cy="12" r="10" opacity="0.25" />
 				<path d="M12 2a10 10 0 019.95 9" />
 			</svg>
-			Copying...
+			{$ui("ui.copying")}
 		{:else}
 			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
 				<polyline points="20 6 9 17 4 12" />
 			</svg>
-			Copied
+			{$ui("ui.copied")}
 		{/if}
 	</div>
 {/if}
@@ -9050,16 +9072,16 @@
 {#if mathModal}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div class="math-modal-overlay" onclick={(e) => closeFromOverlay(e, cancelMathModal)} onkeydown={(e) => closeOnEscape(e, cancelMathModal)}>
-		<div class="math-modal" role="dialog" aria-modal="true" aria-label="Math editor" tabindex="-1">
+		<div class="math-modal" role="dialog" aria-modal="true" aria-label={$ui("ui.math_editor")} tabindex="-1">
 			<div class="math-modal-header">
-				<span>{mathModal.editPos !== null ? 'Edit' : 'Insert'} {mathModal.kind === 'block' ? 'Math Block' : 'Inline Math'}</span>
-				<button type="button" class="math-modal-close" onclick={cancelMathModal} aria-label="Close">
+				<span>{mathModal.editPos !== null ? $ui("ui.edit") : $ui("ui.insert")} {mathModal.kind === 'block' ? $ui("ui.math_block") : $ui("ui.inline_math")}</span>
+				<button type="button" class="math-modal-close" onclick={cancelMathModal} aria-label={$ui("ui.close")}>
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 				</button>
 			</div>
 			<textarea
 				class="math-modal-input"
-				placeholder="LaTeX, e.g. E = mc^2"
+				placeholder={$ui("ui.latex_e_g_e_mc_2")}
 				bind:value={mathModal.tex}
 				onkeydown={(e) => {
 					if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); commitMathModal(); }
@@ -9071,15 +9093,15 @@
 				{#if mathModal.tex.trim()}
 					<div>{@html renderMathPreview(mathModal.tex, mathModal.kind === 'block')}</div>
 				{:else}
-					<span class="math-modal-preview-empty">Preview appears here…</span>
+					<span class="math-modal-preview-empty">{$ui("ui.preview_appears_here")}</span>
 				{/if}
 			</div>
 			<div class="math-modal-footer">
-				<span class="math-modal-hint">{modKey}+Enter to {mathModal.editPos !== null ? 'update' : 'insert'} · Esc to cancel</span>
+				<span class="math-modal-hint">{$ui("ui.enter_to_esc_to_cancel", { value0: modKey, value1: mathModal.editPos !== null ? $ui('ui.update') : $ui('ui.insert') })}</span>
 				<div class="math-modal-actions">
-					<button type="button" onclick={cancelMathModal}>Cancel</button>
+					<button type="button" onclick={cancelMathModal}>{$ui("ui.cancel")}</button>
 					<button type="button" class="primary" onclick={commitMathModal} disabled={!mathModal.tex.trim()}>
-						{mathModal.editPos !== null ? 'Update' : 'Insert'}
+						{mathModal.editPos !== null ? $ui("ui.update") : $ui("ui.insert")}
 					</button>
 				</div>
 			</div>
@@ -9090,17 +9112,17 @@
 {#if secretModal}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div class="math-modal-overlay" onclick={(e) => closeFromOverlay(e, cancelSecretModal)} onkeydown={(e) => closeOnEscape(e, cancelSecretModal)}>
-		<div class="math-modal secret-modal" role="dialog" aria-modal="true" aria-label="Encrypted secret editor" tabindex="-1">
+		<div class="math-modal secret-modal" role="dialog" aria-modal="true" aria-label={$ui("ui.encrypted_secret_editor")} tabindex="-1">
 			<div class="math-modal-header">
-				<span>Insert Secret</span>
-				<button type="button" class="math-modal-close" onclick={cancelSecretModal} aria-label="Close">
+				<span>{$ui("ui.insert_secret")}</span>
+				<button type="button" class="math-modal-close" onclick={cancelSecretModal} aria-label={$ui("ui.close")}>
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 				</button>
 			</div>
 			<input
 				class="secret-modal-title"
 				type="text"
-				placeholder="Title"
+				placeholder={$ui("ui.title")}
 				bind:value={secretModal.title}
 				bind:this={secretTitleInput}
 				onkeydown={(e) => {
@@ -9110,7 +9132,7 @@
 			/>
 			<textarea
 				class="math-modal-input secret-modal-text"
-				placeholder="Secret text"
+				placeholder={$ui("ui.secret_text")}
 				bind:value={secretModal.text}
 				onkeydown={(e) => {
 					if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') { e.preventDefault(); commitSecretModal(); }
@@ -9120,7 +9142,7 @@
 			<div class="secret-modal-fields">
 				<input
 					type="password"
-					placeholder="Passphrase"
+					placeholder={$ui("ui.passphrase")}
 					autocomplete="new-password"
 					bind:value={secretModal.passphrase}
 					onkeydown={(e) => {
@@ -9130,7 +9152,7 @@
 				/>
 				<input
 					type="password"
-					placeholder="Confirm passphrase"
+					placeholder={$ui("ui.confirm_passphrase")}
 					autocomplete="new-password"
 					bind:value={secretModal.confirmPassphrase}
 					onkeydown={(e) => {
@@ -9143,11 +9165,11 @@
 				<div class="secret-modal-error">{secretModal.error}</div>
 			{/if}
 			<div class="math-modal-footer">
-				<span class="math-modal-hint">Stored as a portable helix-secret markdown block</span>
+				<span class="math-modal-hint">{$ui("ui.stored_as_a_portable_helix_secret_markdown_block")}</span>
 				<div class="math-modal-actions">
-					<button type="button" onclick={cancelSecretModal} disabled={secretModal.busy}>Cancel</button>
+					<button type="button" onclick={cancelSecretModal} disabled={secretModal.busy}>{$ui("ui.cancel")}</button>
 					<button type="button" class="primary" onclick={commitSecretModal} disabled={secretModal.busy || !secretModal.text || !secretModal.passphrase || !secretModal.confirmPassphrase}>
-						{secretModal.busy ? 'Encrypting...' : 'Encrypt'}
+						{secretModal.busy ? $ui("ui.encrypting") : $ui("ui.encrypt")}
 					</button>
 				</div>
 			</div>
@@ -9158,17 +9180,17 @@
 {#if viewerImportPickerOpen}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div class="viewer-import-overlay" onclick={(e) => closeFromOverlay(e, () => (viewerImportPickerOpen = false))} onkeydown={(e) => closeOnEscape(e, () => (viewerImportPickerOpen = false))}>
-		<div class="viewer-import-picker" role="dialog" aria-modal="true" aria-label="Import image to folder" tabindex="-1">
+		<div class="viewer-import-picker" role="dialog" aria-modal="true" aria-label={$ui("ui.import_image_to_folder")} tabindex="-1">
 			<div class="viewer-import-header">
-				<span>Import to folder</span>
-				<button type="button" class="viewer-import-close" onclick={() => (viewerImportPickerOpen = false)} aria-label="Close">
+				<span>{$ui("ui.import_to_folder")}</span>
+				<button type="button" class="viewer-import-close" onclick={() => (viewerImportPickerOpen = false)} aria-label={$ui("ui.close")}>
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 				</button>
 			</div>
 			<div class="viewer-import-list">
 				<button type="button" class="viewer-import-item" onclick={() => viewerImportTo('')} disabled={viewerImportBusy}>
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
-					Vault root
+					{$ui("ui.vault_root")}
 				</button>
 				{#each viewerFlatNotebooks as nb (nb.path)}
 					<button type="button" class="viewer-import-item" style="padding-left: {12 + nb.depth * 16}px" onclick={() => viewerImportTo(nb.path)} disabled={viewerImportBusy}>
@@ -9190,7 +9212,7 @@
 					{#each $activeNote.meta.tags as tag, i (tagIterationKey(tag, i))}
 						<span class="tag-menu-chip">
 							<TagLabel name={tag} size={12} />
-							<button class="tag-menu-remove" onclick={() => removeActiveNoteTag(tag)} title="Remove tag" aria-label="Remove tag">
+							<button class="tag-menu-remove" onclick={() => removeActiveNoteTag(tag)} title={$ui("ui.remove_tag")} aria-label={$ui("ui.remove_tag")}>
 								<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 							</button>
 						</span>
@@ -9199,7 +9221,7 @@
 			{/if}
 			<TagSuggestInput
 				existing={$activeNote.meta.tags}
-				placeholder="Add tag..."
+				placeholder={$ui("ui.add_tag")}
 				onsubmit={(t) => addActiveNoteTag(t)}
 				oncancel={() => (tagMenu = null)}
 			/>
@@ -9211,7 +9233,7 @@
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div class="code-lang-overlay" onclick={(e) => closeFromOverlay(e, closeCodeLangDropdown)} onkeydown={(e) => closeOnEscape(e, closeCodeLangDropdown)}>
 		<div class="code-lang-dropdown" style="left: {codeLangDropdown.x}px; top: {codeLangDropdown.y}px">
-			<input class="code-lang-search" type="text" placeholder="Search..." bind:this={codeLangInput} bind:value={codeLangSearch} onkeydown={(e) => {
+			<input class="code-lang-search" type="text" placeholder={$ui("ui.search_6d7a30")} bind:this={codeLangInput} bind:value={codeLangSearch} onkeydown={(e) => {
 				if (e.key === 'Enter' && codeLangFiltered.length > 0) { e.preventDefault(); e.stopPropagation(); selectCodeLang(codeLangFiltered[0]); }
 				if (e.key === 'Escape') closeCodeLangDropdown();
 			}} />
@@ -9220,7 +9242,7 @@
 					class="code-lang-option"
 					class:active={codeLangDropdown.current === ''}
 					onclick={() => selectCodeLang('')}
-				>auto</button>
+				>{$ui("ui.auto")}</button>
 			{/if}
 			{#each codeLangFiltered as lang}
 				<button
@@ -9230,7 +9252,7 @@
 				>{lang}</button>
 			{/each}
 			{#if codeLangFiltered.length === 0}
-				<div class="code-lang-empty">No match</div>
+				<div class="code-lang-empty">{$ui("ui.no_match")}</div>
 			{/if}
 		</div>
 	</div>
@@ -9256,7 +9278,7 @@
 						{/each}
 					</div>
 					<div class="slash-table-picker-label">
-						{slashTableHover.rows > 0 ? `${slashTableHover.rows} x ${slashTableHover.cols}` : 'Select table size'}
+						{slashTableHover.rows > 0 ? `${slashTableHover.rows} x ${slashTableHover.cols}` : $ui("ui.select_table_size")}
 					</div>
 				</div>
 			{:else if slashColorPicker}
@@ -9267,7 +9289,7 @@
 						{/each}
 					</div>
 					<div class="slash-color-row">
-						<input type="color" class="slash-color-native" value={/^#[0-9a-fA-F]{6}$/.test(slashColorHex) ? slashColorHex : '#4b6abf'} oninput={(e) => { slashColorHex = (e.target as HTMLInputElement).value; }} title="Pick a color" />
+						<input type="color" class="slash-color-native" value={/^#[0-9a-fA-F]{6}$/.test(slashColorHex) ? slashColorHex : '#4b6abf'} oninput={(e) => { slashColorHex = (e.target as HTMLInputElement).value; }} title={$ui("ui.pick_a_color")} />
 						<input
 							type="text"
 							class="slash-color-input"
@@ -9277,11 +9299,11 @@
 							oninput={(e) => { slashColorHex = (e.target as HTMLInputElement).value; }}
 							onkeydown={(e) => { if (e.key === 'Enter') { e.preventDefault(); insertColor(slashColorHex); } else if (e.key === 'Escape') { e.preventDefault(); closeSlashMenu(); } }}
 						/>
-						<button class="slash-color-insert" onmousedown={(e) => { e.preventDefault(); insertColor(slashColorHex); }}>Insert</button>
+						<button class="slash-color-insert" onmousedown={(e) => { e.preventDefault(); insertColor(slashColorHex); }}>{$ui("ui.insert")}</button>
 					</div>
 				</div>
 			{:else if slashFiltered.length === 0}
-				<div class="slash-menu-empty">No matching commands</div>
+				<div class="slash-menu-empty">{$ui("ui.no_matching_commands")}</div>
 			{:else}
 				{#each slashFiltered as cmd, i}
 					<button
@@ -9291,7 +9313,7 @@
 						onmousedown={(e) => { e.preventDefault(); executeSlashCommand(i); }}
 					>
 						<span class="slash-menu-icon">{@html cmd.icon}</span>
-						<span class="slash-menu-label">{cmd.label}</span>
+						<span class="slash-menu-label">{$uiLabel(cmd.label)}</span>
 					</button>
 				{/each}
 			{/if}
@@ -9304,7 +9326,7 @@
 	<div class="slash-menu-overlay" onclick={(e) => closeFromOverlay(e, closeTaskMetaMenu)} onkeydown={(e) => closeOnEscape(e, closeTaskMetaMenu)}>
 		<div class="slash-menu" style="left: {taskMetaMenu.x}px; top: {taskMetaMenu.y}px">
 			{#if taskMetaFiltered.length === 0}
-				<div class="slash-menu-empty">No match</div>
+				<div class="slash-menu-empty">{$ui("ui.no_match")}</div>
 			{:else}
 				{#each taskMetaFiltered as item, i}
 					<button
@@ -9314,7 +9336,7 @@
 						onmousedown={(e) => { e.preventDefault(); selectTaskMeta(i); }}
 					>
 						<span class="slash-menu-icon">{@html item.icon}</span>
-						<span class="slash-menu-label">{item.label}</span>
+						<span class="slash-menu-label">{$uiLabel(item.label)}</span>
 					</button>
 				{/each}
 			{/if}
@@ -9342,7 +9364,7 @@
 		<div class="wiki-link-menu" style="left: {wikiLinkMenu.x}px; top: {wikiLinkMenu.y}px">
 			{#if wikiLinkRowCount === 0}
 				<div class="wiki-link-empty">
-					{wikiLinkMenu.query ? 'No matching notes' : 'Type to search notes...'}
+					{wikiLinkMenu.query ? $ui("ui.no_matching_notes") : $ui("ui.type_to_search_notes")}
 				</div>
 			{:else}
 				{#each wikiLinkVisible as entry, i}
@@ -9370,7 +9392,7 @@
 					>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V9z"/><polyline points="13 2 13 9 20 9"/><path d="M12 12v6M9 15h6"/></svg>
 						<span class="wiki-link-title-col">
-							<span class="wiki-link-title">Create note "{wikiLinkCreateTitle}"</span>
+							<span class="wiki-link-title">{$ui("ui.create_note", { value0: wikiLinkCreateTitle })}</span>
 						</span>
 					</button>
 				{/if}
@@ -9383,7 +9405,7 @@
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div class="wiki-link-overlay" onclick={(e) => closeFromOverlay(e, () => wikiLinkNavDisambig = null)} onkeydown={(e) => closeOnEscape(e, () => wikiLinkNavDisambig = null)}>
 		<div class="wiki-link-menu" style="left: {wikiLinkNavDisambig.x}px; top: {wikiLinkNavDisambig.y}px">
-			<div class="wiki-link-disambig-header">Multiple notes found - choose one:</div>
+			<div class="wiki-link-disambig-header">{$ui("ui.multiple_notes_found_choose_one")}</div>
 			{#each wikiLinkNavDisambig.entries as entry, i}
 				<button
 					class="wiki-link-item"
@@ -9405,129 +9427,132 @@
 {#if aiMenu}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div class="ai-menu-overlay" class:mobile={isMobile} onclick={(e) => closeFromOverlay(e, closeAiMenu)} onkeydown={(e) => closeOnEscape(e, closeAiMenu)}>
-		<div class="ai-menu" class:mobile={isMobile} style={isMobile ? '' : `left: ${aiMenu.x}px; top: ${aiMenu.y}px`}>
+		<div class="ai-menu" class:mobile={isMobile} style={isMobile ? '' : `left: clamp(8px, ${aiMenu.x}px, calc(100vw - min(480px, calc(100vw - 16px)) - 8px)); top: clamp(8px, ${aiMenu.y}px, calc(20vh - 8px))`}>
+			{#if aiResult === null && !aiLoading}
+				<AiImageOptions images={aiImages} bind:selected={aiSelectedImages} destination={aiDestination} />
+			{/if}
 			{#if aiResult !== null || aiLoading}
 				<!-- Result view -->
 				<div class="ai-result-header">
 					<span class="ai-result-title">
 						{#if aiLoading}
 							<svg class="ai-spinner" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" opacity="0.25" /><path d="M12 2a10 10 0 019.95 9" /></svg>
-							Generating...
+							{$ui("ui.generating")}
 						{:else}
-							AI Result
+							{$ui("ui.ai_result")}
 						{/if}
 					</span>
-					<button class="ai-result-close" onclick={closeAiMenu} aria-label="Close AI menu">
+					<button class="ai-result-close" onclick={closeAiMenu} aria-label={$ui("ui.close_ai_menu")}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
 					</button>
 				</div>
-				{#if aiError}
-					<div class="ai-error">{aiError}</div>
-				{:else}
-					<div class="ai-result-body">{aiResult}</div>
-				{/if}
+				{#if aiError}<div class="ai-error" role="alert">{aiError}</div>{/if}
+				{#if aiResult}<div class="ai-result-body">{aiResult}</div>{/if}
 				{#if !aiLoading && aiResult && !aiError}
 					<div class="ai-result-actions">
 						<button class="ai-action-btn apply" onclick={aiApplyResult}>
 							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-							{aiEmptyNote ? 'Insert Note' : aiWholeNote ? 'Apply to Note' : 'Replace'}
+							{aiEmptyNote ? $ui("ui.insert_note") : aiWholeNote ? $ui("ui.apply_to_note") : $ui("ui.replace")}
 						</button>
 						<button class="ai-action-btn discard" onclick={aiDiscard}>
 							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
-							Discard
+							{$ui("ui.discard")}
 						</button>
 					</div>
 				{/if}
 			{:else if aiShowCustom}
 				<!-- Custom prompt input -->
 				<div class="ai-custom-header">
-					<button class="ai-back-btn" onclick={() => aiShowCustom = false} aria-label="Back to AI actions">
+					<button class="ai-back-btn" onclick={() => aiShowCustom = false} aria-label={$ui("ui.back_to_ai_actions")}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
 					</button>
-					<span>Custom Prompt</span>
+					<span>{$ui("ui.custom_prompt")}</span>
 				</div>
 				<div class="ai-custom-body">
 					<textarea
 						class="ai-custom-input"
-						placeholder="Tell AI what to do with the selected text..."
+						placeholder={$ui("ui.tell_ai_what_to_do_with_the_selected_text")}
 						bind:value={aiCustomPrompt}
 						onkeydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); runAiAction('custom', aiCustomPrompt); } }}
 						use:autofocus
 					></textarea>
 					<button class="ai-custom-submit" onclick={() => runAiAction('custom', aiCustomPrompt)} disabled={!aiCustomPrompt.trim()}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" /></svg>
-						Send
+						{$ui("ui.send")}
 					</button>
 				</div>
 			{:else if aiTranslateMenu}
 				<!-- Translate submenu -->
 				<div class="ai-custom-header">
-					<button class="ai-back-btn" onclick={() => aiTranslateMenu = false} aria-label="Back to AI actions">
+					<button class="ai-back-btn" onclick={() => aiTranslateMenu = false} aria-label={$ui("ui.back_to_ai_actions")}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
 					</button>
-					<span>Translate to</span>
+					<span>{$ui("ui.translate_to")}</span>
 				</div>
-				<button class="ai-menu-item" onclick={() => runAiAction('translate_en')}>English</button>
-				<button class="ai-menu-item" onclick={() => runAiAction('translate_nl')}>Dutch</button>
-				<button class="ai-menu-item" onclick={() => runAiAction('translate_de')}>German</button>
-				<button class="ai-menu-item" onclick={() => runAiAction('translate_fr')}>French</button>
-				<button class="ai-menu-item" onclick={() => runAiAction('translate_es')}>Spanish</button>
+				<button class="ai-menu-item" onclick={() => runAiAction('translate_en')}>{$uiLabel("English")}</button>
+				<button class="ai-menu-item" onclick={() => runAiAction('translate_nl')}>{$ui("ui.dutch")}</button>
+				<button class="ai-menu-item" onclick={() => runAiAction('translate_de')}>{$ui("ui.german")}</button>
+				<button class="ai-menu-item" onclick={() => runAiAction('translate_fr')}>{$ui("ui.french")}</button>
+				<button class="ai-menu-item" onclick={() => runAiAction('translate_es')}>{$ui("ui.spanish")}</button>
 			{:else if aiEmptyNote}
 				<!-- Empty note - generate from prompt -->
-				<div class="ai-menu-label">Generate Note</div>
+				<div class="ai-menu-label">{$ui("ui.generate_note")}</div>
 				<div class="ai-custom-body">
 					<textarea
 						class="ai-custom-input"
-						placeholder="Describe the note you want to create..."
+						placeholder={$ui("ui.describe_the_note_you_want_to_create")}
 						bind:value={aiCustomPrompt}
 						onkeydown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); runAiAction('custom', aiCustomPrompt); } }}
 						use:autofocus
 					></textarea>
 					<button class="ai-custom-submit" onclick={() => runAiAction('custom', aiCustomPrompt)} disabled={!aiCustomPrompt.trim()}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4l-2-2"/><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M9 13v2"/><path d="M15 13v2"/></svg>
-						Generate
+						{$ui("ui.generate")}
 					</button>
 				</div>
 			{:else}
 				<!-- Action list -->
-				<div class="ai-menu-label">{aiWholeNote ? 'AI Actions (Entire Note)' : 'AI Actions'}</div>
+				<div class="ai-menu-label">{aiWholeNote ? $ui("ui.ai_actions_entire_note") : $ui("ui.ai_actions")}</div>
+				{#if aiSelectedImages.length}
+					<button class="ai-menu-item" onclick={() => runAiAction('describe_images')}>{$ui('ai.vision.describe')}</button>
+				{/if}
 				<button class="ai-menu-item" onclick={() => runAiAction('improve')}>
 					<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 013 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>
-					Improve Writing
+					{$ui("ui.improve_writing")}
 				</button>
 				<button class="ai-menu-item" onclick={() => runAiAction('fix_grammar')}>
 					<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
-					Fix Grammar
+					{$ui("ui.fix_grammar")}
 				</button>
 				<button class="ai-menu-item" onclick={() => runAiAction('shorter')}>
 					<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12h16"/><path d="M4 6h10"/></svg>
-					Make Shorter
+					{$ui("ui.make_shorter")}
 				</button>
 				<button class="ai-menu-item" onclick={() => runAiAction('longer')}>
 					<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h10"/></svg>
-					Make Longer
+					{$ui("ui.make_longer")}
 				</button>
 				<div class="ai-menu-sep"></div>
 				<button class="ai-menu-item" onclick={() => runAiAction('professional')}>
 					<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="14" rx="2" ry="2"/><path d="M16 7V5a2 2 0 00-2-2h-4a2 2 0 00-2 2v2"/></svg>
-					Professional Tone
+					{$ui("ui.professional_tone")}
 				</button>
 				<button class="ai-menu-item" onclick={() => runAiAction('friendly')}>
 					<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" y1="9" x2="9.01" y2="9"/><line x1="15" y1="9" x2="15.01" y2="9"/></svg>
-					Friendly Tone
+					{$ui("ui.friendly_tone")}
 				</button>
 				<div class="ai-menu-sep"></div>
 				<button class="ai-menu-item" onclick={() => runAiAction('summarize')}>
 					<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="10" x2="16" y2="10"/><line x1="4" y1="14" x2="12" y2="14"/></svg>
-					Summarize
+					{$ui("ui.summarize")}
 				</button>
 				<button class="ai-menu-item" onclick={() => runAiAction('explain')}>
 					<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M9.09 9a3 3 0 015.83 1c0 2-3 3-3 3"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
-					Explain
+					{$ui("ui.explain")}
 				</button>
 				<button class="ai-menu-item" onclick={() => aiTranslateMenu = true}>
 					<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 8l6 6"/><path d="M4 14l6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="M22 22l-5-10-5 10"/><path d="M14 18h6"/></svg>
-					Translate
+					{$ui("ui.translate")}
 					<span class="ai-menu-arrow">
 						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
 					</span>
@@ -9535,7 +9560,7 @@
 				<div class="ai-menu-sep"></div>
 				<button class="ai-menu-item" onclick={() => aiShowCustom = true}>
 					<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13" /><polygon points="22 2 15 22 11 13 2 9 22 2" /></svg>
-					Custom Prompt...
+					{$ui("ui.custom_prompt_bafcec")}
 				</button>
 			{/if}
 		</div>
@@ -9545,7 +9570,7 @@
 {#if linkModal}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div class="link-modal-overlay" onclick={(e) => closeFromOverlay(e, linkModalCancel)} onkeydown={(e) => closeOnEscape(e, linkModalCancel)}>
-		<div class="link-modal" role="dialog" aria-modal="true" aria-label="Insert link" tabindex="-1">
+		<div class="link-modal" role="dialog" aria-modal="true" aria-label={$ui("ui.insert_link")} tabindex="-1">
 			<div class="link-modal-header">
 				<svg width="28" height="28" viewBox="0 0 48 48" fill="none">
 					<rect width="48" height="48" rx="12" fill="var(--accent)" />
@@ -9556,7 +9581,7 @@
 					<line x1="19" y1="18" x2="29" y2="30" stroke="white" stroke-width="2" stroke-linecap="round" opacity="0.7" />
 					<line x1="29" y1="18" x2="19" y2="30" stroke="white" stroke-width="2" stroke-linecap="round" opacity="0.7" />
 				</svg>
-				<span>Insert Link</span>
+				<span>{$ui("ui.insert_link_07f5d3")}</span>
 			</div>
 			<input
 				type="text"
@@ -9574,7 +9599,7 @@
 					}
 					if (e.key === 'Escape') { e.preventDefault(); linkModalCancel(); }
 				}}
-				placeholder="URL or note name"
+				placeholder={$ui("ui.url_or_note_name")}
 			/>
 			{#if linkSuggestFiltered.length > 0}
 				<div class="link-suggest-list">
@@ -9592,9 +9617,9 @@
 				</div>
 			{/if}
 			<div class="link-modal-actions">
-				<button class="link-modal-btn cancel" onclick={linkModalCancel}>Cancel</button>
+				<button class="link-modal-btn cancel" onclick={linkModalCancel}>{$ui("ui.cancel")}</button>
 				<button class="link-modal-btn confirm" onclick={linkModalConfirm}>
-					{linkModalUrl ? 'Apply' : 'Remove Link'}
+					{linkModalUrl ? $ui("ui.apply") : $ui("ui.remove_link")}
 				</button>
 			</div>
 		</div>
@@ -12997,7 +13022,8 @@
 		border-radius: 10px;
 		box-shadow: var(--shadow-lg);
 		padding: 4px;
-		min-width: 320px;
+		width: min(480px, calc(100vw - 16px));
+		min-width: 0;
 		max-width: 480px;
 		z-index: 1601;
 		max-height: 80vh;

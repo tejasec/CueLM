@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { t as ui, tr as uiText } from '$lib/i18n';
 	import { onMount, untrack } from 'svelte';
 	import { open } from '@tauri-apps/plugin-dialog';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
@@ -41,7 +42,6 @@
 	const storageLocations = [
 		{ label: 'Documents', path: '/storage/emulated/0/Documents' },
 		{ label: 'Downloads', path: '/storage/emulated/0/Download' },
-		{ label: 'Recordings', path: '/storage/emulated/0/Recordings' },
 		{ label: 'Internal Storage', path: '/storage/emulated/0' },
 	];
 
@@ -72,7 +72,7 @@
 			const bridge = (window as any).Android;
 			bridge?.requestStoragePermission?.();
 		} catch {
-			error = 'Go to Settings > Apps > CueLM > Permissions and enable "All files access".';
+			error = uiText("ui.go_to_settings_apps_helixnotes_permissions_and_enable_all_files_access");
 		}
 	}
 
@@ -96,14 +96,14 @@
 		} else if (isAndroid) {
 			await openSelectedVault(fullPath);
 		} else {
-			const selected = await open({ directory: true, multiple: false, title: 'Choose Notes Folder' });
+			const selected = await open({ directory: true, multiple: false, title: $ui('ui.choose_notes_folder') });
 			if (selected) {
 				await openSelectedVault(selected as string);
 			}
 		}
 	}
 
-	async function openSelectedVault(path: string) {
+	async function openSelectedVault(path: string, existing = false) {
 		loading = true;
 		error = '';
 		try {
@@ -113,14 +113,12 @@
 					bridge?.prepareVaultDir?.(path);
 				} catch { /* Rust will retry mkdir itself */ }
 			}
-			await openVault(path);
-			const config = await getAppConfig();
-			$appConfig = config;
+			$appConfig = await openVault(path, { existing });
 			$vaultReady = true;
 		} catch (e) {
 			const msg = String(e);
 			if (isAndroid && /os error 13|permission denied/i.test(msg)) {
-				error = 'Storage permission is required. Enable file access for CueLM in your system settings, then try again.';
+				error = uiText("ui.storage_permission_is_required_enable_file_access_for_helixnot_3ffc58");
 			} else {
 				error = msg;
 			}
@@ -135,7 +133,7 @@
 		try {
 			const selected = await chooseExternalVault();
 			if (!selected) return;
-			$appConfig = await getAppConfig();
+			$appConfig = selected;
 			$vaultReady = true;
 		} catch (e) {
 			error = String(e);
@@ -147,15 +145,14 @@
 	async function openRecentVault(vault: VaultConfig) {
 		if (loading) return;
 		if (!isIOS || !vault.bookmark_id) {
-			await openSelectedVault(vault.path);
+			await openSelectedVault(vault.path, true);
 			return;
 		}
 
 		loading = true;
 		error = '';
 		try {
-			await restoreExternalVault(vault.bookmark_id);
-			$appConfig = await getAppConfig();
+			$appConfig = await restoreExternalVault(vault.bookmark_id);
 			$vaultReady = true;
 		} catch (e) {
 			error = String(e);
@@ -192,7 +189,7 @@
 <div class="vault-picker" class:mobile={isMobile} onmousedown={(e) => { if (!isMobile && !(e.target as HTMLElement).closest('button, .picker-card')) appWindow.startDragging(); }}>
 	{#if !isMobile}
 	<div class="window-controls">
-		<button class="window-close" onclick={() => appWindow.close()} title="Close">
+		<button class="window-close" onclick={() => appWindow.close()} title={$ui("ui.close")}>
 			<svg width="10" height="10" viewBox="0 0 10 10">
 				<line x1="1.5" y1="1.5" x2="8.5" y2="8.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
 				<line x1="8.5" y1="1.5" x2="1.5" y2="8.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
@@ -213,24 +210,24 @@
 			</svg>
 		</div>
 		<h1>CueLM</h1>
-		<p class="subtitle">Local markdown notes</p>
+		<p class="subtitle">{$ui("ui.local_markdown_notes")}</p>
 		{#if isMobile}
 			{#if isIOS}
-				<p class="description">Keep notes in CueLM, or use an existing folder from iCloud Drive or Files.</p>
+				<p class="description">{$ui("ui.keep_notes_in_helixnotes_or_use_an_existing_folder_from_icloud_4c305f")}</p>
 			{:else}
-				<p class="description">Choose where to store your notes. Sync with Syncthing, Nextcloud, or any file sync app.</p>
+				<p class="description">{$ui("ui.choose_where_to_store_your_notes_sync_with_syncthing_nextcloud_a4b7b7")}</p>
 			{/if}
 
 			{#if isAndroid && !hasPermission}
 				<button class="btn-permission" onclick={requestPermission}>
-					Grant File Access
+					{$ui("ui.grant_file_access")}
 				</button>
-				<p class="permission-hint">Required to access Documents, Downloads, and other shared folders.</p>
+				<p class="permission-hint">{$ui("ui.required_to_access_documents_downloads_and_other_shared_folders")}</p>
 			{/if}
 
 			{#if isAndroid}
 			<div class="location-selector" role="group" aria-labelledby="storage-location-label">
-				<span id="storage-location-label" class="location-label">Location</span>
+				<span id="storage-location-label" class="location-label">{$ui("ui.location")}</span>
 				<div class="location-options">
 					{#each storageLocations as loc}
 						<button
@@ -245,7 +242,7 @@
 						class:active={selectedLocation === 'Custom'}
 						aria-pressed={selectedLocation === 'Custom'}
 						onclick={() => selectedLocation = 'Custom'}
-					>Custom</button>
+					>{$ui("ui.custom")}</button>
 				</div>
 				{#if selectedLocation === 'Custom'}
 					<input class="custom-path-input" type="text" bind:value={customPath} placeholder="/storage/emulated/0/..." />
@@ -254,12 +251,12 @@
 			{/if}
 
 			<div class="vault-name-input">
-				<label for="vault-name">Vault name</label>
+				<label for="vault-name">{$ui("ui.vault_name")}</label>
 				<div class="vault-name-preview"><input id="vault-name" type="text" bind:value={vaultName} placeholder="CueLM" /></div>
 				<span class="vault-path-hint">{fullPath}</span>
 			</div>
 		{:else}
-			<p class="description">Your notes are stored as standard Markdown (.md) files. Pick any folder - existing .md files will be recognized automatically.</p>
+			<p class="description">{$ui("ui.your_notes_are_stored_as_standard_markdown_md_files_pick_any_f_ccf685")}</p>
 		{/if}
 
 		{#if error}
@@ -268,38 +265,38 @@
 
 		<button class="btn-primary" onclick={pickFolder} disabled={loading}>
 			{#if loading}
-				Opening...
+				{$ui("ui.opening")}
 			{:else if isIOS}
-				Use Local Folder
+				{$ui("ui.use_local_folder")}
 			{:else if isMobile}
-				Get Started
+				{$ui("ui.get_started")}
 			{:else}
-				Open Notes Folder
+				{$ui("ui.open_notes_folder")}
 			{/if}
 		</button>
 
 		{#if isIOS}
 			<button class="btn-back" onclick={pickExternalFolder} disabled={loading}>
-				Choose Folder in Files
+				{$ui("ui.choose_folder_in_files")}
 			</button>
 		{/if}
 
 		{#if $appConfig?.active_vault && !initialError}
 			<button class="btn-back" onclick={() => ($vaultReady = true)}>
-				Back
+				{$ui("ui.back")}
 			</button>
 		{/if}
 
 		{#if recentVaults.length > 0}
 			<div class="recent">
-				<span class="recent-label">Recent</span>
+				<span class="recent-label">{$ui("ui.recent")}</span>
 				{#each recentVaults as vault}
 					<div class="vault-row">
 						<button class="vault-item" class:current={isActiveVault(vault)} onclick={() => openRecentVault(vault)} disabled={loading}>
-							<span class="vault-name">{vault.name}{#if isActiveVault(vault)}<span class="vault-current-badge">Current</span>{/if}</span>
-							<span class="vault-path">{vault.bookmark_id ? `Files · ${vault.path}` : vault.path}</span>
+							<span class="vault-name">{vault.name}{#if isActiveVault(vault)}<span class="vault-current-badge">{$ui("ui.current_4fc0e2")}</span>{/if}</span>
+							<span class="vault-path">{vault.bookmark_id ? $ui("ui.files", { value0: vault.path }) : vault.path}</span>
 						</button>
-						<button class="vault-remove" title="Remove from list" aria-label="Remove from list" onclick={() => forgetVault(vault)} disabled={loading}>
+						<button class="vault-remove" title={$ui("ui.remove_from_list")} aria-label={$ui("ui.remove_from_list")} onclick={() => forgetVault(vault)} disabled={loading}>
 							<svg width="12" height="12" viewBox="0 0 10 10">
 								<line x1="1.5" y1="1.5" x2="8.5" y2="8.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />
 								<line x1="8.5" y1="1.5" x2="1.5" y2="8.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" />

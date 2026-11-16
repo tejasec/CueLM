@@ -1,9 +1,11 @@
 <script lang="ts">
+	import { t as ui, tr as uiText } from '$lib/i18n';
 	import { onMount, onDestroy, untrack } from 'svelte';
 	import { listen } from '@tauri-apps/api/event';
 	import { getCurrentWebview } from '@tauri-apps/api/webview';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
 	import Editor from './Editor.svelte';
+	import EditorModePicker from './EditorModePicker.svelte';
 	import {
 		appConfig,
 		activeNote,
@@ -19,6 +21,7 @@
 	import type { FileEvent } from '$lib/types';
 	import { isCurrentVaultEvent } from '$lib/utils/note-list-updates';
 	import { beginNoteNavigation, isCurrentNoteNavigation, cancelNoteNavigation } from '$lib/utils/note-navigation';
+	import { mcpBusy } from '$lib/utils/mcp-editor';
 
 	let { notePath, vaultPath }: { notePath: string; vaultPath: string | null } = $props();
 	const ownerVault = untrack(() => vaultPath);
@@ -141,7 +144,7 @@
 				unlistenClose = closeListener;
 			}
 			if (!ownerVault) {
-				loadError = 'This note window has no valid originating vault.';
+				loadError = uiText("ui.this_note_window_has_no_valid_originating_vault");
 				return;
 			}
 
@@ -189,11 +192,11 @@
 			async function refreshOpenNote(restored = false) {
 				const path = $activeNotePath;
 				const openingNote = $activeNote;
-				if (!path || !openingNote) return;
+				if ($mcpBusy || !path || !openingNote) return;
 				const request = ++fileRefreshRequest;
 				try {
 					const content = await readNote(ownerVault!, path);
-					if (!isCurrentOwner() || request !== fileRefreshRequest || $activeNotePath !== path) return;
+					if ($mcpBusy || !isCurrentOwner() || request !== fileRefreshRequest || $activeNotePath !== path) return;
 					if ($editorDirty) {
 						if (restored && content.raw !== editor?.getAcceptedRaw()) editor?.flagExternalConflict();
 						return;
@@ -202,12 +205,13 @@
 					$activeNote = content;
 					editor?.loadNote(path, content.content);
 				} catch (error) {
+					if ($mcpBusy) return;
 					if (restored && isCurrentOwner() && request === fileRefreshRequest && $activeNotePath === path) {
 						if ($editorDirty) editor?.flagExternalConflict();
 						else {
 							$activeNote = null;
 							$activeNotePath = null;
-							loadError = 'This note was removed by the vault restore.';
+							loadError = uiText("ui.this_note_was_removed_by_the_vault_restore");
 						}
 					} else if (!restored) console.error('Failed to refresh note window:', error);
 				}
@@ -261,16 +265,12 @@
 			</svg>
 			<span class="nw-title">{$activeNote?.meta.title || 'Loading...'}</span>
 			{#if $editorDirty}
-				<span class="nw-dirty-dot" title="Unsaved changes"></span>
+				<span class="nw-dirty-dot" title={$ui("ui.unsaved_changes")}></span>
 			{/if}
 		</div>
 		<div class="titlebar-actions">
-			<button class="nw-btn" class:active={$sourceMode} onclick={() => ($sourceMode = !$sourceMode)} title="Toggle Source Mode">
-				<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-					<polyline points="16 18 22 12 16 6" /><polyline points="8 6 2 12 8 18" />
-				</svg>
-			</button>
-			<button class="nw-btn" class:active={$readOnly} onclick={() => ($readOnly = !$readOnly)} title={$readOnly ? 'Switch to Edit Mode' : 'Switch to View Mode'}>
+			<EditorModePicker id="detached-editor-mode" />
+			<button class="nw-btn" class:active={$readOnly} onclick={() => ($readOnly = !$readOnly)} title={$readOnly ? $ui("ui.switch_to_edit_mode") : $ui("ui.switch_to_view_mode")}>
 				<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					{#if $readOnly}
 						<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" />
@@ -285,12 +285,12 @@
 		</div>
 		{#if !isMac}
 		<div class="titlebar-controls">
-			<button class="titlebar-btn" onclick={() => appWindow.minimize()} title="Minimize">
+			<button class="titlebar-btn" onclick={() => appWindow.minimize()} title={$ui("ui.minimize")}>
 				<svg width="10" height="10" viewBox="0 0 10 10">
 					<line x1="1" y1="5" x2="9" y2="5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
 				</svg>
 			</button>
-			<button class="titlebar-btn" onclick={() => appWindow.toggleMaximize()} title={maximized ? 'Restore' : 'Maximize'}>
+			<button class="titlebar-btn" onclick={() => appWindow.toggleMaximize()} title={maximized ? $ui("ui.restore") : $ui("ui.maximize")}>
 				{#if maximized}
 					<svg width="10" height="10" viewBox="0 0 10 10">
 						<rect x="2.5" y="0.5" width="7" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="1.2" />
@@ -302,7 +302,7 @@
 					</svg>
 				{/if}
 			</button>
-			<button class="titlebar-btn titlebar-close" onclick={() => appWindow.close()} title="Close">
+			<button class="titlebar-btn titlebar-close" onclick={() => appWindow.close()} title={$ui("ui.close")}>
 				<svg width="10" height="10" viewBox="0 0 10 10">
 					<line x1="1.5" y1="1.5" x2="8.5" y2="8.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
 					<line x1="8.5" y1="1.5" x2="1.5" y2="8.5" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" />
@@ -314,7 +314,7 @@
 
 	{#if loadError}
 		<div class="nw-error">
-			<p>Failed to load note</p>
+			<p>{$ui("ui.failed_to_load_note")}</p>
 			<p class="nw-error-detail">{loadError}</p>
 		</div>
 	{:else}

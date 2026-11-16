@@ -1,0 +1,10 @@
+{
+  "language.title": "Language",
+  "language.description": "Choose the interface language. Your notes are not translated.",
+  "language.system": "System default",
+  "ui.save": "Save",
+  "ui.cancel": "Cancel",
+  "ui.settings": "Settings",
+  "ui.create_note": "Create note \"{value0}\"",
+  "count.notes": "{count, plural, one {# note} other {# notes}}"
+}

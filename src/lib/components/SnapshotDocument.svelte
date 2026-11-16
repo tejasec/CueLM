@@ -1,10 +1,12 @@
 <script lang="ts" module>
+	import { tr as uiText, setUiText, setUiLabel } from '$lib/i18n';
 	let diagramId = 0;
 	// Mermaid has a shared configuration; serialize snapshot renders and restore it afterward.
 	let diagramQueue = Promise.resolve();
 </script>
 
 <script lang="ts">
+	import { label as uiLabel } from '$lib/i18n';
 	import createDOMPurify from 'dompurify';
 	import katex from 'katex';
 	import 'katex/dist/katex.min.css';
@@ -46,6 +48,12 @@
 		return node;
 	}
 
+	function messageUi(key: Parameters<typeof uiText>[0], values?: Parameters<typeof uiText>[1]): HTMLParagraphElement {
+		const node = message('');
+		setUiText(node, key, values);
+		return node;
+	}
+
 	function imageSourceAllowed(source: string): boolean {
 		if (/[\u0000-\u0020\u007f]/.test(source)) return false;
 		if (/^(?:asset|imgproxy):\/\//i.test(source)) return true;
@@ -83,14 +91,14 @@
 			if (language) element.className = language;
 			if (element.hasAttribute('data-wiki-link')) {
 				element.className = 'snapshot-wiki-link';
-				element.title = `Wiki link to ${element.getAttribute('data-title') || element.textContent || ''} (inactive in snapshot preview)`;
+				setUiText(element, 'snapshot.wiki', { title: element.getAttribute('data-title') || element.textContent || '' }, 'title');
 				element.setAttribute('aria-disabled', 'true');
 			}
 			if (element.hasAttribute('data-page-break')) element.className = 'snapshot-page-break';
 			// Snapshot links are readable but inert: inspection cannot navigate the live note.
 			if (element.tagName === 'A') {
 				const href = element.getAttribute('href');
-				if (href) element.title = `${element.title ? element.title + ' — ' : ''}${href} (inactive in snapshot preview)`;
+				if (href) setUiText(element, 'snapshot.link', { title: element.title ? element.title + ' — ' : '', url: href }, 'title');
 				element.removeAttribute('href');
 				element.setAttribute('aria-disabled', 'true');
 			}
@@ -98,19 +106,19 @@
 		for (const attachment of fragment.querySelectorAll<HTMLElement>('[data-pdf-src]')) {
 			const name = attachment.getAttribute('data-pdf-name') || 'PDF attachment';
 			const source = attachment.getAttribute('data-pdf-src') || '';
-			attachment.prepend(message(`${name} — PDF attachment (inline PDF rendering is unavailable in snapshot previews). ${source}`));
+			attachment.prepend(messageUi('snapshot.pdf', { name, source }));
 		}
 		for (const image of fragment.querySelectorAll<HTMLImageElement>('img')) {
 			const source = image.getAttribute('src') || '';
 			if (!imageSourceAllowed(source)) {
-				image.replaceWith(message(`Image unavailable or blocked${image.alt ? ': ' + image.alt : '.'}`));
+				image.replaceWith(messageUi('snapshot.imageBlocked', { alt: image.alt || source }));
 				continue;
 			}
 			image.crossOrigin = 'anonymous';
 			image.loading = 'lazy';
 			image.decoding = 'async';
 			image.addEventListener('error', () => {
-				image.replaceWith(message(`Image could not be loaded: ${image.alt || source}`));
+				image.replaceWith(messageUi('snapshot.imageFailed', { source: image.alt || source }));
 			}, { once: true });
 		}
 		for (const item of fragment.querySelectorAll<HTMLElement>('li[data-type="taskItem"]')) {
@@ -120,7 +128,7 @@
 			checkbox.type = 'checkbox';
 			checkbox.checked = item.getAttribute('data-checked') === 'true';
 			checkbox.disabled = true;
-			checkbox.setAttribute('aria-label', checkbox.checked ? 'Completed task' : 'Incomplete task');
+			setUiText(checkbox, checkbox.checked ? 'snapshot.taskDone' : 'snapshot.taskOpen', {}, 'aria-label');
 			item.className = 'snapshot-task';
 			item.append(checkbox, body);
 		}
@@ -129,7 +137,7 @@
 			scroll.className = 'snapshot-table';
 			scroll.tabIndex = 0;
 			scroll.setAttribute('role', 'region');
-			scroll.setAttribute('aria-label', 'Snapshot table');
+			setUiText(scroll, 'snapshot.table', {}, 'aria-label');
 			table.replaceWith(scroll);
 			scroll.append(table);
 		}
@@ -147,14 +155,14 @@
 				payload = decodeURIComponent(stored);
 				JSON.parse(payload);
 			} catch {
-				error = 'The stored secret payload is malformed; it cannot be previewed.';
+				error = uiText("ui.the_stored_secret_payload_is_malformed_it_cannot_be_previewed");
 			}
 			title.textContent = readSecretTitle(payload);
-			node.append(title, message('Locked encrypted content. Secrets are not unlocked in history previews.'));
+			node.append(title, messageUi('snapshot.secretLocked'));
 			if (error) {
 				const details = document.createElement('details');
 				const summary = document.createElement('summary');
-				summary.textContent = 'Stored secret payload';
+				setUiText(summary, "ui.stored_secret_payload");
 				const code = document.createElement('pre');
 				code.textContent = payload;
 				details.append(summary, code);
@@ -182,11 +190,12 @@
 			icon.setAttribute('aria-hidden', 'true');
 			icon.append(purifier.sanitize(calloutIcon(type), { USE_PROFILES: { svg: true }, RETURN_DOM_FRAGMENT: true }));
 			const heading = document.createElement('strong');
-			heading.textContent = title;
+			if (node.getAttribute('data-callout-title')) heading.textContent = title;
+			else setUiLabel(heading, title);
 			header.append(icon, heading);
 			if (title !== calloutLabel(type)) {
 				const kind = document.createElement('small');
-				kind.textContent = calloutLabel(type);
+				setUiLabel(kind, calloutLabel(type));
 				header.append(kind);
 			}
 			const body = document.createElement('div');
@@ -217,7 +226,7 @@
 				code.textContent = tex;
 				const status = document.createElement('span');
 				status.className = 'snapshot-message';
-				status.textContent = ` Math could not be rendered: ${error instanceof Error ? error.message : String(error)}`;
+				status.textContent = uiText("ui.math_could_not_be_rendered", { value0: error instanceof Error ? error.message : String(error) });
 				node.replaceChildren(code, status);
 			}
 			node.removeAttribute('data-math-inline');
@@ -232,7 +241,7 @@
 			controls.className = 'snapshot-diagram';
 			const button = document.createElement('button');
 			button.type = 'button';
-			button.textContent = '▶ Render diagram';
+			button.textContent = uiText("ui.render_diagram");
 			const status = document.createElement('span');
 			status.className = 'snapshot-message';
 			status.setAttribute('role', 'status');
@@ -242,7 +251,7 @@
 			code.parentElement!.after(controls);
 			button.addEventListener('click', async () => {
 				button.disabled = true;
-				status.textContent = 'Rendering diagram…';
+				status.textContent = uiText("ui.rendering_diagram");
 				let staging: HTMLDivElement | undefined;
 				let restoreConfig: (() => void) | undefined;
 				let release!: () => void;
@@ -274,7 +283,7 @@
 						const data: unknown = parsed.db.getData();
 						if (data && typeof data === 'object' && 'nodes' in data && Array.isArray(data.nodes)
 							&& data.nodes.some((node: unknown) => node && typeof node === 'object' && 'img' in node && node.img)) {
-							throw new Error('Embedded Mermaid images are not loaded in snapshot previews.');
+							throw new Error(uiText("error.snapshotImages"));
 						}
 					}
 					if (!isCurrent() || !controls.isConnected) return;
@@ -302,18 +311,18 @@
 						}
 					}
 					const diagram = clean.querySelector('svg');
-					if (!diagram) throw new Error('No safe diagram output was produced.');
+					if (!diagram) throw new Error(uiText("error.snapshotDiagram"));
 					diagram.setAttribute('role', 'img');
-					diagram.setAttribute('aria-label', 'Rendered snapshot diagram; source is shown above');
+					setUiText(diagram, 'snapshot.diagram', {}, 'aria-label');
 					output.replaceChildren(clean);
 					status.textContent = blockedContent
 						? 'Rendered with unsupported embedded content blocked. Original source remains above.'
 						: 'Rendered. Original source remains above.';
-					button.textContent = '↻ Render again';
+					button.textContent = uiText("ui.render_again");
 				} catch (error) {
 					if (isCurrent() && controls.isConnected) {
-						status.textContent = `Diagram could not be rendered: ${error instanceof Error ? error.message : String(error)} Original source remains above.`;
-						button.textContent = '↻ Retry';
+						status.textContent = uiText("ui.diagram_could_not_be_rendered_original_source_remains_above", { value0: error instanceof Error ? error.message : String(error) });
+						button.textContent = uiText("ui.retry_ba143d");
 					}
 				} finally {
 					staging?.remove();
@@ -335,7 +344,7 @@
 		let active = true;
 		try {
 			purifier ??= createDOMPurify(window);
-			if (!purifier.isSupported) throw new Error('Safe HTML rendering is unavailable in this browser.');
+			if (!purifier.isSupported) throw new Error(uiText("error.safeHtml"));
 			const fragment = purifier.sanitize(source, {
 				ALLOWED_TAGS: documentTags,
 				ALLOWED_ATTR: documentAttributes,
@@ -357,13 +366,13 @@
 			if (blockedMarkup) {
 				const details = document.createElement('details');
 				const summary = document.createElement('summary');
-				summary.textContent = 'Active or unsupported embedded content was blocked. View supplied HTML as text.';
+				summary.textContent = uiText("ui.active_or_unsupported_embedded_content_was_blocked_view_suppli_a3ac67");
 				const code = document.createElement('pre');
 				code.textContent = source;
 				details.append(summary, code);
 				fragment.prepend(details);
 			}
-			target.replaceChildren(source.trim() ? fragment : message('This snapshot has no body content.'));
+			target.replaceChildren(source.trim() ? fragment : message(uiText("snapshot.empty")));
 		} catch (error) {
 			const code = document.createElement('pre');
 			code.textContent = source;
@@ -373,7 +382,7 @@
 	});
 </script>
 
-<section class="snapshot-document" aria-label={label}>
+<section class="snapshot-document" aria-label={$uiLabel(label)}>
 	<div class="snapshot-body" bind:this={root}></div>
 </section>
 

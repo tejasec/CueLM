@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { t as ui, label as uiLabel, locale, tr as uiText } from '$lib/i18n';
+	import { message as showMessage } from '@tauri-apps/plugin-dialog';
 	import { onDestroy, tick, untrack } from 'svelte';
 	import { get } from 'svelte/store';
 	import {
@@ -78,10 +80,10 @@
 	let calYear = $state(new Date().getFullYear());
 	let dailyDates = $state<Set<string>>(new Set());
 
-	const calMonthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+	const calMonthNames = $derived(Array.from({ length: 12 }, (_, month) => new Intl.DateTimeFormat($locale, { month: 'long' }).format(new Date(2024, month, 1))));
 	// 0 = Sunday, 1 = Monday (default). Day names + grid offset follow the setting.
 	const weekStartsOn = $derived($appConfig?.week_start === 'sunday' ? 0 : 1);
-	const DOW = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
+	const DOW = $derived(Array.from({ length: 7 }, (_, day) => new Intl.DateTimeFormat($locale, { weekday: 'short' }).format(new Date(2024, 0, 7 + day))));
 	const calDayNames = $derived([...DOW.slice(weekStartsOn), ...DOW.slice(0, weekStartsOn)]);
 
 	function calDays(): Array<{ day: number; date: string; current: boolean }> {
@@ -136,6 +138,10 @@
 			await refresh();
 		} catch (e) {
 			console.error('Failed to open daily note:', e);
+			if (navigationIsCurrent(token)) {
+				await showMessage(`${uiText('ui.could_not_open_this_note')}\n\n${String(e)}`, { title: uiText('ui.daily_note'), kind: 'error' })
+					.catch(error => console.error('Could not display daily-note error:', error));
+			}
 		}
 	}
 
@@ -216,6 +222,7 @@
 	let listRows = $derived(buildNoteListRows(
 		$sortedNotes,
 		groupingActive ? ($sortMode === 'created' ? 'created' : 'modified') : null,
+		new Date(), $locale,
 	));
 
 	let listContainer = $state<HTMLDivElement>(null!);
@@ -455,14 +462,14 @@
 	});
 
 	let viewTitle = $derived.by(() => {
-		if ($viewMode === 'all') return 'All Notes';
-		if ($viewMode === 'notebook') return $activeNotebook?.name ?? 'Notebook';
+		if ($viewMode === 'all') return $ui("ui.all_notes");
+		if ($viewMode === 'notebook') return $activeNotebook?.relative_path === '' ? $ui('ui.unfiled_notes') : $activeNotebook?.name ?? $ui('ui.notebooks');
 		if ($viewMode === 'tag') return `#${$activeTag}`;
-		if ($viewMode === 'quickaccess') return 'Quick Access';
-		if ($viewMode === 'daily') return 'Daily Notes';
-		if ($viewMode === 'tasks') return 'Tasks';
-		if ($viewMode === 'trash') return 'Trash';
-		return 'Notes';
+		if ($viewMode === 'quickaccess') return $ui("ui.quick_access");
+		if ($viewMode === 'daily') return $ui("ui.daily_notes");
+		if ($viewMode === 'tasks') return $ui("ui.tasks");
+		if ($viewMode === 'trash') return $ui("ui.trash");
+		return $ui("ui.notes_704400");
 	});
 
 	// Note list cache: avoids re-scanning when switching views
@@ -795,7 +802,7 @@
 		update(meta);
 		if ($activeNotePath === path && $activeNote) {
 			if (!(await onUpdateActiveNote({ pinned: meta.pinned, tags: meta.tags }))) {
-				throw new Error('Note still has unsaved changes');
+				throw new Error(uiText("error.unsaved"));
 			}
 		} else {
 			await saveNote(ownerVault!, path, meta, current.content, current.raw);
@@ -1232,7 +1239,7 @@
 		</span>
 		<div class="list-actions">
 			{#if !isMobile}
-				<button class="icon-btn" onclick={() => ($notelistCollapsed = true)} title={`Hide notes list (${modKey}+Shift+\\)`} aria-label="Hide notes list">
+				<button class="icon-btn" onclick={() => ($notelistCollapsed = true)} title={$ui("ui.hide_notes_list_shift", { value0: modKey })} aria-label={$ui("ui.hide_notes_list")}>
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<line x1="8" y1="6" x2="20" y2="6" />
 						<line x1="8" y1="12" x2="20" y2="12" />
@@ -1243,26 +1250,26 @@
 			{/if}
 			{#if $viewMode !== 'tasks'}
 			{#if isAndroid}
-				<button class="icon-btn" class:active-toggle={multiSelectMode} onclick={() => { multiSelectMode = !multiSelectMode; if (!multiSelectMode) clearSelection(); }} title="Multi-select">
+				<button class="icon-btn" class:active-toggle={multiSelectMode} onclick={() => { multiSelectMode = !multiSelectMode; if (!multiSelectMode) clearSelection(); }} title={$ui("ui.multi_select")}>
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<rect x="3" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" />{#if multiSelectMode}<polyline points="6 6.5 7 7.5 9 5.5" stroke-width="2" /><polyline points="6 17.5 7 18.5 9 16.5" stroke-width="2" />{/if}<line x1="14" y1="6.5" x2="21" y2="6.5" /><line x1="14" y1="17.5" x2="21" y2="17.5" />
 					</svg>
 				</button>
 			{/if}
-			<button class="icon-btn" onclick={openSortMenu} title="Sort: {$sortMode}">
+			<button class="icon-btn" onclick={openSortMenu} title={$ui("ui.sort", { value0: $sortMode })}>
 				<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<line x1="4" y1="6" x2="11" y2="6" /><line x1="4" y1="12" x2="15" y2="12" /><line x1="4" y1="18" x2="20" y2="18" />
 				</svg>
 			</button>
 			{#if $viewMode === 'all' && ($sortMode === 'created' || $sortMode === 'modified')}
-				<button class="icon-btn" class:active-toggle={$groupNotesByDate} onclick={() => { $groupNotesByDate = !$groupNotesByDate; }} title="Group by date">
+				<button class="icon-btn" class:active-toggle={$groupNotesByDate} onclick={() => { $groupNotesByDate = !$groupNotesByDate; }} title={$ui("ui.group_by_date")}>
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<line x1="8" y1="6" x2="21" y2="6" /><line x1="8" y1="12" x2="21" y2="12" /><line x1="8" y1="18" x2="21" y2="18" /><line x1="3" y1="6" x2="3.01" y2="6" /><line x1="3" y1="12" x2="3.01" y2="12" /><line x1="3" y1="18" x2="3.01" y2="18" />
 					</svg>
 				</button>
 			{/if}
 			{#if $viewMode !== 'trash' && $viewMode !== 'quickaccess'}
-				<button class={isMobile ? 'mobile-create-btn' : 'icon-btn'} onclick={handleCreateNote} title={`New note (${modKey}+N)`}>
+				<button class={isMobile ? 'mobile-create-btn' : 'icon-btn'} onclick={handleCreateNote} title={$ui("ui.new_note_n", { value0: modKey })}>
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width={isMobile ? '3' : '2'} stroke-linecap="round" stroke-linejoin="round">
 						<line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
 					</svg>
@@ -1274,23 +1281,23 @@
 
 	{#if selectedPaths.size > 0}
 		<div class="selection-bar">
-			<span class="selection-count">{selectedPaths.size} selected</span>
+			<span class="selection-count">{$ui("ui.selected", { value0: selectedPaths.size })}</span>
 			<div class="selection-actions">
 				{#if $viewMode === 'trash'}
-					<button class="selection-action" onclick={handleBatchRestore} title="Restore selected">
+					<button class="selection-action" onclick={handleBatchRestore} title={$ui("ui.restore_selected")}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
-						Restore
+						{$ui("ui.restore")}
 					</button>
-					<button class="selection-action danger" onclick={handleBatchPermanentDelete} title="Delete permanently">
+					<button class="selection-action danger" onclick={handleBatchPermanentDelete} title={$ui("ui.delete_permanently")}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
-						Delete
+						{$ui("ui.delete_action")}
 					</button>
 				{:else}
-					<button class="selection-action" onclick={() => { batchMovePicker = true; }}>Move</button>
-					<button class="selection-action" onclick={() => openBatchTagEdit()}>Tag</button>
-					<button class="selection-action danger" onclick={handleBatchDelete}>Delete</button>
+					<button class="selection-action" onclick={() => { batchMovePicker = true; }}>{$ui("ui.move")}</button>
+					<button class="selection-action" onclick={() => openBatchTagEdit()}>{$ui("ui.tag")}</button>
+					<button class="selection-action danger" onclick={handleBatchDelete}>{$ui('ui.delete_action')}</button>
 				{/if}
-				<button class="selection-close" onclick={clearSelection} title="Clear selection">
+				<button class="selection-close" onclick={clearSelection} title={$ui("ui.clear_selection")}>
 					<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 				</button>
 			</div>
@@ -1302,13 +1309,13 @@
 		<div class="batch-move-overlay" onclick={closeBatchMoveOverlay} onkeydown={(e) => { if (e.key === 'Escape') batchMovePicker = false; }}>
 			<div class="batch-move-picker" role="dialog" aria-modal="true" aria-labelledby="batch-move-title" tabindex="-1">
 				<div class="batch-move-header">
-					<span id="batch-move-title">Move {selectedPaths.size} notes to...</span>
-					<button class="selection-close" onclick={() => batchMovePicker = false} aria-label="Close move picker">
+					<span id="batch-move-title">{$ui("ui.move_notes_to", { value0: selectedPaths.size })}</span>
+					<button class="selection-close" onclick={() => batchMovePicker = false} aria-label={$ui("ui.close_move_picker")}>
 						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 					</button>
 				</div>
 				{#if flatNotebookList.length === 0}
-					<div class="context-empty">No notebooks available</div>
+					<div class="context-empty">{$ui("ui.no_notebooks_available")}</div>
 				{:else}
 					<div class="move-picker-list">
 						{#each flatNotebookList as nb}
@@ -1330,8 +1337,8 @@
 		<div class="batch-move-overlay" onclick={closeBatchTagOverlay} onkeydown={(e) => { if (e.key === 'Escape') batchTagEdit = false; }}>
 			<div class="batch-move-picker" role="dialog" aria-modal="true" aria-labelledby="batch-tags-title" tabindex="-1">
 				<div class="batch-move-header">
-					<span id="batch-tags-title">Tags for {selectedPaths.size} notes</span>
-					<button class="selection-close" onclick={() => batchTagEdit = false} aria-label="Close tag editor">
+					<span id="batch-tags-title">{$ui("ui.tags_for_notes", { value0: selectedPaths.size })}</span>
+					<button class="selection-close" onclick={() => batchTagEdit = false} aria-label={$ui("ui.close_tag_editor")}>
 						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 					</button>
 				</div>
@@ -1339,7 +1346,7 @@
 					<div class="tag-edit-input-row">
 						<TagSuggestInput
 							existing={tagEditTags}
-							placeholder="Add tag to all..."
+							placeholder={$ui("ui.add_tag_to_all")}
 							onsubmit={(t) => addTagToBatch(t)}
 							oncancel={() => batchTagEdit = false}
 						/>
@@ -1349,14 +1356,14 @@
 							{#each tagEditTags as tag, i (tagIterationKey(tag, i))}
 								<div class="tag-edit-item">
 									<span class="tag-edit-name"><TagLabel name={tag} size={12} /></span>
-									<button class="tag-edit-remove" onclick={() => removeTagFromBatch(tag)} title="Remove from all">
+									<button class="tag-edit-remove" onclick={() => removeTagFromBatch(tag)} title={$ui("ui.remove_from_all")}>
 										<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 									</button>
 								</div>
 							{/each}
 						</div>
 					{:else}
-						<div class="context-empty">No common tags</div>
+						<div class="context-empty">{$ui("ui.no_common_tags")}</div>
 					{/if}
 				</div>
 			</div>
@@ -1371,11 +1378,11 @@
 		{#if $viewMode === 'daily'}
 			<div class="cal">
 				<div class="cal-nav">
-					<button class="cal-nav-btn" onclick={calPrev} title="Previous month">
+					<button class="cal-nav-btn" onclick={calPrev} title={$ui("ui.previous_month")}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
 					</button>
-					<button class="cal-title" onclick={calToday}>{calMonthNames[calMonth]} {calYear}</button>
-					<button class="cal-nav-btn" onclick={calNext} title="Next month">
+					<button class="cal-title" onclick={calToday}>{$uiLabel(calMonthNames[calMonth])} {calYear}</button>
+					<button class="cal-nav-btn" onclick={calNext} title={$ui("ui.next_month")}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
 					</button>
 				</div>
@@ -1405,12 +1412,12 @@
 		{#if $sortedNotes.length === 0 && $viewMode !== 'daily' && $viewMode !== 'tasks' && (!($viewMode === 'trash') || trashNotebooks.length === 0)}
 			<div class="empty-state">
 				{#if $viewMode === 'trash'}
-					<p>Trash is empty</p>
+					<p>{$ui("ui.trash_is_empty")}</p>
 				{:else if $viewMode === 'quickaccess'}
-					<p>No starred notes</p>
+					<p>{$ui("ui.no_starred_notes")}</p>
 				{:else}
-					<p>No notes yet</p>
-					<button class="btn-link" onclick={handleCreateNote}>Create your first note</button>
+					<p>{$ui("ui.no_notes_yet")}</p>
+					<button class="btn-link" onclick={handleCreateNote}>{$ui("ui.create_your_first_note")}</button>
 				{/if}
 			</div>
 		{/if}
@@ -1427,18 +1434,18 @@
 					{#if trashBusy === nb.path}
 						<div class="note-preview trash-busy">
 							<svg class="spinner" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><path d="M12 2a10 10 0 0 1 10 10"/></svg>
-							Working...
+							{$ui("ui.working")}
 						</div>
 					{:else}
-						<div class="note-preview">{nb.note_count} {nb.note_count === 1 ? 'note' : 'notes'}</div>
+						<div class="note-preview">{$ui("count.notes", { count: nb.note_count })}</div>
 						<div class="trash-notebook-actions">
-							<button class="trash-nb-btn restore" onclick={() => handleRestoreNotebook(nb)} title="Restore notebook">
+							<button class="trash-nb-btn restore" onclick={() => handleRestoreNotebook(nb)} title={$ui("ui.restore_notebook")}>
 								<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 105.64-11.36L1 10"/></svg>
-								Restore
+								{$ui("ui.restore")}
 							</button>
-							<button class="trash-nb-btn delete" onclick={() => handleDeleteNotebook(nb)} title="Delete permanently">
+							<button class="trash-nb-btn delete" onclick={() => handleDeleteNotebook(nb)} title={$ui("ui.delete_permanently")}>
 								<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg>
-								Delete
+								{$ui("ui.delete_action")}
 							</button>
 						</div>
 					{/if}
@@ -1566,7 +1573,7 @@
 							{#if getNotebookPath(note)}
 								<span class="note-notebook">{getNotebookPath(note)}</span>
 							{/if}
-							{#if showDates}<span class="note-date-compact" title={`Created ${formatDate(note.meta.created)}\nModified ${formatDate(note.meta.modified)}`}>{formatRelativeTime($sortMode === 'created' ? note.meta.created : note.meta.modified)}</span>{/if}
+							{#if showDates}<span class="note-date-compact" title={$ui("ui.created_modified", { value0: formatDate(note.meta.created, $locale), value1: formatDate(note.meta.modified, $locale) })}>{formatRelativeTime($sortMode === 'created' ? note.meta.created : note.meta.modified, $locale)}</span>{/if}
 						</div>
 					{:else}
 						<div class="note-title">
@@ -1590,7 +1597,7 @@
 									<span class="note-notebook">{getNotebookPath(note)}</span>
 									{#if showDates}<span class="note-meta-sep">&middot;</span>{/if}
 								{/if}
-								{#if showDates}<span class="note-date" title={`Created ${formatDate(note.meta.created)}\nModified ${formatDate(note.meta.modified)}`}>{formatRelativeTime($sortMode === 'created' ? note.meta.created : note.meta.modified)}</span>{/if}
+								{#if showDates}<span class="note-date" title={$ui("ui.created_modified", { value0: formatDate(note.meta.created, $locale), value1: formatDate(note.meta.modified, $locale) })}>{formatRelativeTime($sortMode === 'created' ? note.meta.created : note.meta.modified, $locale)}</span>{/if}
 							</span>
 							{/if}
 							{#if note.meta.tags.length > 0}
@@ -1604,10 +1611,10 @@
 				{/if}
 				{#if $viewMode === 'trash'}
 					<span class="trash-row-actions">
-						<span class="trash-row-btn" role="button" tabindex="0" onclick={(e) => { e.stopPropagation(); handleRestore(note); }} title="Restore" onkeydown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); handleRestore(note); } }}>
+						<span class="trash-row-btn" role="button" tabindex="0" onclick={(e) => { e.stopPropagation(); handleRestore(note); }} title={$ui("ui.restore")} onkeydown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); handleRestore(note); } }}>
 							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg>
 						</span>
-						<span class="trash-row-btn danger" role="button" tabindex="0" onclick={(e) => { e.stopPropagation(); handlePermanentDelete(note); }} title="Delete permanently" onkeydown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); handlePermanentDelete(note); } }}>
+						<span class="trash-row-btn danger" role="button" tabindex="0" onclick={(e) => { e.stopPropagation(); handlePermanentDelete(note); }} title={$ui("ui.delete_permanently")} onkeydown={(e) => { if (e.key === 'Enter') { e.stopPropagation(); handlePermanentDelete(note); } }}>
 							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4h6v2"/></svg>
 						</span>
 					</span>
@@ -1621,7 +1628,7 @@
 			{#each visibleRows as row, index (row.key)}
 				<div class="virtual-note-row" data-row-key={row.key} use:measureRow>
 					{#if row.kind === 'section'}
-						<div class="note-list-section" class:first-section={windowRows.start + index === 0}>{row.label}</div>
+						<div class="note-list-section" class:first-section={windowRows.start + index === 0}>{$uiLabel(row.label)}</div>
 					{:else}
 						{@render noteRow(row.note, row.noteIndex)}
 					{/if}
@@ -1633,29 +1640,29 @@
 </div>
 
 {#if contextMenu}
-	<div class="context-menu" class:mobile={isMobile} style="left: {contextMenu.x}px; top: {contextMenu.y}px" role="group" aria-label="Note actions">
+	<div class="context-menu" class:mobile={isMobile} style="left: {contextMenu.x}px; top: {contextMenu.y}px" role="group" aria-label={$ui("ui.note_actions")}>
 		{#if selectedPaths.size > 1 && selectedPaths.has(contextMenu.note.path)}
 			<!-- Batch context menu -->
 			{#if $viewMode === 'trash'}
 				<button onclick={() => { contextMenu = null; handleBatchRestore(); }}>
-					Restore {selectedPaths.size} notes
+					{$ui("ui.restore_notes", { value0: selectedPaths.size })}
 				</button>
 				<button class="danger" onclick={() => { contextMenu = null; handleBatchPermanentDelete(); }}>
-					Delete {selectedPaths.size} permanently
+					{$ui("ui.delete_permanently_6c345b", { value0: selectedPaths.size })}
 				</button>
 			{:else if batchTagEdit}
 				<button class="move-back" onclick={() => batchTagEdit = false}>
 					<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<polyline points="15 18 9 12 15 6"/>
 					</svg>
-					Tags for {selectedPaths.size} notes
+					{$ui("ui.tags_for")} {selectedPaths.size} {$ui("ui.notes")}
 				</button>
 				<div class="context-sep"></div>
 				<div class="tag-edit-section">
 					<div class="tag-edit-input-row">
 						<TagSuggestInput
 							existing={tagEditTags}
-							placeholder="Add tag to all..."
+							placeholder={$ui("ui.add_tag_to_all")}
 							onsubmit={(t) => addTagToBatch(t)}
 							oncancel={() => batchTagEdit = false}
 						/>
@@ -1665,14 +1672,14 @@
 							{#each tagEditTags as tag, i (tagIterationKey(tag, i))}
 								<div class="tag-edit-item">
 									<span class="tag-edit-name"><TagLabel name={tag} size={12} /></span>
-									<button class="tag-edit-remove" onclick={() => removeTagFromBatch(tag)} title="Remove from all">
+									<button class="tag-edit-remove" onclick={() => removeTagFromBatch(tag)} title={$ui("ui.remove_from_all")}>
 										<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 									</button>
 								</div>
 							{/each}
 						</div>
 					{:else}
-						<div class="context-empty">No common tags</div>
+						<div class="context-empty">{$ui("ui.no_common_tags")}</div>
 					{/if}
 				</div>
 			{:else}
@@ -1680,34 +1687,34 @@
 					<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<path d="M20.59 13.41l-7.17 7.17a2 2 0 01-2.83 0L2 12V2h10l8.59 8.59a2 2 0 010 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/>
 					</svg>
-					Tags...
+					{$ui("ui.tags_06d7f3")}
 				</button>
 				<button onclick={() => { contextMenu = null; batchMovePicker = true; }}>
 					<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/>
 					</svg>
-					Move {selectedPaths.size} notes...
+					{$ui("ui.move")} {selectedPaths.size} {$ui("ui.notes_e3e6b9")}
 				</button>
 				<button class="danger" onclick={() => { contextMenu = null; handleBatchDelete(); }}>
-					Delete {selectedPaths.size} notes
+					{$ui("ui.delete_notes", { value0: selectedPaths.size })}
 				</button>
 			{/if}
 		{:else if $viewMode === 'trash'}
-			<button onclick={() => handleRestore(contextMenu!.note)}>Restore</button>
-			<button class="danger" onclick={() => handlePermanentDelete(contextMenu!.note)}>Delete Permanently</button>
+			<button onclick={() => handleRestore(contextMenu!.note)}>{$ui("ui.restore")}</button>
+			<button class="danger" onclick={() => handlePermanentDelete(contextMenu!.note)}>{$ui("ui.delete_permanently_a9ec7c")}</button>
 		{:else if tagEditNote}
 			<button class="move-back" onclick={() => tagEditNote = null}>
 				<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<polyline points="15 18 9 12 15 6"/>
 				</svg>
-				Tags
+				{$ui("ui.tags_848eed")}
 			</button>
 			<div class="context-sep"></div>
 			<div class="tag-edit-section">
 				<div class="tag-edit-input-row">
 					<TagSuggestInput
 						existing={tagEditTags}
-						placeholder="Add tag..."
+						placeholder={$ui("ui.add_tag")}
 						onsubmit={(t) => addTagToNote(t)}
 						oncancel={() => tagEditNote = null}
 					/>
@@ -1717,14 +1724,14 @@
 						{#each tagEditTags as tag, i (tagIterationKey(tag, i))}
 							<div class="tag-edit-item">
 								<span class="tag-edit-name"><TagLabel name={tag} size={12} /></span>
-								<button class="tag-edit-remove" onclick={() => removeTagFromNote(tag)} title="Remove tag">
+								<button class="tag-edit-remove" onclick={() => removeTagFromNote(tag)} title={$ui("ui.remove_tag")}>
 									<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 								</button>
 							</div>
 						{/each}
 					</div>
 				{:else}
-					<div class="context-empty">No tags</div>
+					<div class="context-empty">{$ui("ui.no_tags")}</div>
 				{/if}
 			</div>
 		{:else if movePickerNote}
@@ -1732,11 +1739,11 @@
 				<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<polyline points="15 18 9 12 15 6"/>
 				</svg>
-				Move to...
+				{$ui("ui.move_to_d19987")}
 			</button>
 			<div class="context-sep"></div>
 			{#if flatNotebookList.length === 0}
-				<div class="context-empty">No other notebooks</div>
+				<div class="context-empty">{$ui("ui.no_other_notebooks")}</div>
 			{:else}
 				<div class="move-picker-list">
 					{#each flatNotebookList as nb}
@@ -1754,67 +1761,67 @@
 				<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M12 17v5"/><path d="M9 2h6l-1 7h4l-2 4H8l-2-4h4L9 2z"/>
 				</svg>
-				{contextMenu.note.meta.pinned ? 'Unpin Note' : 'Pin Note'}
+				{contextMenu.note.meta.pinned ? $ui("ui.unpin_note_3004d5") : $ui("ui.pin_note_ae126e")}
 			</button>
 			<button onclick={() => openTagEdit(contextMenu!.note)}>
 				<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M20.59 13.41l-7.17 7.17a2 2 0 01-2.83 0L2 12V2h10l8.59 8.59a2 2 0 010 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/>
 				</svg>
-				Tags...
+				{$ui("ui.tags_06d7f3")}
 			</button>
 			{#if $quickAccessPaths.includes(contextMenu.note.relative_path)}
 				<button onclick={() => handleRemoveQuickAccess(contextMenu!.note)}>
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
 					</svg>
-					Remove from Quick Access
+					{$ui("ui.remove_from_quick_access")}
 				</button>
 			{:else}
 				<button onclick={() => handleAddQuickAccess(contextMenu!.note)}>
 					<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
 					</svg>
-					Add to Quick Access
+					{$ui("ui.add_to_quick_access")}
 				</button>
 			{/if}
 			<button onclick={() => { const n = contextMenu!.note; contextMenu = null; openNoteWindow(ownerVault!, n.path, n.meta.title); }}>
 				<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
 				</svg>
-				Open in New Window
+				{$ui("ui.open_in_new_window")}
 			</button>
 			{#if !isMobile}
 			<button onclick={async () => { const n = contextMenu!.note; contextMenu = null; try { await revealFile(n.path); } catch (e) { console.error('Failed to reveal in file manager:', e); } }}>
 				<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
 				</svg>
-				Show in File Manager
+				{$ui("ui.show_in_file_manager")}
 			</button>
 			{/if}
 			<button onclick={() => startRename(contextMenu!.note)}>
 				<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M17 3a2.85 2.85 0 114 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/>
 				</svg>
-				Rename
+				{$ui("ui.rename")}
 			</button>
 			<button onclick={() => handleDuplicate(contextMenu!.note)}>
 				<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<rect x="8" y="8" width="13" height="13" rx="2"/><path d="M16 8V5a2 2 0 00-2-2H5a2 2 0 00-2 2v9a2 2 0 002 2h3"/>
 				</svg>
-				Duplicate Note
+				{$ui("ui.duplicate_note")}
 			</button>
 			<button onclick={() => { movePickerNote = contextMenu!.note; }}>
 				<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/>
 				</svg>
-				Move to...
+				{$ui("ui.move_to_d19987")}
 			</button>
 			{#if isFiled(contextMenu.note)}
 			<button onclick={() => unfileNote(contextMenu!.note)}>
 				<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/><path d="M9 13h6"/>
 				</svg>
-				Unfile Note
+				{$ui("ui.unfile_note")}
 			</button>
 			{/if}
 			{#if !isMobile}
@@ -1822,14 +1829,14 @@
 				<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/>
 				</svg>
-				Print / Export to PDF
+				{$ui("ui.print_export_to_pdf")}
 			</button>
 			{/if}
 			<button class="danger" onclick={() => handleDelete(contextMenu!.note)}>
 				<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>
 				</svg>
-				Move to Trash
+				{$ui("ui.move_to_trash")}
 			</button>
 		{/if}
 	</div>
@@ -1837,13 +1844,13 @@
 
 {#if sortMenu}
 	<div class="sort-menu" class:mobile={isMobile} style="left: {sortMenu.x}px; top: {sortMenu.y}px">
-		<div class="sort-menu-title">Sort by</div>
+		<div class="sort-menu-title">{$ui("ui.sort_by")}</div>
 		<button class:active={$sortMode === 'modified'} onclick={() => setSortMode('modified')}>
 			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 				<circle cx="12" cy="12" r="10" />
 				<polyline points="12 6 12 12 16 14" />
 			</svg>
-			Last Modified
+			{$ui("ui.last_modified")}
 			{#if $sortMode === 'modified'}<span class="sort-check">&#10003;</span>{/if}
 		</button>
 		<button class:active={$sortMode === 'created'} onclick={() => setSortMode('created')}>
@@ -1853,7 +1860,7 @@
 				<line x1="8" y1="2" x2="8" y2="6" />
 				<line x1="3" y1="10" x2="21" y2="10" />
 			</svg>
-			Date Created
+			{$ui("ui.date_created")}
 			{#if $sortMode === 'created'}<span class="sort-check">&#10003;</span>{/if}
 		</button>
 		<button class:active={$sortMode === 'title'} onclick={() => setSortMode('title')}>
@@ -1862,7 +1869,7 @@
 				<line x1="4" y1="12" x2="14" y2="12" />
 				<line x1="4" y1="18" x2="18" y2="18" />
 			</svg>
-			Title
+			{$ui("ui.title")}
 			{#if $sortMode === 'title'}<span class="sort-check">&#10003;</span>{/if}
 		</button>
 		<button class:active={$sortMode === 'custom'} onclick={() => setSortMode('custom')}>
@@ -1874,7 +1881,7 @@
 				<circle cx="4" cy="12" r="1" />
 				<circle cx="4" cy="18" r="1" />
 			</svg>
-			Custom
+			{$ui("ui.custom")}
 			{#if $sortMode === 'custom'}<span class="sort-check">&#10003;</span>{/if}
 		</button>
 	</div>

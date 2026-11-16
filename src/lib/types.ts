@@ -1,3 +1,5 @@
+import type { Language } from './i18n/core';
+
 export interface NoteMeta {
   id: string;
   title: string;
@@ -52,6 +54,7 @@ export interface NoteContent {
 }
 
 export interface VaultConfig {
+  mcp_grant_id?: string | null;
   path: string;
   name: string;
   bookmark_id?: string | null;
@@ -73,10 +76,9 @@ export interface PendingOpenFile {
   path: string;
 }
 
-export interface ExternalVaultResult {
-  bookmarkId: string;
+export interface VaultIdentity {
   path: string;
-  name: string;
+  bookmarkId: string | null;
 }
 
 export interface CustomThemeColors {
@@ -110,6 +112,7 @@ export interface AppConfig {
   active_vault: string | null;
   active_bookmark_id?: string | null;
   theme: string;
+  language?: Language;
   system_light_theme: string;
   system_dark_theme: string;
   accent_color: string | null;
@@ -154,9 +157,14 @@ export interface AppConfig {
   openai_compatible_base_url: string | null;
   openai_compatible_api_key: string | null;
   ai_model: string;
+  anthropic_model?: string | null;
+  openai_model?: string | null;
+  ollama_model?: string | null;
+  openai_compatible_model?: string | null;
   ai_writing_style: string | null;
   default_view_mode: boolean;
   new_notes_in_source_mode: boolean;
+  new_note_editor_mode?: 'rich' | 'live' | 'source' | null;
   show_tray_icon: boolean;
   close_to_tray: boolean;
   enable_wiki_links: boolean;
@@ -306,4 +314,3 @@ export interface RecordingEntry {
   display_name?: string;
   children?: RecordingEntry[];
 }
-

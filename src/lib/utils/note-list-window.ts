@@ -9,6 +9,7 @@ export function buildNoteListRows(
   notes: NoteEntry[],
   groupBy: 'created' | 'modified' | null,
   now = new Date(),
+  locale?: string,
 ): NoteListRow[] {
   const rows: NoteListRow[] = [];
   let previousLabel: string | undefined;
@@ -16,7 +17,7 @@ export function buildNoteListRows(
   for (let noteIndex = 0; noteIndex < notes.length; noteIndex++) {
     const note = notes[noteIndex];
     if (groupBy) {
-      const label = note.meta.pinned ? 'Pinned' : dateBucketLabel(note.meta[groupBy], now);
+      const label = note.meta.pinned ? 'Pinned' : dateBucketLabel(note.meta[groupBy], now, locale);
       if (label !== previousLabel) {
         rows.push({ kind: 'section', key: `section:${section++}:${label}`, label });
         previousLabel = label;

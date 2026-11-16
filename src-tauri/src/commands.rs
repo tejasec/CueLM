@@ -2,13 +2,14 @@ use crate::asset_scope;
 use crate::search::SearchIndex;
 use crate::state::AppState;
 use crate::types::*;
+use crate::vault::daily_template::DailyTemplate;
 use crate::vault::operations;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
 use tauri_plugin_fs::FsExt;
 
-fn index_note_bg(search: Option<Arc<SearchIndex>>, path: &str) {
+pub(crate) fn index_note_bg(search: Option<Arc<SearchIndex>>, path: &str) {
     if let Some(search) = search {
         if let Err(error) = search.queue_index_note(path) {
             log::error!("Failed to queue note indexing: {error}");
@@ -110,26 +111,57 @@ fn announce_rewritten_links<R: Runtime>(
 
 // ── Vault Management ──
 
-#[cfg(target_os = "ios")]
-use tauri_plugin_ios_vault_access::{FolderSelection, IosVaultAccessExt};
+#[cfg(test)]
+mod vault_switch_tests;
 
-#[derive(Debug, Clone, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ExternalVaultResult {
-    pub bookmark_id: String,
-    pub path: String,
-    pub name: String,
+#[cfg(target_os = "ios")]
+use tauri_plugin_ios_vault_access::IosVaultAccessExt;
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VaultIdentity {
+    path: String,
+    bookmark_id: Option<String>,
 }
 
-#[cfg(target_os = "ios")]
-impl From<FolderSelection> for ExternalVaultResult {
-    fn from(selection: FolderSelection) -> Self {
-        Self {
-            bookmark_id: selection.bookmark_id,
-            path: selection.path,
-            name: selection.name,
+fn validate_vault_origin(
+    config: &AppConfig,
+    expected: Option<&VaultIdentity>,
+) -> Result<(), String> {
+    if let Some(expected) = expected {
+        if config.active_vault.as_deref() != Some(expected.path.as_str())
+            || config.active_bookmark_id != expected.bookmark_id
+        {
+            return Err("The active vault changed. Reopen the vault menu before switching.".into());
         }
     }
+    Ok(())
+}
+
+fn validate_vault_path(path: &str) -> Result<(), String> {
+    if !Path::new(path).is_absolute() {
+        return Err("Choose an absolute vault folder path.".into());
+    }
+    Ok(())
+}
+
+fn validate_saved_vault(config: &AppConfig, path: &str) -> Result<(), String> {
+    if !config
+        .vaults
+        .iter()
+        .any(|vault| vault.bookmark_id.is_none() && vault.path == path)
+    {
+        return Err("This vault is no longer in the saved list. Reopen the vault menu.".into());
+    }
+    if !Path::new(path).is_dir() {
+        return Err("This vault folder is unavailable. Reconnect its storage or choose it again; it was not recreated.".into());
+    }
+    // An unmounted drive can leave an empty mount-point directory behind. Saved
+    // vaults were already initialized; do not silently initialize that placeholder.
+    if !Path::new(path).join(".helixnotes/config.json").is_file() {
+        return Err("This saved vault's metadata is unavailable. Reconnect its storage or explicitly choose the folder again.".into());
+    }
+    Ok(())
 }
 
 fn open_vault_path(
@@ -137,7 +169,8 @@ fn open_vault_path(
     state: &State<'_, AppState>,
     path: String,
     external: Option<(String, String)>,
-) -> Result<std::sync::Arc<SearchIndex>, String> {
+) -> Result<(std::sync::Arc<SearchIndex>, AppConfig), String> {
+    validate_vault_path(&path)?;
     operations::ensure_vault_structure(&path)?;
 
     // Stage the search index and watcher before replacing the active runtime.
@@ -195,14 +228,17 @@ fn open_vault_path(
         return Err(error);
     }
     let old_search = search_slot.replace(search.clone());
-    *config = next;
+    *config = next.clone();
     drop(config);
     drop(search_slot);
-    // Index disposal and watcher shutdown must not hold global state slots.
-    state.retain_vault_watchers()?;
+    // Once configuration is committed, cleanup failures must not report activation
+    // failure and strand the frontend on the previous vault.
+    if let Err(error) = state.retain_vault_watchers() {
+        log::error!("Could not clean up vault watchers after activation: {error}");
+    }
     drop(old_search);
 
-    Ok(search)
+    Ok((search, next))
 }
 
 #[tauri::command]
@@ -210,17 +246,29 @@ pub async fn open_vault(
     app: AppHandle,
     state: State<'_, AppState>,
     path: String,
-) -> Result<(), String> {
+    require_existing: Option<bool>,
+    expected: Option<VaultIdentity>,
+) -> Result<AppConfig, String> {
     let _transition = state.vault_transition.lock().await;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<AppState>();
-        let search = open_vault_path(app.clone(), &state, path.clone(), None)?;
+        validate_vault_path(&path)?;
+        {
+            let config = state.config.lock().map_err(|error| error.to_string())?;
+            validate_vault_origin(&config, expected.as_ref())?;
+            if require_existing.unwrap_or(false) {
+                validate_saved_vault(&config, &path)?;
+            }
+        }
+        let (search, config) = open_vault_path(app.clone(), &state, path.clone(), None)?;
         #[cfg(target_os = "ios")]
-        app.ios_vault_access().release_active()?;
+        if let Err(error) = app.ios_vault_access().release_active() {
+            log::error!("Could not release previous vault scope after activation: {error}");
+        }
         if let Err(error) = search.queue_vault_refresh(&path) {
             log::error!("Failed to queue opened vault search refresh: {error}");
         }
-        Ok(())
+        Ok(config)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -230,7 +278,7 @@ pub async fn open_vault(
 pub async fn choose_external_vault(
     app: AppHandle,
     state: State<'_, AppState>,
-) -> Result<Option<ExternalVaultResult>, String> {
+) -> Result<Option<AppConfig>, String> {
     let _transition = state.vault_transition.lock().await;
     #[cfg(target_os = "ios")]
     {
@@ -243,7 +291,7 @@ pub async fn choose_external_vault(
         if selection.cancelled {
             return Ok(None);
         }
-        let result = ExternalVaultResult::from(selection);
+        let result = selection;
         tauri::async_runtime::spawn_blocking(move || {
             let state = app.state::<AppState>();
             let bookmark_was_registered = state
@@ -253,13 +301,13 @@ pub async fn choose_external_vault(
                 .vaults
                 .iter()
                 .any(|vault| vault.bookmark_id.as_deref() == Some(result.bookmark_id.as_str()));
-            let search = match open_vault_path(
+            let (search, config) = match open_vault_path(
                 app.clone(),
                 &state,
                 result.path.clone(),
                 Some((result.bookmark_id.clone(), result.name.clone())),
             ) {
-                Ok(search) => search,
+                Ok(opened) => opened,
                 Err(error) => {
                     let rollback = if bookmark_was_registered {
                         app.ios_vault_access().rollback_staged()
@@ -274,11 +322,13 @@ pub async fn choose_external_vault(
                     });
                 }
             };
-            app.ios_vault_access().commit_staged()?;
+            if let Err(error) = app.ios_vault_access().commit_staged() {
+                log::error!("Could not finalize vault scope after activation: {error}");
+            }
             if let Err(error) = search.queue_vault_refresh(&result.path) {
                 log::error!("Failed to queue opened vault search refresh: {error}");
             }
-            Ok(Some(result))
+            Ok(Some(config))
         })
         .await
         .map_err(|error| error.to_string())?
@@ -295,8 +345,20 @@ pub async fn restore_external_vault(
     app: AppHandle,
     state: State<'_, AppState>,
     bookmark_id: String,
-) -> Result<ExternalVaultResult, String> {
+    expected: Option<VaultIdentity>,
+) -> Result<AppConfig, String> {
     let _transition = state.vault_transition.lock().await;
+    {
+        let config = state.config.lock().map_err(|error| error.to_string())?;
+        validate_vault_origin(&config, expected.as_ref())?;
+        if !config
+            .vaults
+            .iter()
+            .any(|vault| vault.bookmark_id.as_deref() == Some(bookmark_id.as_str()))
+        {
+            return Err("This vault is no longer in the saved list. Reopen the vault menu.".into());
+        }
+    }
     #[cfg(target_os = "ios")]
     {
         let resolver_app = app.clone();
@@ -305,16 +367,16 @@ pub async fn restore_external_vault(
         })
         .await
         .map_err(|error| error.to_string())??;
-        let result = ExternalVaultResult::from(selection);
+        let result = selection;
         tauri::async_runtime::spawn_blocking(move || {
             let state = app.state::<AppState>();
-            let search = match open_vault_path(
+            let (search, config) = match open_vault_path(
                 app.clone(),
                 &state,
                 result.path.clone(),
                 Some((result.bookmark_id.clone(), result.name.clone())),
             ) {
-                Ok(search) => search,
+                Ok(opened) => opened,
                 Err(error) => {
                     return Err(match app.ios_vault_access().rollback_staged() {
                         Ok(()) => error,
@@ -324,11 +386,13 @@ pub async fn restore_external_vault(
                     });
                 }
             };
-            app.ios_vault_access().commit_staged()?;
+            if let Err(error) = app.ios_vault_access().commit_staged() {
+                log::error!("Could not finalize vault scope after activation: {error}");
+            }
             if let Err(error) = search.queue_vault_refresh(&result.path) {
                 log::error!("Failed to queue opened vault search refresh: {error}");
             }
-            Ok(result)
+            Ok(config)
         })
         .await
         .map_err(|error| error.to_string())?
@@ -481,13 +545,47 @@ pub fn complete_window_close<R: Runtime>(
     window: tauri::Window<R>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
+    if crate::mcp::McpRuntime::editing(window.app_handle()) {
+        return Err("An MCP edit is still running. Wait for it to finish before closing.".into());
+    }
     if state.should_hide_to_tray(
         window.label(),
-        window.app_handle().tray_by_id("cuelm").is_some(),
+        window.app_handle().tray_by_id("cuelm").is_some()
+            || window.app_handle().tray_by_id("helixnotes").is_some(),
     )? {
         return window.hide().map_err(|error| error.to_string());
     }
     window.destroy().map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub fn set_language<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    language: String,
+) -> Result<(), String> {
+    if language != "system" && !crate::i18n::supported_languages().contains(&language) {
+        return Err("Unsupported interface language".to_string());
+    }
+    let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    let previous = std::mem::replace(&mut config.language, language.clone());
+    if let Err(error) = save_app_config(&config) {
+        config.language = previous;
+        return Err(error);
+    }
+    drop(config);
+    #[cfg(desktop)]
+    if let Some(tray) = app.tray_by_id("helixnotes") {
+        match crate::localized_tray_menu(&app, &language) {
+            Ok(menu) => {
+                let _ = tray.set_menu(Some(menu));
+            }
+            Err(error) => log::error!("Could not update tray language: {error}"),
+        }
+    }
+    // Detached note windows share this device's language, without touching vault state.
+    let _ = app.emit("language-changed", &language);
+    Ok(())
 }
 
 #[tauri::command]
@@ -727,6 +825,8 @@ pub async fn get_notebooks(state: State<'_, AppState>) -> Result<Vec<NotebookEnt
         .map_err(|error| error.to_string())?
 }
 
+// ── Audio Recording Commands (CueLM) ──
+
 #[tauri::command]
 pub async fn get_recordings(
     state: State<'_, AppState>,
@@ -780,9 +880,11 @@ pub async fn rename_recording(
             .clone()
             .ok_or("No active vault")?,
     };
-    tauri::async_runtime::spawn_blocking(move || operations::rename_recording(&target_vault, &old_path, &new_name))
-        .await
-        .map_err(|error| error.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        operations::rename_recording(&target_vault, &old_path, &new_name)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[tauri::command]
@@ -801,11 +903,12 @@ pub async fn delete_recording(
             .clone()
             .ok_or("No active vault")?,
     };
-    tauri::async_runtime::spawn_blocking(move || operations::delete_recording(&target_vault, &file_path))
-        .await
-        .map_err(|error| error.to_string())?
+    tauri::async_runtime::spawn_blocking(move || {
+        operations::delete_recording(&target_vault, &file_path)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
-
 
 #[tauri::command]
 pub async fn count_root_notes(state: State<'_, AppState>) -> Result<usize, String> {
@@ -979,20 +1082,39 @@ pub async fn save_note(
     tauri::async_runtime::spawn_blocking(move || {
         // Keep ordering even if the calling window closes while its save runs.
         let _save_guard = save_guard;
-        if let Some(saved) = operations::save_note(&vault_path, &path, &meta, &body, &expected_raw)?
-        {
-            crate::history::maybe_snapshot(
-                &vault_path,
-                &saved.id,
-                &saved.previous_raw,
-                max_versions,
-            );
-            index_note_bg(search, &path);
-        }
+        commit_note(
+            search,
+            &vault_path,
+            &path,
+            &meta,
+            &body,
+            &expected_raw,
+            max_versions,
+        )?;
         operations::read_vault_note(&vault_path, &path)
     })
     .await
     .map_err(|error| error.to_string())?
+}
+
+/// Shared commit path for the editor and authenticated MCP writes. The caller owns note_save.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn commit_note(
+    search: Option<Arc<SearchIndex>>,
+    vault: &str,
+    path: &str,
+    meta: &NoteMeta,
+    body: &str,
+    expected_raw: &str,
+    max_versions: u32,
+) -> Result<bool, String> {
+    if let Some(saved) = operations::save_note(vault, path, meta, body, expected_raw)? {
+        crate::history::maybe_snapshot(vault, &saved.id, &saved.previous_raw, max_versions);
+        index_note_bg(search, path);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 #[tauri::command]
@@ -1076,12 +1198,97 @@ pub async fn create_daily_note(
         .map_err(|error| error.to_string())?
         .daily_title_format
         .clone();
-    let _write_guard = state.note_save.lock().await;
-    let entry = operations::create_daily_note(&vault_path, date.as_deref(), &title_format)?;
+    let write_guard = state.note_save.clone().lock_owned().await;
+    let entry = tauri::async_runtime::spawn_blocking(move || {
+        let _write_guard = write_guard;
+        operations::create_daily_note(&vault_path, date.as_deref(), &title_format)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
 
     index_note_bg(search, &entry.path);
 
     Ok(entry)
+}
+
+#[tauri::command]
+pub async fn get_daily_note_template(
+    state: State<'_, AppState>,
+    vault_path: String,
+) -> Result<DailyTemplate, String> {
+    state.validate_vault(&vault_path)?;
+    let guard = state.note_save.clone().lock_owned().await;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        crate::vault::daily_template::read(&vault_path).map(DailyTemplate::from_raw)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn set_daily_note_template(
+    state: State<'_, AppState>,
+    vault_path: String,
+    template: Option<String>,
+    expected_template: Option<String>,
+) -> Result<DailyTemplate, String> {
+    let guard = state.note_save.clone().lock_owned().await;
+    state.validate_vault(&vault_path)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        crate::vault::daily_template::set(
+            &vault_path,
+            template.as_deref(),
+            expected_template.as_deref(),
+        )
+        .map(DailyTemplate::from_raw)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn import_daily_note_template<R: Runtime>(
+    app: AppHandle<R>,
+    state: State<'_, AppState>,
+    vault_path: String,
+    title: String,
+    expected_template: Option<String>,
+) -> Result<Option<DailyTemplate>, String> {
+    state.validate_vault(&vault_path)?;
+    // Pick inside this command: callers cannot nominate an arbitrary external path.
+    // Do not hold the note-save lock while a user is choosing a file.
+    let text = tauri::async_runtime::spawn_blocking(move || {
+        use tauri_plugin_dialog::DialogExt;
+        let Some(source) = app
+            .dialog()
+            .file()
+            .set_title(title)
+            .add_filter("Markdown", &["md"])
+            .blocking_pick_file()
+        else {
+            return Ok::<_, String>(None);
+        };
+        let mut options = tauri_plugin_fs::OpenOptions::new();
+        options.read(true);
+        let file = app.fs().open(source, options).map_err(|e| e.to_string())?;
+        crate::vault::daily_template::read_from(file).map(Some)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    let Some(text) = text else {
+        return Ok(None);
+    };
+    let guard = state.note_save.clone().lock_owned().await;
+    state.validate_vault(&vault_path)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        crate::vault::daily_template::set(&vault_path, Some(&text), expected_template.as_deref())
+            .map(|raw| Some(DailyTemplate::from_raw(raw)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1189,12 +1396,12 @@ fn scan_all_note_titles(vault_path: &str) -> Result<Vec<NoteTitleEntry>, String>
     use rayon::prelude::*;
 
     let vault = std::path::Path::new(vault_path);
-    let hn_dir = operations::cuelm_dir(vault_path);
+    let hn_dir = operations::helixnotes_dir(vault_path);
 
     let paths: Vec<PathBuf> = walkdir::WalkDir::new(vault)
         .into_iter()
-        // Cross-platform exclusion (string "/.cuelm/" checks miss Windows
-        // backslash paths, which leaked .cuelm/history snapshots in as dupes).
+        // Cross-platform exclusion (string "/.helixnotes/" checks miss Windows
+        // backslash paths, which leaked .helixnotes/history snapshots in as dupes).
         .filter_entry(|e| {
             e.depth() == 0 || (!operations::is_hidden(e.path()) && !e.path().starts_with(&hn_dir))
         })
@@ -1314,9 +1521,9 @@ fn scan_graph_data(vault_path: &str) -> Result<crate::types::GraphData, String> 
     use std::collections::{HashMap, HashSet};
 
     let vault = std::path::Path::new(vault_path);
-    let hn_dir = operations::cuelm_dir(vault_path);
+    let hn_dir = operations::helixnotes_dir(vault_path);
 
-    // Collect every note path first. Cross-platform exclusion (string "/.cuelm/" checks miss
+    // Collect every note path first. Cross-platform exclusion (string "/.helixnotes/" checks miss
     // Windows backslash paths; is_hidden also covers .stversions/.stfolder/.trash/.git).
     let candidates: Vec<PathBuf> = walkdir::WalkDir::new(vault)
         .into_iter()
@@ -1519,7 +1726,7 @@ fn scan_tasks(vault_path: &str, note_path: Option<&str>) -> Result<Vec<TaskItem>
     }
 
     let vault = Path::new(vault_path);
-    let hn_dir = operations::cuelm_dir(vault_path);
+    let hn_dir = operations::helixnotes_dir(vault_path);
     let paths: Vec<PathBuf> = walkdir::WalkDir::new(vault)
         .into_iter()
         .filter_entry(|entry| {
@@ -1609,8 +1816,8 @@ mod note_title_scan_tests {
             .map(|index| format!("tag-{index}"))
             .collect::<Vec<_>>()
             .join(", ");
-        fs::create_dir_all(vault.join("Notebook/.cuelm")).unwrap();
-        fs::create_dir_all(vault.join(".cuelm/history")).unwrap();
+        fs::create_dir_all(vault.join("Notebook/.helixnotes")).unwrap();
+        fs::create_dir_all(vault.join(".helixnotes/history")).unwrap();
         fs::write(
             vault.join("Notebook/Long.md"),
             format!("---\ntags: [{tags}]\ntitle: Long Title\n---\n# Long Title\n"),
@@ -1618,7 +1825,7 @@ mod note_title_scan_tests {
         .unwrap();
         fs::write(vault.join("Plain.md"), "# No frontmatter\n").unwrap();
         fs::write(
-            vault.join(".cuelm/history/Old.md"),
+            vault.join(".helixnotes/history/Old.md"),
             "---\ntitle: Old\n---\n",
         )
         .unwrap();
@@ -1648,7 +1855,7 @@ mod graph_scan_tests {
         let vault = parent.path().join("vault");
         fs::create_dir_all(vault.join("folder")).unwrap();
         fs::create_dir_all(vault.join("other")).unwrap();
-        fs::create_dir_all(vault.join(".cuelm")).unwrap();
+        fs::create_dir_all(vault.join(".helixnotes")).unwrap();
         let write = |path: &str, text: &str| fs::write(vault.join(path), text).unwrap();
         write("A.md", "---\ntitle: \"Alpha\"\n---\n[[Beta]] [[folder/C|alias]] [[Twin#Head]] [[missing]] [[unterminated");
         write(
@@ -1659,7 +1866,7 @@ mod graph_scan_tests {
         write("folder/Twin.md", "---\ntitle: Twin\n---\n");
         write("other/Twin.md", "---\ntitle: Twin\n---\n");
         write("A.sync-conflict-20260101.md", "[[Beta]]");
-        write(".cuelm/Hidden.md", "[[Beta]]");
+        write(".helixnotes/Hidden.md", "[[Beta]]");
         write("ignored.txt", "[[Beta]]");
 
         let graph = scan_graph_data(vault.to_str().unwrap()).unwrap();
@@ -2132,8 +2339,8 @@ mod vault_state_scope_tests {
     async fn queued_state_write_keeps_its_originating_vault() -> Result<(), String> {
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
-        std::fs::create_dir(first.path().join(".cuelm")).unwrap();
-        std::fs::create_dir(second.path().join(".cuelm")).unwrap();
+        std::fs::create_dir(first.path().join(".helixnotes")).unwrap();
+        std::fs::create_dir(second.path().join(".helixnotes")).unwrap();
         let first_path = first.path().to_string_lossy().into_owned();
         let second_path = second.path().to_string_lossy().into_owned();
         let first_state = VaultState {
@@ -2483,6 +2690,31 @@ pub async fn import_tag_icon(
 
 // ── General Settings ──
 
+#[cfg(test)]
+mod editor_mode_tests;
+
+fn persist_new_note_editor_mode(
+    config: &mut AppConfig,
+    mode: NewNoteEditorMode,
+    path: &Path,
+) -> Result<(), String> {
+    let mut next = config.clone();
+    next.new_note_editor_mode = Some(mode);
+    next.new_notes_in_source_mode = mode != NewNoteEditorMode::Rich;
+    save_app_config_to(&next, path)?;
+    *config = next;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_new_note_editor_mode(
+    state: State<'_, AppState>,
+    mode: NewNoteEditorMode,
+) -> Result<(), String> {
+    let mut config = state.config.lock().map_err(|error| error.to_string())?;
+    persist_new_note_editor_mode(&mut config, mode, &app_config_path()?)
+}
+
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn set_general_settings(
@@ -2537,7 +2769,11 @@ pub fn set_general_settings(
     config.show_line_numbers = show_line_numbers;
     config.show_link_arrows = show_link_arrows;
     config.default_view_mode = default_view_mode;
-    config.new_notes_in_source_mode = new_notes_in_source_mode;
+    config.new_notes_in_source_mode = config
+        .new_note_editor_mode
+        .map_or(new_notes_in_source_mode, |mode| {
+            mode != NewNoteEditorMode::Rich
+        });
     config.show_tray_icon = show_tray_icon;
     config.close_to_tray = close_to_tray;
     config.enable_wiki_links = enable_wiki_links;
@@ -2636,7 +2872,7 @@ fn scan_vault_stats(vault_path: &str) -> Result<VaultStats, String> {
             if relative
                 .parent()
                 .and_then(Path::file_name)
-                .is_some_and(|name| name == ".cuelm")
+                .is_some_and(|name| name == ".helixnotes")
             {
                 return is_directory && entry.file_name() == "attachments";
             }
@@ -2728,22 +2964,22 @@ mod vault_stats_tests {
         write_fixture(
             vault.path(),
             &[
-                (&[".cuelm", "attachments", "image.png"], b"123"),
-                (&[".cuelm", "attachments", "Manual.md"], b"1234"),
+                (&[".helixnotes", "attachments", "image.png"], b"123"),
+                (&[".helixnotes", "attachments", "Manual.md"], b"1234"),
                 (
-                    &[".cuelm", "attachments", "Nested", "icon.svg"],
+                    &[".helixnotes", "attachments", "Nested", "icon.svg"],
                     b"12345",
                 ),
                 (
-                    &[".cuelm", "attachments", ".trash-backup", "backup.bin"],
+                    &[".helixnotes", "attachments", ".trash-backup", "backup.bin"],
                     b"123456",
                 ),
-                (&[".cuelm", "settings.json"], b"excluded"),
-                (&[".cuelm", "history", "Snapshot.md"], b"excluded"),
-                (&[".cuelm", "trash", "Deleted.md"], b"excluded"),
-                (&[".cuelm", "attachments-old", "old.png"], b"excluded"),
+                (&[".helixnotes", "settings.json"], b"excluded"),
+                (&[".helixnotes", "history", "Snapshot.md"], b"excluded"),
+                (&[".helixnotes", "trash", "Deleted.md"], b"excluded"),
+                (&[".helixnotes", "attachments-old", "old.png"], b"excluded"),
                 (
-                    &[".cuelm", "attachments", ".trash", "deleted.png"],
+                    &[".helixnotes", "attachments", ".trash", "deleted.png"],
                     b"excluded",
                 ),
             ],
@@ -2759,24 +2995,24 @@ mod vault_stats_tests {
             vault.path(),
             &[
                 (&[".trash-backup", "Note.md"], b"1"),
-                (&[".cuelm-backup", "Note.md"], b"12"),
+                (&[".helixnotes-backup", "Note.md"], b"12"),
                 (&["attachments-old", "Note.md"], b"123"),
                 (&["Work.notebook", "attachments-old", "Note.md"], b"1234"),
                 (&["Work.notebook", ".trash-backup", "picture.png"], b"12345"),
                 (&["Files", ".trash"], b"123456"),
-                (&["Files", ".cuelm"], b"1234567"),
+                (&["Files", ".helixnotes"], b"1234567"),
                 (
-                    &["Work.notebook", ".cuelm", "attachments", "photo.png"],
+                    &["Work.notebook", ".helixnotes", "attachments", "photo.png"],
                     b"12345678",
                 ),
                 (&[".trash", "Deleted.md"], b"excluded"),
                 (&["Work.notebook", ".trash", "deleted.png"], b"excluded"),
                 (
-                    &["Work.notebook", ".cuelm", "history", "Snapshot.md"],
+                    &["Work.notebook", ".helixnotes", "history", "Snapshot.md"],
                     b"excluded",
                 ),
                 (
-                    &["Work.notebook", ".cuelm", "attachments-old", "old.png"],
+                    &["Work.notebook", ".helixnotes", "attachments-old", "old.png"],
                     b"excluded",
                 ),
             ],
@@ -2789,10 +3025,10 @@ mod vault_stats_tests {
     fn vault_stats_ignore_excluded_names_outside_the_vault() {
         let locations: &[&[&str]] = &[
             &[".trash", "vault"],
-            &[".cuelm", "history", "vault"],
-            &[".cuelm", "attachments-old", "vault"],
+            &[".helixnotes", "history", "vault"],
+            &[".helixnotes", "attachments-old", "vault"],
             &[".trash"],
-            &[".cuelm"],
+            &[".helixnotes"],
         ];
         for components in locations {
             let root = tempfile::tempdir().unwrap();
@@ -2805,8 +3041,8 @@ mod vault_stats_tests {
                 &[
                     (&["Note.md"], b"hello"),
                     (&["Notebook", "photo.png"], b"123"),
-                    (&[".cuelm", "attachments", "photo.png"], b"12"),
-                    (&[".cuelm", "history", "Snapshot.md"], b"excluded"),
+                    (&[".helixnotes", "attachments", "photo.png"], b"12"),
+                    (&[".helixnotes", "history", "Snapshot.md"], b"excluded"),
                     (&[".trash", "Deleted.md"], b"excluded"),
                 ],
             );
@@ -2883,13 +3119,13 @@ pub struct OrphanAttachment {
     pub size: u64,
 }
 
-// Conservatively find files in .cuelm/attachments not referenced by ANY note. Scans every
-// .md in the vault (including .cuelm/trash, so a restorable trashed note keeps its files)
+// Conservatively find files in .helixnotes/attachments not referenced by ANY note. Scans every
+// .md in the vault (including .helixnotes/trash, so a restorable trashed note keeps its files)
 // plus notebook_icons.json and tag_styles.json. A single matcher finds all basename substrings
 // in each source, first raw and then decoded in place (including URL-encoded paths).
 // When in doubt a file is KEPT: a leftover orphan is harmless, a wrong deletion is not.
 fn scan_orphaned_attachments(vault: &str) -> Result<Vec<(String, u64)>, String> {
-    let attachments_dir = operations::cuelm_dir(vault).join("attachments");
+    let attachments_dir = operations::helixnotes_dir(vault).join("attachments");
     let entries = match std::fs::read_dir(&attachments_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -2941,7 +3177,7 @@ fn scan_orphaned_attachments(vault: &str) -> Result<Vec<(String, u64)>, String> 
     }
     // Folder and tag icons live in attachments but are referenced here, not in notes. (#157)
     for mapping in ["notebook_icons.json", "tag_styles.json"] {
-        let mapping_path = operations::cuelm_dir(vault).join(mapping);
+        let mapping_path = operations::helixnotes_dir(vault).join(mapping);
         match std::fs::read_to_string(&mapping_path) {
             Ok(content) => {
                 let references = operations::attachment_metadata_references(mapping, &content)
@@ -3018,8 +3254,8 @@ fn trash_orphaned_files(vault: &str, names: &[String]) -> Result<u32, String> {
         .into_iter()
         .map(|(n, _)| n)
         .collect();
-    let attachments_dir = operations::cuelm_dir(vault).join("attachments");
-    let trash_dir = operations::cuelm_dir(vault).join("trash");
+    let attachments_dir = operations::helixnotes_dir(vault).join("attachments");
+    let trash_dir = operations::helixnotes_dir(vault).join("trash");
     std::fs::create_dir_all(&trash_dir).map_err(|e| e.to_string())?;
     let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S%3f").to_string();
     let mut moved = 0u32;
@@ -3068,7 +3304,7 @@ mod orphan_attachment_tests {
             let root = tempfile::tempdir().unwrap();
             let vault = root.path().to_str().unwrap();
             operations::ensure_vault_structure(vault).unwrap();
-            let storage = operations::cuelm_dir(vault);
+            let storage = operations::helixnotes_dir(vault);
             let attachment = storage.join("attachments/keep.png");
             std::fs::write(&attachment, b"preserved").unwrap();
             std::fs::write(storage.join(mapping), content).unwrap();
@@ -3086,7 +3322,7 @@ mod orphan_attachment_tests {
         let root = tempfile::tempdir().unwrap();
         let vault = root.path().to_str().unwrap();
         operations::ensure_vault_structure(vault).unwrap();
-        let storage = operations::cuelm_dir(vault);
+        let storage = operations::helixnotes_dir(vault);
         std::fs::write(storage.join("attachments/猫.png"), b"notebook").unwrap();
         std::fs::write(storage.join("attachments/é.png"), b"tag").unwrap();
         std::fs::write(
@@ -3118,7 +3354,7 @@ mod orphan_attachment_tests {
         let root = tempfile::tempdir().unwrap();
         let vault = root.path().to_str().unwrap();
         operations::ensure_vault_structure(vault).unwrap();
-        let attachments = operations::cuelm_dir(vault).join("attachments");
+        let attachments = operations::helixnotes_dir(vault).join("attachments");
         for name in [
             "plain.txt",
             "icon.png",
@@ -3147,7 +3383,7 @@ mod orphan_attachment_tests {
         let root = tempfile::tempdir().unwrap();
         let vault = root.path().to_str().unwrap();
         operations::ensure_vault_structure(vault).unwrap();
-        let storage = operations::cuelm_dir(vault);
+        let storage = operations::helixnotes_dir(vault);
         let attachments = storage.join("attachments");
         for name in [
             "raw 猫.png",
@@ -3201,7 +3437,7 @@ mod orphan_attachment_tests {
         let root = tempfile::tempdir().unwrap();
         let vault = root.path().to_str().unwrap();
         operations::ensure_vault_structure(vault).unwrap();
-        let storage = operations::cuelm_dir(vault);
+        let storage = operations::helixnotes_dir(vault);
         let attachment = storage.join("attachments/keep.png");
         std::fs::write(&attachment, b"image").unwrap();
         std::fs::write(root.path().join("Note.md"), "keep.png").unwrap();
@@ -3216,7 +3452,7 @@ mod orphan_attachment_tests {
         let root = tempfile::tempdir().unwrap();
         let vault = root.path().to_str().unwrap();
         operations::ensure_vault_structure(vault).unwrap();
-        let storage = operations::cuelm_dir(vault);
+        let storage = operations::helixnotes_dir(vault);
         let attachments = storage.join("attachments");
         for name in [
             "late.png",
@@ -3279,7 +3515,7 @@ mod orphan_attachment_tests {
         let root = tempfile::tempdir().unwrap();
         let vault = root.path().to_str().unwrap();
         operations::ensure_vault_structure(vault).unwrap();
-        let storage = operations::cuelm_dir(vault);
+        let storage = operations::helixnotes_dir(vault);
         let attachment = storage.join("attachments/keep.png");
         std::fs::write(&attachment, b"image").unwrap();
         let note = root.path().join("Unreadable.md");
@@ -3432,7 +3668,7 @@ mod external_access_tests {
     #[test]
     fn external_urls_allow_supported_schemes() {
         for url in [
-            "https://cuelm.com",
+            "https://helixnotes.com",
             "http://example.com",
             "mailto:hello@example.com",
             "tel:+123456789",
@@ -3591,8 +3827,8 @@ mod external_access_tests {
         operations::ensure_vault_structure(&destination).unwrap();
         std::fs::create_dir(source_root.join("Notebook")).unwrap();
         let source = source_root.join("Notebook/Note.md");
-        let image = source_root.join(".cuelm/attachments/photo%20).png");
-        let href = ".cuelm/attachments/photo%2520%29.png";
+        let image = source_root.join(".helixnotes/attachments/photo%20).png");
+        let href = ".helixnotes/attachments/photo%2520%29.png";
         let raw = format!("![Image]({href})");
         std::fs::write(&source, &raw).unwrap();
         std::fs::write(&image, b"source image").unwrap();
@@ -3631,11 +3867,11 @@ mod external_access_tests {
         )
         .await
         .unwrap();
-        assert!(note.raw.contains(".cuelm/attachments/"));
+        assert!(note.raw.contains(".helixnotes/attachments/"));
         assert_eq!(std::fs::read_to_string(source).unwrap(), raw);
         assert_eq!(std::fs::read(image).unwrap(), b"source image");
         let files: Vec<_> =
-            std::fs::read_dir(std::path::Path::new(&destination).join(".cuelm/attachments"))
+            std::fs::read_dir(std::path::Path::new(&destination).join(".helixnotes/attachments"))
                 .unwrap()
                 .collect();
         assert_eq!(files.len(), 1);
@@ -3653,7 +3889,7 @@ mod external_access_tests {
         crate::vault::operations::ensure_vault_structure(&vault_path).unwrap();
         let outside = root.path().join("outside.md");
         let non_markdown = root.path().join("outside.txt");
-        let internal = vault.join(".cuelm/history/snapshot.md");
+        let internal = vault.join(".helixnotes/history/snapshot.md");
         fs::create_dir_all(internal.parent().unwrap()).unwrap();
         for path in [&outside, &non_markdown, &internal] {
             fs::write(path, "Original").unwrap();
@@ -3701,7 +3937,7 @@ mod external_access_tests {
     #[test]
     fn file_access_requires_the_active_vault_or_an_explicit_user_scope() {
         let root = std::env::temp_dir().join(format!(
-            "cuelm-external-access-{}",
+            "helixnotes-external-access-{}",
             uuid::Uuid::new_v4()
         ));
         let vault = root.join("vault");
@@ -4042,6 +4278,30 @@ pub async fn get_note_version_content(
 // ── AI ──
 
 #[tauri::command]
+pub async fn fetch_ai_models(
+    provider: String,
+    api_key: String,
+) -> Result<Vec<crate::ai::models::AiModel>, String> {
+    crate::ai::models::fetch_models(&provider, &api_key).await
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AiImageContext {
+    vault_path: String,
+    note_path: String,
+    paths: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AiRequestConfig {
+    provider: Option<String>,
+    model: String,
+    base_url: Option<String>,
+}
+
+#[tauri::command]
 #[allow(clippy::too_many_arguments)]
 pub fn set_ai_settings(
     state: State<'_, AppState>,
@@ -4054,8 +4314,20 @@ pub fn set_ai_settings(
     openai_compatible_base_url: Option<String>,
     openai_compatible_api_key: Option<String>,
 ) -> Result<(), String> {
-    let mut config = state.config.lock().map_err(|e| e.to_string())?;
-    let key = api_key.filter(|k| !k.is_empty());
+    let mut current = state.config.lock().map_err(|e| e.to_string())?;
+    let mut config = current.clone();
+    let key = api_key
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty());
+    let model = model.trim().to_string();
+    if model.len() > 512
+        || key.as_ref().is_some_and(|key| key.len() > 8192)
+        || writing_style
+            .as_ref()
+            .is_some_and(|style| style.len() > 256 * 1024)
+    {
+        return Err("AI settings exceed the size limit".into());
+    }
     match provider.as_deref() {
         Some("openai") => config.openai_api_key = key,
         Some("ollama") => {
@@ -4067,12 +4339,23 @@ pub fn set_ai_settings(
                 openai_compatible_base_url.filter(|u| !u.trim().is_empty());
             config.openai_compatible_api_key = openai_compatible_api_key.filter(|k| !k.is_empty());
         }
-        _ => config.ai_api_key = key,
+        Some("anthropic") => config.ai_api_key = key,
+        None => {} // Turning AI off must not erase saved credentials.
+        _ => return Err("Unsupported AI provider".into()),
+    }
+    let remembered = (!model.is_empty()).then(|| model.clone());
+    match provider.as_deref() {
+        Some("openai") => config.openai_model = remembered,
+        Some("anthropic") => config.anthropic_model = remembered,
+        Some("ollama") => config.ollama_model = remembered,
+        Some("openai_compatible") => config.openai_compatible_model = remembered,
+        _ => {}
     }
     config.ai_provider = provider;
     config.ai_model = model;
     config.ai_writing_style = writing_style.filter(|s| !s.trim().is_empty());
     save_app_config(&config)?;
+    *current = config;
     Ok(())
 }
 
@@ -4084,7 +4367,7 @@ pub fn test_ai_connection(app: AppHandle) -> Result<(), String> {
         let provider = config
             .ai_provider
             .clone()
-            .unwrap_or_else(|| "anthropic".to_string());
+            .ok_or("AI is disabled. Choose a provider in Settings.")?;
         let key = match provider.as_str() {
             "ollama" => Some(config.ollama_api_key.clone().unwrap_or_default()),
             "openai_compatible" => {
@@ -4101,6 +4384,14 @@ pub fn test_ai_connection(app: AppHandle) -> Result<(), String> {
         };
         (provider, key, model, base_url)
     };
+    if model.trim().is_empty()
+        || !matches!(
+            provider.as_str(),
+            "openai" | "anthropic" | "ollama" | "openai_compatible"
+        )
+    {
+        return Err("Choose an AI provider and model in Settings".into());
+    }
 
     std::thread::spawn(move || {
         use tauri::Emitter;
@@ -4315,7 +4606,7 @@ pub fn sync_now(app: AppHandle) -> Result<(), String> {
     };
     std::thread::spawn(move || {
         use tauri::Emitter;
-        let result = crate::sync::run_sync(app.clone(), vault.clone(), cfg);
+        let result = crate::sync::run_sync(app.clone(), vault.clone(), bookmark_id.clone(), cfg);
         app.state::<AppState>()
             .syncing
             .store(false, Ordering::SeqCst);
@@ -4338,7 +4629,7 @@ pub fn sync_now(app: AppHandle) -> Result<(), String> {
             Err(e) => {
                 let _ = app.emit(
                     "sync-error",
-                    serde_json::json!({ "vault_path": vault, "success": false, "error": e }),
+                    serde_json::json!({ "vault_path": vault, "bookmark_id": bookmark_id, "success": false, "error": e }),
                 );
             }
         }
@@ -4347,20 +4638,25 @@ pub fn sync_now(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn ai_ask(
+pub async fn ai_ask(
     app: AppHandle,
     action: String,
     text: String,
     custom_prompt: Option<String>,
     request_id: String,
+    image_context: Option<AiImageContext>,
+    expected_config: Option<AiRequestConfig>,
 ) -> Result<(), String> {
+    if text.len() + custom_prompt.as_ref().map_or(0, String::len) > 2 * 1024 * 1024 {
+        return Err("AI text exceeds the 2 MiB request limit".into());
+    }
     let (provider, api_key, model, writing_style, base_url) = {
         let state = app.state::<AppState>();
         let config = state.config.lock().map_err(|e| e.to_string())?;
         let provider = config
             .ai_provider
             .clone()
-            .unwrap_or_else(|| "anthropic".to_string());
+            .ok_or("AI is disabled. Choose a provider in Settings.")?;
         let key = match provider.as_str() {
             "ollama" => Some(config.ollama_api_key.clone().unwrap_or_default()),
             "openai_compatible" => {
@@ -4379,6 +4675,49 @@ pub fn ai_ask(
         (provider, key, model, style, base_url)
     };
 
+    if let Some(expected) = expected_config {
+        let relevant_base = matches!(provider.as_str(), "ollama" | "openai_compatible");
+        if expected.provider.as_deref() != Some(provider.as_str())
+            || expected.model != model
+            || (relevant_base && expected.base_url != base_url)
+        {
+            return Err(
+                "AI settings changed. Reopen AI actions before sending this request.".into(),
+            );
+        }
+    } else if image_context.is_some() {
+        return Err("Confirm the AI destination before including images".into());
+    }
+    if model.trim().is_empty() {
+        return Err("Choose an AI model in Settings before starting".into());
+    }
+    if !matches!(
+        provider.as_str(),
+        "openai" | "anthropic" | "ollama" | "openai_compatible"
+    ) {
+        return Err("Unsupported AI provider".into());
+    }
+    let images = if let Some(context) = image_context {
+        let state = app.state::<AppState>();
+        state.validate_vault(&context.vault_path)?;
+        let guard = state.note_save.clone().lock_owned().await;
+        tauri::async_runtime::spawn_blocking(move || {
+            let _guard = guard;
+            crate::ai::images::prepare(&context.vault_path, &context.note_path, &context.paths)
+        })
+        .await
+        .map_err(|_| "AI image preparation failed")??
+    } else {
+        Vec::new()
+    };
+
+    if writing_style
+        .as_ref()
+        .is_some_and(|style| style.len() > 256 * 1024)
+        || model.len() > 512
+    {
+        return Err("AI settings exceed the size limit".into());
+    }
     let mut system_prompt = "You are a helpful writing assistant inside a note-taking app called HelixNotes. \
         You help users improve, rewrite, summarize, and transform their text. \
         Return ONLY the resulting text - no explanations, no markdown code fences, no preamble. \
@@ -4393,7 +4732,11 @@ pub fn ai_ask(
         ));
     }
 
+    if action == "describe_images" && images.is_empty() {
+        return Err("Select images before requesting a description".into());
+    }
     let user_message = match action.as_str() {
+        "describe_images" => format!("Describe the attached images, including readable text and relevant details. Preserve the existing text and every media placeholder; add descriptions alongside them:\n\n{}", text),
         "improve" => format!("Improve the writing quality of this text while keeping the same meaning and tone:\n\n{}", text),
         "fix_grammar" => format!("Fix all grammar, spelling, and punctuation errors in this text. Keep the original style:\n\n{}", text),
         "shorter" => format!("Make this text more concise while keeping the key points:\n\n{}", text),
@@ -4423,6 +4766,7 @@ pub fn ai_ask(
         user_message,
         request_id,
         base_url,
+        images,
     );
     Ok(())
 }
@@ -4438,7 +4782,7 @@ pub fn set_mobile_config_dir(path: std::path::PathBuf) {
     let _ = MOBILE_CONFIG_DIR.set(path);
 }
 
-fn app_config_path() -> Result<std::path::PathBuf, String> {
+pub(crate) fn app_config_path() -> Result<std::path::PathBuf, String> {
     // Prefer the injected mobile dir when present (set only on mobile); fall back to
     // the platform config dir on desktop.
     let app_dir = if let Some(mobile_dir) = MOBILE_CONFIG_DIR.get() {
@@ -4564,7 +4908,7 @@ fn write_private_file(path: &std::path::Path, data: &[u8]) -> Result<(), String>
 
     let folder = path.parent().ok_or("File has no parent directory")?;
     let mut temporary = tempfile::Builder::new()
-        .prefix(".cuelm-config-")
+        .prefix(".helixnotes-config-")
         .tempfile_in(folder)
         .map_err(|error| error.to_string())?;
     #[cfg(unix)]
@@ -4596,7 +4940,7 @@ mod config_permission_tests {
     #[test]
     fn config_files_are_owner_only() {
         let path = std::env::temp_dir().join(format!(
-            "cuelm-config-permissions-{}.json",
+            "helixnotes-config-permissions-{}.json",
             uuid::Uuid::new_v4()
         ));
         std::fs::write(&path, "old").unwrap();
@@ -4618,7 +4962,7 @@ fn save_app_config(config: &AppConfig) -> Result<(), String> {
     save_app_config_to(config, &path)
 }
 
-fn save_app_config_to(config: &AppConfig, path: &Path) -> Result<(), String> {
+pub(crate) fn save_app_config_to(config: &AppConfig, path: &Path) -> Result<(), String> {
     let data = serde_json::to_string_pretty(config).map_err(|e| e.to_string())?;
     write_private_file(path, data.as_bytes())?;
     Ok(())
@@ -4657,7 +5001,7 @@ pub fn get_install_type() -> String {
     } else if std::path::Path::new("/var/lib/dpkg/info/helix-notes.list").exists() {
         "deb".to_string()
     } else if std::path::Path::new("/var/lib/pacman/local").exists()
-        && ["cuelm", "cuelm-bin", "cuelm-appimage-bin"]
+        && ["helixnotes", "helixnotes-bin", "helixnotes-appimage-bin"]
             .iter()
             .any(|pkg| {
                 std::process::Command::new("pacman")

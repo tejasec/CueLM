@@ -1,13 +1,18 @@
 <script lang="ts">
-	import { onMount } from 'svelte';
+	import { onMount, untrack } from 'svelte';
+	import { t as ui } from '$lib/i18n';
 	import type { SourceController } from '$lib/editor/source/controller';
 
-	let { controller, readonly = false, numbers = false, visible = true, mobile = false }: {
+	let { controller, readonly = false, numbers = false, visible = true, mobile = false, preview = false, resolveImage, openLink, context = '' }: {
 		controller: SourceController;
 		readonly?: boolean;
 		numbers?: boolean;
 		visible?: boolean;
 		mobile?: boolean;
+		preview?: boolean;
+		resolveImage?: (href: string) => string;
+		openLink?: (href: string) => void;
+		context?: string;
 	} = $props();
 	let host: HTMLDivElement;
 	onMount(() => {
@@ -22,11 +27,25 @@
 			detach();
 		};
 	});
-	$effect(() => { controller.configure(readonly, numbers); });
+	$effect(() => {
+		const settings = { readonly, numbers };
+		untrack(() => controller.configure(settings.readonly, settings.numbers));
+	});
+	$effect(() => {
+		const placeholder = $ui('source.placeholder'), label = $ui(preview ? 'editorMode.live' : 'source.label');
+		untrack(() => controller.setLabels(placeholder, label));
+	});
+	$effect(() => {
+		const enabled = preview && visible;
+		const options = { resolveImage, openLink, context,
+			checkboxLabel: $ui('livePreview.toggleTask'), imageLabel: $ui('livePreview.editImage') };
+		// Renderer callbacks must not subscribe this effect to unrelated note/config stores.
+		untrack(() => controller.setLivePreview(enabled, options));
+	});
 	$effect(() => { if (visible) controller.view?.requestMeasure(); });
 </script>
 
-<div class="source-editor" class:mobile class:with-line-numbers={numbers} style:display={visible ? undefined : 'none'} bind:this={host}></div>
+<div class="source-editor" class:mobile class:live-preview={preview} class:with-line-numbers={numbers && !preview} style:display={visible ? undefined : 'none'} bind:this={host}></div>
 
 <style>
 	.source-editor {

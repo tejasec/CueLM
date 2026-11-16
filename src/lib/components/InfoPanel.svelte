@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { t as ui, label as uiLabel } from '$lib/i18n';
 	import { showInfo } from '$lib/stores/app';
 	import { openUrl } from '$lib/api';
 	import { getVersion } from '@tauri-apps/api/app';
@@ -114,8 +115,8 @@
 	<div class="info-overlay" onclick={closeFromOverlay} onkeydowncapture={handleEscape} onkeydown={handleEscape}>
 		<div class="info-panel">
 			<div class="info-header">
-				<h2>Info</h2>
-				<button class="close-btn" onclick={close} aria-label="Close info">
+				<h2>{$ui("ui.info")}</h2>
+				<button class="close-btn" onclick={close} aria-label={$ui("ui.close_info")}>
 					<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<line x1="18" y1="6" x2="6" y2="18" />
 						<line x1="6" y1="6" x2="18" y2="18" />
@@ -126,8 +127,8 @@
 			<div class="info-body">
 				{#if !isMobile}
 				<div class="info-tabs">
-					<button class="info-tab" class:active={activeTab === 'shortcuts'} onclick={() => activeTab = 'shortcuts'}>Shortcuts</button>
-					<button class="info-tab" class:active={activeTab === 'about'} onclick={() => activeTab = 'about'}>About</button>
+					<button class="info-tab" class:active={activeTab === 'shortcuts'} onclick={() => activeTab = 'shortcuts'}>{$ui("ui.shortcuts")}</button>
+					<button class="info-tab" class:active={activeTab === 'about'} onclick={() => activeTab = 'about'}>{$ui("ui.about")}</button>
 				</div>
 				{/if}
 
@@ -145,31 +146,31 @@
 					</div>
 					<h3 class="app-name">CueLM</h3>
 					<p class="app-version">v{appVersion}</p>
-					<p class="app-description">A local markdown note-taking app.</p>
+					<p class="app-description">{$ui("ui.a_local_markdown_note_taking_app")}</p>
 
 
 
 					<div class="info-credits">
-						<p>Created by <strong>Yuri Karamian</strong></p>
+						<p>{$ui("ui.created_by")} <strong>{$ui("ui.yuri_karamian")}</strong></p>
 						<button class="info-link" onclick={() => openLink('https://cuelm.com')}>
 							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 								<circle cx="12" cy="12" r="10" />
 								<line x1="2" y1="12" x2="22" y2="12" />
 								<path d="M12 2a15.3 15.3 0 014 10 15.3 15.3 0 01-4 10 15.3 15.3 0 01-4-10 15.3 15.3 0 014-10z" />
 							</svg>
-							cuelm.com
+							{$ui("ui.helixnotes_com")}
 						</button>
 					</div>
 				{:else}
 					<div class="shortcuts-section">
 						{#if !isMobile}
-							<p class="shortcuts-hint">Click a shortcut to rebind it, right-click to reset.</p>
+							<p class="shortcuts-hint">{$ui("ui.click_a_shortcut_to_rebind_it_right_click_to_reset")}</p>
 						{/if}
 						{#each actionGroups as group}
-							<h4 class="shortcuts-group-title">{group.title}</h4>
+							<h4 class="shortcuts-group-title">{$uiLabel(group.title)}</h4>
 							{#each group.actions as action}
 								<div class="shortcut-row">
-									<span class="shortcut-desc">{action.label}</span>
+									<span class="shortcut-desc">{$uiLabel(action.label)}</span>
 									{#if isMobile}
 										<span class="shortcut-keys">{#each bindingToKeys($keybindings[action.id]) as key, i}{#if i > 0}+{/if}<kbd>{key}</kbd>{/each}</span>
 									{:else}
@@ -177,14 +178,14 @@
 											class="shortcut-key-btn"
 											class:capturing={capturingId === action.id}
 											class:conflict={conflictId === action.id}
-											title="Click to rebind · right-click to reset"
+											title={$ui("ui.click_to_rebind_right_click_to_reset")}
 											onclick={() => startCapture(action.id)}
 											oncontextmenu={(e) => resetKey(e, action.id)}
 										>
 											{#if capturingId === action.id}
-												<span class="capture-prompt">Press keys…</span>
+												<span class="capture-prompt">{$ui("ui.press_keys")}</span>
 											{:else if conflictId === action.id}
-												<span class="conflict-msg">Already in use</span>
+												<span class="conflict-msg">{$ui("ui.already_in_use")}</span>
 											{:else}
 												<span class="shortcut-keys">{#each bindingToKeys($keybindings[action.id]) as key, i}{#if i > 0}+{/if}<kbd>{key}</kbd>{/each}</span>
 											{/if}
@@ -193,33 +194,33 @@
 								</div>
 							{/each}
 						{/each}
-						<div class="shortcut-row"><span class="shortcut-desc">Close panel / exit focus</span><span class="shortcut-keys"><kbd>Esc</kbd></span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.close_panel_exit_focus")}</span><span class="shortcut-keys"><kbd>Esc</kbd></span></div>
 
-						<h4 class="shortcuts-group-title">Formatting</h4>
-						<div class="shortcut-row"><span class="shortcut-desc">Bold</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>B</kbd></span></div>
-						<div class="shortcut-row"><span class="shortcut-desc">Italic</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>I</kbd></span></div>
-						<div class="shortcut-row"><span class="shortcut-desc">Underline</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>U</kbd></span></div>
-						<div class="shortcut-row"><span class="shortcut-desc">Strikethrough</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd></span></div>
-						<div class="shortcut-row"><span class="shortcut-desc">Code</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>E</kbd></span></div>
-						<div class="shortcut-row"><span class="shortcut-desc">Link</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>K</kbd></span></div>
-						<div class="shortcut-row"><span class="shortcut-desc">Collapsible section</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>.</kbd></span></div>
-						<div class="shortcut-row"><span class="shortcut-desc">Undo</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>Z</kbd></span></div>
-						<div class="shortcut-row"><span class="shortcut-desc">Redo</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd></span></div>
-						<div class="shortcut-row"><span class="shortcut-desc">Move line up / down</span><span class="shortcut-keys"><kbd>Alt</kbd>+<kbd>↑↓</kbd></span></div>
-						<div class="shortcut-row"><span class="shortcut-desc">Move list item up / down</span><span class="shortcut-keys"><kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>↑↓</kbd></span></div>
+						<h4 class="shortcuts-group-title">{$ui("ui.formatting")}</h4>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.bold")}</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>B</kbd></span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.italic")}</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>I</kbd></span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.underline")}</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>U</kbd></span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.strikethrough")}</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>Shift</kbd>+<kbd>X</kbd></span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.code")}</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>E</kbd></span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.link")}</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>K</kbd></span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.collapsible_section_17c25e")}</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>.</kbd></span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.undo")}</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>Z</kbd></span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.redo")}</span><span class="shortcut-keys"><kbd>{modKey}</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd></span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.move_line_up_down")}</span><span class="shortcut-keys"><kbd>Alt</kbd>+<kbd>↑↓</kbd></span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.move_list_item_up_down")}</span><span class="shortcut-keys"><kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>↑↓</kbd></span></div>
 
-						<h4 class="shortcuts-group-title">Editor Commands</h4>
-						<div class="shortcut-row"><span class="shortcut-desc">Slash commands</span><span class="shortcut-keys"><kbd>/</kbd></span></div>
-						<div class="shortcut-row command-detail"><span class="shortcut-desc">Headings, lists, code block, table, blockquote, collapsible section, horizontal rule</span></div>
-						<div class="shortcut-row"><span class="shortcut-desc">Wiki-link to note</span><span class="shortcut-keys"><kbd>[[</kbd></span></div>
-						<div class="shortcut-row command-detail"><span class="shortcut-desc">Type <kbd>[[</kbd> to search and link to another note. Close with <kbd>]]</kbd> or pick from the list.</span></div>
+						<h4 class="shortcuts-group-title">{$ui("ui.editor_commands")}</h4>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.slash_commands")}</span><span class="shortcut-keys"><kbd>/</kbd></span></div>
+						<div class="shortcut-row command-detail"><span class="shortcut-desc">{$ui("ui.headings_lists_code_block_table_blockquote_collapsible_section_b82c40")}</span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.wiki_link_to_note")}</span><span class="shortcut-keys"><kbd>[[</kbd></span></div>
+						<div class="shortcut-row command-detail"><span class="shortcut-desc">{$ui("ui.type")} <kbd>[[</kbd> {$ui("ui.to_search_and_link_to_another_note_close_with")} <kbd>]]</kbd> {$ui("ui.or_pick_from_the_list")}</span></div>
 
-						<h4 class="shortcuts-group-title">Editor Features</h4>
-						<div class="shortcut-row"><span class="shortcut-desc">Right-click in editor for formatting menu</span></div>
-						<div class="shortcut-row"><span class="shortcut-desc">Right-click a table cell for table options</span></div>
-						<div class="shortcut-row"><span class="shortcut-desc">Right-click a link to open, copy, edit, or remove</span></div>
-						<div class="shortcut-row"><span class="shortcut-desc">Click an image to resize (small / medium / full)</span></div>
-						<div class="shortcut-row"><span class="shortcut-desc">Drag & drop images, PDFs, or files into the editor</span></div>
+						<h4 class="shortcuts-group-title">{$ui("ui.editor_features")}</h4>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.right_click_in_editor_for_formatting_menu")}</span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.right_click_a_table_cell_for_table_options")}</span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.right_click_a_link_to_open_copy_edit_or_remove")}</span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.click_an_image_to_resize_small_medium_full")}</span></div>
+						<div class="shortcut-row"><span class="shortcut-desc">{$ui("ui.drag_drop_images_pdfs_or_files_into_the_editor")}</span></div>
 					</div>
 				{/if}
 			</div>

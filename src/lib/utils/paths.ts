@@ -80,9 +80,9 @@ export function resolveVaultFilePath(
 	const root = vaultRoot?.replace(/\\/g, '/').replace(/\/$/, '') ?? '';
 	if (root) {
 		// Older imported managed links may still contain notebook-depth prefixes.
-		const managed = target.match(/^(?:\.{1,2}\/)*(\.(?:cuelm|helixnotes)\/attachments\/.*)$/);
+		const managed = target.match(/^(?:\.{1,2}\/)*(\.helixnotes\/attachments\/.*)$/);
 		if (managed) return resolvePathFromFile(`${root}/.vault-root`, managed[1]);
-		if (target.startsWith('.cuelm/') || target.startsWith('.helixnotes/')) return resolvePathFromFile(`${root}/.vault-root`, target);
+		if (target.startsWith('.helixnotes/')) return resolvePathFromFile(`${root}/.vault-root`, target);
 	}
 	if (notePath) return resolvePathFromFile(notePath, target);
 	if (root) return resolvePathFromFile(`${root}/.vault-root`, target);
@@ -166,8 +166,5 @@ export function isPathInDirectory(path: string, directory: string | null): boole
 }
 
 export function isTrashedNote(path: string | null, vaultRoot: string | null | undefined): boolean {
-	return !!path && !!vaultRoot && (
-		isPathInDirectory(path, `${vaultRoot}/.cuelm/trash`) ||
-		isPathInDirectory(path, `${vaultRoot}/.helixnotes/trash`)
-	);
+	return !!path && !!vaultRoot && isPathInDirectory(path, `${vaultRoot}/.helixnotes/trash`);
 }

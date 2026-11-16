@@ -1,12 +1,15 @@
 <script lang="ts">
 	import { onDestroy, onMount, tick } from 'svelte';
-	import { appConfig, vaultReady, theme } from '$lib/stores/app';
+	import { tr } from '$lib/i18n';
+	import { appConfig, vaultReady, theme, activeNotePath } from '$lib/stores/app';
 	import { getAppConfig, openVault, restoreExternalVault, setFontSize } from '$lib/api';
 	import { darkThemes, isIOS, isMobile } from '$lib/platform';
 	import { getWheelFontSizeAction } from '$lib/utils/editor-zoom';
 	import { applyUiScale, defaultUiScale } from '$lib/ui-scale';
 	import { listen } from '@tauri-apps/api/event';
 	import { getCurrentWindow } from '@tauri-apps/api/window';
+	import { mcpBusy, mcpWindowReady } from '$lib/utils/mcp-editor';
+	import { t } from '$lib/i18n';
 	import VaultPicker from '$lib/components/VaultPicker.svelte';
 	import AppLayout from '$lib/components/AppLayout.svelte';
 	import NoteWindow from '$lib/components/NoteWindow.svelte';
@@ -21,6 +24,8 @@
 	let removeScrollFontSizeListener: (() => void) | null = null;
 	let startupRevealTimer: ReturnType<typeof setTimeout> | null = null;
 	let startupWindowRevealed = false;
+	let removeMcp: (() => void) | null = null;
+	let pageDisposed = false;
 
 	const STARTUP_REVEAL_FAILSAFE_MS = 4000;
 
@@ -157,6 +162,13 @@
 			noteWindowVault = params.get('vault');
 		}
 
+		if (!isMobile) {
+			try {
+				const { installMcpWindow } = await import('$lib/mcp');
+				const dispose = await installMcpWindow(() => !loading && (noteWindowPath ? !!$activeNotePath : !$vaultReady || mcpWindowReady()));
+				if (pageDisposed) dispose(); else removeMcp = dispose;
+			} catch (error) { console.error('MCP editor listener is unavailable:', error); }
+		}
 		try {
 			const config = await getAppConfig();
 			if (noteWindowPath) {
@@ -168,7 +180,7 @@
 				} else {
 					noteWindowPath = null;
 					noteWindowVault = null;
-					startupVaultError = 'This note window’s vault is no longer available. Choose a vault to continue.';
+					startupVaultError = tr('startup.vaultUnavailable');
 				}
 			}
 			$appConfig = config;
@@ -276,16 +288,15 @@
 					// Note windows don't re-open the vault (already open in main process)
 					if (!noteWindowPath) {
 						if (isIOS && activeVault?.bookmark_id) {
-							await restoreExternalVault(activeVault.bookmark_id);
-							$appConfig = await getAppConfig();
+							$appConfig = await restoreExternalVault(activeVault.bookmark_id);
 						} else {
-							await openVault(config.active_vault);
+							$appConfig = await openVault(config.active_vault, { existing: true });
 						}
 					}
 					$vaultReady = true;
 				} catch (e) {
 					$vaultReady = false;
-					startupVaultError = `Could not open the last vault: ${String(e)}`;
+					startupVaultError = tr('startup.openFailed', { error: String(e) });
 					// A saved path is not proof that the vault was initialized.
 					// Do not let the picker navigate back into a failed startup.
 					$appConfig = {
@@ -308,6 +319,8 @@
 	});
 
 	onDestroy(() => {
+		pageDisposed = true;
+		removeMcp?.();
 		removeEditorZoomShortcuts?.();
 		removeFontSizeListener?.();
 		removeScrollFontSizeListener?.();
@@ -316,6 +329,7 @@
 	});
 </script>
 
+<div class="mcp-window-shell" inert={$mcpBusy} aria-busy={$mcpBusy}>
 {#if loading}
 	<div class="loading">
 		<div class="spinner"></div>
@@ -323,10 +337,14 @@
 {:else if noteWindowPath}
 	<NoteWindow notePath={noteWindowPath} vaultPath={noteWindowVault} />
 {:else if $vaultReady}
-	<AppLayout />
+	{#key JSON.stringify([$appConfig?.active_vault ?? null, $appConfig?.active_bookmark_id ?? null])}
+		<AppLayout />
+	{/key}
 {:else}
 	<VaultPicker initialError={startupVaultError} />
 {/if}
+</div>
+{#if $mcpBusy}<div class="mcp-status" role="status">{$t('mcp.applying')}</div>{/if}
 
 <style>
 	.loading {
@@ -351,4 +369,6 @@
 			transform: rotate(360deg);
 		}
 	}
+	.mcp-window-shell { height: 100%; }
+	.mcp-status { position: fixed; inset-inline: 12px; bottom: 16px; width: fit-content; max-width: calc(100vw - 24px); margin-inline: auto; padding: 8px 14px; border: 1px solid var(--border-color); border-radius: 8px; background: var(--bg-secondary); color: var(--text-primary); font-size: 12px; z-index: 10000; }
 </style>

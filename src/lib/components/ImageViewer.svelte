@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { t as ui } from '$lib/i18n';
 	import { onMount } from 'svelte';
 
 	let { src, alt = '', onclose }: {
@@ -212,7 +213,7 @@
 	class="image-viewer"
 	role="dialog"
 	aria-modal="true"
-	aria-label={alt ? `Image viewer: ${alt}` : 'Image viewer'}
+	aria-label={alt ? $ui("ui.image_viewer", { value0: alt }) : $ui("ui.image_viewer_d3a265")}
 	tabindex="-1"
 	onkeydown={(event) => {
 		if (event.key === 'Escape') {
@@ -251,7 +252,7 @@
 			class="image-viewer-reset"
 			onclick={resetViewer}
 			disabled={scale === MIN_SCALE && panX === 0 && panY === 0}
-			aria-label={`Reset zoom, currently ${zoomPercent}%`}
+			aria-label={$ui("ui.reset_zoom_currently", { value0: zoomPercent })}
 		>
 			<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
 				<path d="M3 12a9 9 0 1 0 3-6.7" />
@@ -259,15 +260,15 @@
 			</svg>
 			<span>{zoomPercent}%</span>
 		</button>
-		<button bind:this={closeButton} type="button" class="image-viewer-close" onclick={onclose} aria-label="Close image viewer">
+		<button bind:this={closeButton} type="button" class="image-viewer-close" onclick={onclose} aria-label={$ui("ui.close_image_viewer")}>
 			<svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
 				<path d="M18 6 6 18M6 6l12 12" />
 			</svg>
 		</button>
 	</div>
 
-	<div class="image-viewer-hint" aria-hidden="true">Pinch to zoom · drag to move · double-tap to zoom or reset</div>
-	<span class="sr-only" aria-live="polite">Zoom {zoomPercent}%</span>
+	<div class="image-viewer-hint" aria-hidden="true">{$ui("ui.pinch_to_zoom_drag_to_move_double_tap_to_zoom_or_reset")}</div>
+	<span class="sr-only" aria-live="polite">{$ui("ui.zoom", { value0: zoomPercent })}</span>
 </div>
 
 <style>

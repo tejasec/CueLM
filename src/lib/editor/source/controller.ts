@@ -3,6 +3,8 @@ import { Decoration, EditorView, drawSelection, keymap, lineNumbers, placeholder
 import { defaultKeymap, history, historyKeymap, indentWithTab, redo, undo } from '@codemirror/commands';
 import { HighlightStyle, indentUnit, syntaxHighlighting } from '@codemirror/language';
 import { markdown } from '@codemirror/lang-markdown';
+import { sourceMarkdownExtensions } from './syntax.ts';
+import { livePreview, type LivePreviewOptions } from './live-preview.ts';
 import { tags } from '@lezer/highlight';
 import { getSelectionPair } from '../selectionPairs.ts';
 import type { NoteSearchMatch } from '../search';
@@ -67,8 +69,13 @@ const sourceSyntax = HighlightStyle.define([
 
 export class SourceController {
 	private configuration = new Compartment();
+	private presentation = new Compartment();
+	private preview = false;
+	private previewOptions: LivePreviewOptions = {};
 	private readOnly = false;
 	private numbers = false;
+	private placeholderText = 'Start writing...';
+	private accessibleLabel = 'Markdown source';
 	private extensions: Extension[];
 	private onChange: (changes: ChangeDesc, edited: boolean) => void;
 	state: EditorState;
@@ -81,10 +88,8 @@ export class SourceController {
 	} = {}) {
 		this.onChange = onChange;
 		this.extensions = [
-			markdown(), history(), drawSelection(), sourceSearchDecoration, sourceTheme,
+			markdown({ extensions: sourceMarkdownExtensions }), history(), drawSelection(), sourceSearchDecoration, sourceTheme,
 			syntaxHighlighting(sourceSyntax), indentUnit.of('\t'), EditorState.tabSize.of(4),
-			placeholder('Start writing...'),
-			EditorView.contentAttributes.of({ 'aria-label': 'Markdown source', tabindex: '0', spellcheck: 'false', autocapitalize: 'off' }),
 			keymap.of([{ key: 'Shift-Enter', run: sourceHardBreak }, indentWithTab, ...historyKeymap, ...defaultKeymap]),
 			EditorView.domEventHandlers({
 				keydown: (event, view) => {
@@ -98,14 +103,36 @@ export class SourceController {
 				drop: (event, view) => !view.state.readOnly && (events.drop?.(event) ?? false),
 				scroll: () => { events.scroll?.(); return false; },
 			}),
-			this.configuration.of(this.settings()),
+			this.configuration.of(this.settings()), this.presentation.of([]),
 		];
 		this.state = EditorState.create({ extensions: this.extensions });
 	}
 
 	private settings(): Extension[] {
 		return [EditorState.readOnly.of(this.readOnly), EditorView.editable.of(!this.readOnly),
-			this.numbers ? lineNumbers() : EditorView.lineWrapping];
+			placeholder(this.placeholderText),
+			EditorView.contentAttributes.of({ 'aria-label': this.accessibleLabel, tabindex: '0', spellcheck: 'false', autocapitalize: 'off' }),
+			this.numbers && !this.preview ? lineNumbers() : EditorView.lineWrapping];
+	}
+
+	/** Reconfigure presentation only: keep the Text, selection, undo branches and save revision. */
+	setLivePreview(enabled: boolean, options: LivePreviewOptions = {}): void {
+		if (enabled === this.preview && Object.keys({ ...this.previewOptions, ...options }).every(key =>
+			this.previewOptions[key as keyof LivePreviewOptions] === options[key as keyof LivePreviewOptions])) return;
+		this.preview = enabled;
+		this.previewOptions = options;
+		this.dispatch({ effects: [
+			this.configuration.reconfigure(this.settings()),
+			this.presentation.reconfigure(enabled ? livePreview(options) : []),
+			...(this.view ? [this.view.scrollSnapshot()] : []),
+		] });
+	}
+
+	setLabels(placeholderText: string, accessibleLabel: string): void {
+		if (placeholderText === this.placeholderText && accessibleLabel === this.accessibleLabel) return;
+		this.placeholderText = placeholderText;
+		this.accessibleLabel = accessibleLabel;
+		this.dispatch({ effects: this.configuration.reconfigure(this.settings()) });
 	}
 
 	configure(readOnly: boolean, numbers: boolean): void {
@@ -148,7 +175,8 @@ export class SourceController {
 	load(content: string): void {
 		this.state = EditorState.create({ doc: content, extensions: this.extensions });
 		// A fresh state starts with the original compartment; retain live settings.
-		this.state = this.state.update({ effects: this.configuration.reconfigure(this.settings()) }).state;
+		this.state = this.state.update({ effects: [this.configuration.reconfigure(this.settings()),
+			this.presentation.reconfigure(this.preview ? livePreview(this.previewOptions) : [])] }).state;
 		this.view?.setState(this.state);
 	}
 

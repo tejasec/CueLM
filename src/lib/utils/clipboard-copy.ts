@@ -6,9 +6,33 @@
  * paragraph spacing; the generated HTML stays semantic (p, h1, li, ...).
  */
 
+import { DOMSerializer, type Schema } from '@tiptap/pm/model';
+
 const COPY_BLOCK_TAGS = 'p|h[1-6]|li|blockquote';
+const COPY_BLOCK_SELECTOR = 'p,h1,h2,h3,h4,h5,h6,li,blockquote';
 const COPY_BLOCK_STYLE = 'line-height:100%';
 const COPY_PARAGRAPH_STYLE = 'line-height:100%;margin:0';
+
+/** Keep clipboard styling out of the schema's cached serializer used to save HTML blocks. */
+export function createSingleLineClipboardSerializer(schema: Schema): DOMSerializer {
+	const serializer = DOMSerializer.fromSchema(schema);
+	const clipboardSerializer = new DOMSerializer(serializer.nodes, serializer.marks);
+	clipboardSerializer.serializeFragment = (fragment, options, target) => {
+		// Delegate to the unmodified serializer so recursive content holes keep their DOM parents.
+		const dom = serializer.serializeFragment(fragment, options, target);
+		const blocks = Array.from(dom.querySelectorAll<HTMLElement>(COPY_BLOCK_SELECTOR));
+		if (dom.nodeType === 1 && (dom as HTMLElement).matches(COPY_BLOCK_SELECTOR)) {
+			blocks.unshift(dom as HTMLElement);
+		}
+		for (const block of blocks) {
+			block.style.lineHeight = '100%';
+			if (block.tagName.toLowerCase() !== 'blockquote') block.style.margin = '0';
+		}
+		// Never move or reparse the result: <tbody>, <tr> and <td> need their table context.
+		return dom;
+	};
+	return clipboardSerializer;
+}
 
 /**
  * Add single-line spacing to the block elements of a copied HTML fragment. Appending the

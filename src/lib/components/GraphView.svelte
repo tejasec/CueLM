@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { t as ui } from '$lib/i18n';
 	import { onDestroy, untrack } from 'svelte';
 	import { getGraphData } from '$lib/api';
 	import { activeNotePath, appConfig } from '$lib/stores/app';
@@ -743,7 +744,7 @@
 <div class="graph-overlay" onkeydown={handleKeydown}>
 	<div class="graph-panel" class:mobile={isMobile}>
 		<div class="graph-header">
-			<h3>Graph View</h3>
+			<h3>{$ui("ui.graph_view")}</h3>
 			<div class="graph-search">
 				<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>
@@ -752,11 +753,11 @@
 				<input
 					type="text"
 					bind:value={searchQuery}
-					placeholder="Filter notes..."
+					placeholder={$ui("ui.filter_notes")}
 					class:active={!!searchQuery}
 				/>
 				{#if searchQuery}
-					<button class="graph-search-clear" aria-label="Clear search" onclick={() => { searchQuery = ''; }}>
+					<button class="graph-search-clear" aria-label={$ui("ui.clear_search")} onclick={() => { searchQuery = ''; }}>
 						<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round">
 							<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
 						</svg>
@@ -766,19 +767,19 @@
 			<div class="graph-stats">
 				{#if !loading}
 					{#if localMode && activeNodeIdx >= 0}
-						{localNeighborhood.nodeSet.size} notes · {localNeighborhood.edgeSet.size} links
+						{$ui("ui.notes_links", { value0: localNeighborhood.nodeSet.size, value1: localNeighborhood.edgeSet.size })}
 					{:else}
-						{nodes.length} notes · {edges.length} links
+						{$ui("ui.notes_links", { value0: nodes.length, value1: edges.length })}
 					{/if}
 					{#if searchMatchSet}
-						· <span class="search-count">{searchMatchSet.size} matched</span>
+						· <span class="search-count">{$ui("ui.matched", { value0: searchMatchSet.size })}</span>
 					{/if}
 				{/if}
 			</div>
 			<button
 				class="graph-btn"
 				class:active={localMode}
-				title={localMode ? 'Show all notes' : 'Show local graph'}
+				title={localMode ? $ui("ui.show_all_notes") : $ui("ui.show_local_graph")}
 				onclick={() => { localMode = !localMode; focusActive(); }}
 			>
 				<!-- network/local icon -->
@@ -787,7 +788,7 @@
 					<line x1="12" y1="7" x2="5" y2="17"/><line x1="12" y1="7" x2="19" y2="17"/>
 				</svg>
 			</button>
-			<button class="graph-btn" onclick={focusActive} title="Focus active note">
+			<button class="graph-btn" onclick={focusActive} title={$ui("ui.focus_active_note")}>
 				<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<circle cx="12" cy="12" r="3"/>
 					<line x1="12" y1="2" x2="12" y2="6"/>
@@ -796,7 +797,7 @@
 					<line x1="18" y1="12" x2="22" y2="12"/>
 				</svg>
 			</button>
-			<button class="graph-close" aria-label="Close graph" onclick={onclose}>
+			<button class="graph-close" aria-label={$ui("ui.close_graph")} onclick={onclose}>
 				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>
 				</svg>
@@ -809,7 +810,7 @@
 						<circle cx="12" cy="12" r="10" opacity="0.25"/>
 						<path d="M12 2a10 10 0 019.95 9"/>
 					</svg>
-					Building graph...
+					{$ui("ui.building_graph")}
 				</div>
 			{/if}
 			<!-- svelte-ignore a11y_no_static_element_interactions -->

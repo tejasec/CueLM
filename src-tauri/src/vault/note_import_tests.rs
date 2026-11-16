@@ -46,7 +46,7 @@ fn fixture(raw: &str) -> (tempfile::TempDir, String, PathBuf) {
 }
 
 fn attachments(vault: &str) -> Vec<PathBuf> {
-    fs::read_dir(Path::new(vault).join(".cuelm/attachments"))
+    fs::read_dir(Path::new(vault).join(".helixnotes/attachments"))
         .unwrap()
         .map(|entry| entry.unwrap().path())
         .collect()
@@ -106,7 +106,7 @@ fn imports_relative_files_once_preserving_originals_frontmatter_and_literal_cont
         );
         for file in files {
             let filename = urlencoding::encode(file.file_name().unwrap().to_str().unwrap());
-            let relative = format!(".cuelm/attachments/{filename}");
+            let relative = format!(".helixnotes/attachments/{filename}");
             assert!(note.raw.contains(&relative));
             assert!(Path::new(&vault)
                 .join(urlencoding::decode(&relative).unwrap().as_ref())
@@ -140,7 +140,7 @@ fn imported_pdf_embeds_keep_the_vault_root_path_convention_in_nested_notebooks()
         |_| Ok(()),
     )
     .unwrap();
-    assert!(note.raw.contains("data-pdf-src=\".cuelm/attachments/"));
+    assert!(note.raw.contains("data-pdf-src=\".helixnotes/attachments/"));
     assert!(note.raw.contains("data-pdf-name=\"Report\""));
     assert_eq!(attachments(&vault).len(), 1);
 }
@@ -167,7 +167,7 @@ fn imported_document_links_remain_managed_and_stable_after_note_and_notebook_mov
     )
     .unwrap();
     assert!(
-        note.raw.starts_with("[Report](.cuelm/attachments/"),
+        note.raw.starts_with("[Report](.helixnotes/attachments/"),
         "managed links must not depend on notebook depth"
     );
     let href = note
@@ -224,7 +224,7 @@ fn import_does_not_replace_existing_note_or_same_named_attachment() {
     .unwrap();
     fs::write(Path::new(&vault).join("External.md"), b"keep note").unwrap();
     fs::write(
-        Path::new(&vault).join(".cuelm/attachments/photo.png"),
+        Path::new(&vault).join(".helixnotes/attachments/photo.png"),
         b"keep image",
     )
     .unwrap();
@@ -248,7 +248,7 @@ fn import_does_not_replace_existing_note_or_same_named_attachment() {
         b"keep note"
     );
     assert_eq!(
-        fs::read(Path::new(&vault).join(".cuelm/attachments/photo.png")).unwrap(),
+        fs::read(Path::new(&vault).join(".helixnotes/attachments/photo.png")).unwrap(),
         b"keep image"
     );
     assert_eq!(attachments(&vault).len(), 2);
@@ -377,7 +377,7 @@ fn failed_note_publication_removes_only_its_new_attachments() {
         )
         .unwrap();
     }
-    let original_asset = Path::new(&vault).join(".cuelm/attachments/original.png");
+    let original_asset = Path::new(&vault).join(".helixnotes/attachments/original.png");
     fs::write(&original_asset, b"keep attachment").unwrap();
     assert!(import_note(
         &vault,
@@ -403,7 +403,7 @@ fn failed_note_publication_removes_only_its_new_attachments() {
         .unwrap()
         .file_name()
         .to_string_lossy()
-        .starts_with(".cuelm-import-")));
+        .starts_with(".helixnotes-import-")));
 }
 
 #[test]
@@ -413,8 +413,8 @@ fn note_content_cannot_import_parent_files_or_hidden_secrets_from_a_broad_scope(
     let parent = source.parent().unwrap();
     for name in [
         ".ssh/key.bin",
-        ".cuelm/history/private.bin",
-        ".cuelm/attachments/photo.bin",
+        ".helixnotes/history/private.bin",
+        ".helixnotes/attachments/photo.bin",
     ] {
         let file = parent.join(name);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -424,7 +424,7 @@ fn note_content_cannot_import_parent_files_or_hidden_secrets_from_a_broad_scope(
     for href in [
         "../private.bin",
         ".ssh/key.bin",
-        ".cuelm/history/private.bin",
+        ".helixnotes/history/private.bin",
     ] {
         assert!(import_note(
             &vault,
@@ -446,13 +446,13 @@ fn note_content_cannot_import_parent_files_or_hidden_secrets_from_a_broad_scope(
         vec![reference(
             raw,
             "asset.bin",
-            ".cuelm/attachments/photo.bin",
+            ".helixnotes/attachments/photo.bin",
             false,
         )],
         |_| Ok(()),
     )
     .unwrap();
-    assert!(note.raw.contains(".cuelm/attachments/"));
+    assert!(note.raw.contains(".helixnotes/attachments/"));
     assert_eq!(attachments(&vault).len(), 1);
 }
 
@@ -474,7 +474,7 @@ fn import_rejects_attachment_and_notebook_destinations_that_follow_symlinks() {
         |_| Ok(())
     )
     .is_err());
-    let directory = Path::new(&vault).join(".cuelm/attachments");
+    let directory = Path::new(&vault).join(".helixnotes/attachments");
     fs::remove_dir(&directory).unwrap();
     std::os::unix::fs::symlink(&outside, &directory).unwrap();
     assert!(import_note(

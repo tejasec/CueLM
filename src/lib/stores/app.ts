@@ -89,7 +89,7 @@ export const mobileView = writable<"sidebar" | "notelist" | "editor">(
 
 // Editor state
 export const editorDirty = writable(false);
-export const sourceMode = writable(false);
+export { sourceMode, livePreviewMode, editorMode, selectEditorMode } from '../editor/mode.ts';
 export const focusMode = writable(false);
 export const readOnly = writable(false);
 
@@ -154,7 +154,7 @@ export const androidApkUrl = writable<string | null>(null);
 
 // Install types that handle their own updates (in-app auto-updater, or a
 // package-manager notice for deb/aur). Anything else - e.g. a distro repo build
-// that sets the CUELM_INSTALL_TYPE build flag (Solus, etc.) - is "managed":
+// that sets the HELIXNOTES_INSTALL_TYPE build flag (Solus, etc.) - is "managed":
 // the app does no update check and shows no update UI at all.
 const SELF_UPDATING_INSTALL_TYPES = ["macos", "windows", "deb", "aur", "appimage", "native", "android"];
 export function isManagedInstall(type: string): boolean {
@@ -254,12 +254,14 @@ export const navHistory = createNavHistory();
 export const canGoBack = derived(navHistory, $h => $h.index > 0);
 export const canGoForward = derived(navHistory, $h => $h.index < $h.stack.length - 1);
 
-let dataVaultPath: string | null = null;
+let dataVaultIdentity = '';
 
 /** Never expose the previous vault's editable note while a new vault loads. */
-export function activateVaultData(vaultPath: string | null): void {
-  if (dataVaultPath === vaultPath) return;
-  dataVaultPath = vaultPath;
+export function activateVaultData(vaultPath: string | null, bookmarkId: string | null = null, fresh = false): void {
+  const identity = JSON.stringify([vaultPath, bookmarkId]);
+  if (!fresh && dataVaultIdentity === identity) return;
+  dataVaultIdentity = identity;
+  syncState.set({ running: false, error: null, result: null });
   activeNote.set(null);
   activeNotePath.set(null);
   activeNotebook.set(null);

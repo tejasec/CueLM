@@ -19,7 +19,10 @@ const MAX_ENTRIES: usize = 1_000_000;
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_NAME_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PATH_COMPONENTS: usize = 64;
-const MANIFEST: &str = ".cuelm-backup.json";
+const MANIFEST: &str = ".helixnotes-backup.json";
+
+#[cfg(test)]
+mod daily_template_tests;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -27,6 +30,9 @@ struct BackupManifest {
     version: u32,
     vault: String,
     attachments: bool,
+    /// None is a pre-template backup: leave the current template alone on restore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    daily_template: Option<bool>,
 }
 
 fn vault_id(vault: &Path) -> Result<String, String> {
@@ -46,7 +52,8 @@ fn options() -> SimpleFileOptions {
 fn is_published_backup(path: &Path) -> bool {
     path.file_name().is_some_and(|name| {
         let name = name.to_string_lossy();
-        name.starts_with("cuelm-backup-") && name.ends_with(".zip")
+        (name.starts_with("helixnotes-backup-") || name.starts_with("cuelm-backup-"))
+            && name.ends_with(".zip")
     })
 }
 
@@ -67,9 +74,12 @@ fn excluded_path(path: &Path, vault: &Path, backup_dir: &Path, attachments: bool
     let relative = path.strip_prefix(vault).expect("walker stays in vault");
     let mut parts = relative.components();
     let first = parts.next().expect("non-root entry").as_os_str();
-    if first == ".cuelm" {
+    if first == ".helixnotes" || first == ".cuelm" {
         return match parts.next() {
-            None => !attachments,
+            None => false,
+            Some(part) if part.as_os_str() == "daily-template.md" && parts.next().is_none() => {
+                false
+            }
             Some(part) if part.as_os_str() == "attachments" && attachments => {
                 parts.any(|part| part.as_os_str().to_string_lossy().starts_with('.'))
             }
@@ -82,7 +92,7 @@ fn excluded_path(path: &Path, vault: &Path, backup_dir: &Path, attachments: bool
     })
 }
 
-/// Returns the default backup directory (~/.config/cuelm/backups/)
+/// Returns the default backup directory (~/.config/helixnotes/backups/)
 pub fn default_backup_dir() -> Result<PathBuf, String> {
     let config_dir = dirs::config_dir().ok_or("Cannot find config directory")?;
     let dir = config_dir.join("cuelm").join("backups");
@@ -122,12 +132,13 @@ pub fn create_backup(
         return Err("Backup directory must not be the vault root".to_string());
     }
     let id = vault_id(&vault)?;
+    let has_template = crate::vault::daily_template::read(vault_path)?.is_some();
     let now = Utc::now();
     let timestamp = now.format("%Y-%m-%dT%H-%M-%S").to_string();
-    let filename = format!("cuelm-backup-{timestamp}-{id}-{}.zip", Uuid::new_v4());
+    let filename = format!("helixnotes-backup-{timestamp}-{id}-{}.zip", Uuid::new_v4());
     let backup_path = output.join(&filename);
     let temporary = Builder::new()
-        .prefix(".cuelm-backup-")
+        .prefix(".helixnotes-backup-")
         .suffix(".tmp")
         .tempfile_in(&output)
         .map_err(|e| format!("Failed to create temporary backup: {e}"))?;
@@ -142,6 +153,7 @@ pub fn create_backup(
                 version: 1,
                 vault: id,
                 attachments: include_attachments,
+                daily_template: Some(has_template),
             },
         )
         .map_err(|e| e.to_string())?;
@@ -210,7 +222,7 @@ pub fn create_backup(
 
 fn archive_name(filename: &str, id: &str) -> Option<(String, bool)> {
     let stem = filename
-        .strip_prefix("cuelm-backup-")?
+        .strip_prefix("helixnotes-backup-")?
         .strip_suffix(".zip")?;
     let timestamp = stem.get(..19)?;
     let suffix = stem.get(19..)?;
@@ -246,7 +258,7 @@ fn list_owned_backups(
         let filename = entry.file_name().to_string_lossy().to_string();
         if let Some((created, owned)) = archive_name(&filename, &id) {
             // Archives from before vault identities carry none, so they cannot be told apart.
-            let names_a_vault = filename.len() > "cuelm-backup-0000-00-00T00-00-00.zip".len();
+            let names_a_vault = filename.len() > "helixnotes-backup-0000-00-00T00-00-00.zip".len();
             entries.push((
                 BackupEntry {
                     filename,
@@ -349,10 +361,10 @@ fn historical_backups(
         let hidden = relative
             .components()
             .any(|component| component.as_os_str().to_string_lossy().starts_with('.'));
-        if hidden && !(attachments && relative.starts_with(".cuelm/attachments")) {
+        if hidden && !(attachments && relative.starts_with(".helixnotes/attachments")) {
             if item.file_type().is_dir() {
-                // Continue into .cuelm only to find historical attachment backups.
-                if attachments && relative == Path::new(".cuelm") {
+                // Continue into .helixnotes only to find historical attachment backups.
+                if attachments && relative == Path::new(".helixnotes") {
                     continue;
                 }
                 walker.skip_current_dir();
@@ -372,6 +384,7 @@ fn install_staged(
     previous: &Path,
     backup_dir: &Path,
     attachments: bool,
+    template: Option<bool>,
 ) -> Result<(), String> {
     let nested = backup_dir
         .strip_prefix(vault)
@@ -393,9 +406,13 @@ fn install_staged(
     let mut held_output = false;
     let mut displaced = Vec::new();
     let mut installed = Vec::new();
-    let attachments_path = vault.join(".cuelm/attachments");
+    let attachments_path = vault.join(".helixnotes/attachments");
     let mut displaced_attachments = false;
     let mut installed_attachments = false;
+    let template_path = vault.join(crate::vault::daily_template::RELATIVE_PATH);
+    let previous_template = previous.join("daily-template.md");
+    let mut displaced_template = false;
+    let mut installed_template = false;
     let operation = (|| -> io::Result<()> {
         fs::create_dir(&previous_entries)?;
         fs::create_dir(&held_history)?;
@@ -432,20 +449,34 @@ fn install_staged(
                 fs::rename(&attachments_path, &previous_attachments)?;
                 displaced_attachments = true;
             }
-            fs::create_dir_all(vault.join(".cuelm"))?;
+            fs::create_dir_all(vault.join(".helixnotes"))?;
         }
         for entry in fs::read_dir(contents)? {
             let entry = entry?;
             let name = entry.file_name();
-            if name == ".cuelm" {
+            if name == ".helixnotes" {
                 continue;
             }
             fs::rename(entry.path(), vault.join(&name))?;
             installed.push(name);
         }
         if attachments {
-            fs::rename(contents.join(".cuelm/attachments"), &attachments_path)?;
+            fs::rename(contents.join(".helixnotes/attachments"), &attachments_path)?;
             installed_attachments = true;
+        }
+        if let Some(enabled) = template {
+            if fs::symlink_metadata(&template_path).is_ok() {
+                fs::rename(&template_path, &previous_template)?;
+                displaced_template = true;
+            }
+            if enabled {
+                fs::create_dir_all(vault.join(".helixnotes"))?;
+                fs::rename(
+                    contents.join(crate::vault::daily_template::RELATIVE_PATH),
+                    &template_path,
+                )?;
+                installed_template = true;
+            }
         }
         if let Some(relative) = nested {
             if held_output {
@@ -489,6 +520,11 @@ fn install_staged(
                 failures.join("; ")
             ));
         }
+        if installed_template {
+            if let Err(e) = remove_entry(&template_path) {
+                failures.push(format!("remove new daily template: {e}"));
+            }
+        }
         if installed_attachments {
             if let Err(e) = remove_entry(&attachments_path) {
                 failures.push(format!("remove new attachments: {e}"));
@@ -512,6 +548,11 @@ fn install_staged(
         for name in displaced {
             if let Err(e) = fs::rename(previous_entries.join(&name), vault.join(&name)) {
                 failures.push(format!("restore original {:?}: {e}", name));
+            }
+        }
+        if displaced_template {
+            if let Err(e) = fs::rename(&previous_template, &template_path) {
+                failures.push(format!("restore daily template: {e}"));
             }
         }
         if displaced_attachments {
@@ -571,7 +612,7 @@ pub fn restore_backup(
     let output = fs::canonicalize(backup_dir).map_err(|e| e.to_string())?;
     let backup = validated_backup_file(&output, backup_path)?;
     let stage = Builder::new()
-        .prefix(".cuelm-restore-")
+        .prefix(".helixnotes-restore-")
         .tempdir_in(vault.parent().ok_or("Vault has no parent")?)
         .map_err(|e| e.to_string())?;
     let contents = stage.path().join("contents");
@@ -627,12 +668,21 @@ pub fn restore_backup(
         }
         let mut parts = relative.components();
         let first = parts.next().expect("checked path");
-        let internal = first.as_os_str() == ".cuelm";
+        let internal = first.as_os_str() == ".helixnotes";
         if internal {
             match parts.next() {
                 None if directory => {}
                 Some(component) if component.as_os_str() == "attachments" => {
                     legacy_attachments = true;
+                }
+                Some(component)
+                    if component.as_os_str() == "daily-template.md"
+                        && parts.next().is_none()
+                        && !directory =>
+                {
+                    if item.size() > crate::vault::daily_template::MAX_BYTES as u64 {
+                        return Err("Daily template exceeds the 256 KiB limit".into());
+                    }
                 }
                 _ => return Err(format!("Archive contains unsupported app metadata: {name}")),
             }
@@ -710,10 +760,27 @@ pub fn restore_backup(
         }
     }
     // An archive holding only its manifest would replace the vault with nothing.
-    if seen.keys().all(|entry| entry == Path::new(MANIFEST)) {
+    if seen.keys().all(|entry| {
+        entry == Path::new(MANIFEST)
+            || entry == Path::new(".helixnotes")
+            || entry == Path::new(crate::vault::daily_template::RELATIVE_PATH)
+    }) {
         return Err(
             "This backup contains no notes, so restoring it would empty the vault".to_string(),
         );
+    }
+    let has_template = seen.contains_key(Path::new(crate::vault::daily_template::RELATIVE_PATH));
+    let template = match manifest.as_ref().and_then(|meta| meta.daily_template) {
+        Some(enabled) if enabled != has_template => {
+            return Err("Daily template does not match the backup manifest".into())
+        }
+        Some(enabled) => Some(enabled),
+        None => has_template.then_some(true),
+    };
+    if has_template {
+        let file = File::open(contents.join(crate::vault::daily_template::RELATIVE_PATH))
+            .map_err(|e| e.to_string())?;
+        crate::vault::daily_template::read_from(file)?;
     }
     let attachments = if let Some(meta) = manifest {
         if meta.version != 1
@@ -730,19 +797,27 @@ pub fn restore_backup(
         legacy_attachments
     };
     if attachments {
-        fs::create_dir_all(contents.join(".cuelm/attachments")).map_err(|e| e.to_string())?;
+        fs::create_dir_all(contents.join(".helixnotes/attachments")).map_err(|e| e.to_string())?;
         if let Ok(relative) = output.strip_prefix(&vault) {
-            if relative.starts_with(".cuelm/attachments") {
+            if relative.starts_with(".helixnotes/attachments") {
                 return Err("Cannot replace attachments containing the backup output".to_string());
             }
         }
-        let internals = vault.join(".cuelm");
+    }
+    if attachments || template.is_some() {
+        let internals = vault.join(".helixnotes");
         if fs::symlink_metadata(&internals).is_ok_and(|meta| !meta.file_type().is_dir()) {
             return Err("Vault app metadata directory is not a real directory".to_string());
         }
     }
+    if template.is_some()
+        && fs::symlink_metadata(vault.join(crate::vault::daily_template::RELATIVE_PATH))
+            .is_ok_and(|meta| meta.file_type().is_dir())
+    {
+        return Err("Daily template destination must not be a directory".into());
+    }
     drop(archive);
-    let result = install_staged(&vault, &contents, &previous, &output, attachments);
+    let result = install_staged(&vault, &contents, &previous, &output, attachments, template);
     if result
         .as_ref()
         .is_err_and(|message| message.contains("rollback incomplete"))
@@ -790,7 +865,7 @@ mod tests {
 
     #[test]
     fn delete_backup_rejects_files_outside_backup_directory() {
-        let root = std::env::temp_dir().join(format!("cuelm-backup-test-{}", Uuid::new_v4()));
+        let root = std::env::temp_dir().join(format!("helixnotes-backup-test-{}", Uuid::new_v4()));
         let backup_dir = root.join("backups");
         let outside = root.join("outside.zip");
         fs::create_dir_all(&backup_dir).unwrap();
@@ -853,7 +928,7 @@ mod tests {
         fs::create_dir_all(vault.join(".private/notes")).unwrap();
         fs::create_dir_all(vault.join("former-archives")).unwrap();
         fs::write(
-            vault.join("former-archives/cuelm-backup-2026-01-02T03-04-05.zip"),
+            vault.join("former-archives/helixnotes-backup-2026-01-02T03-04-05.zip"),
             "former",
         )
         .unwrap();
@@ -865,7 +940,7 @@ mod tests {
         assert!(zip.by_name("note.md").is_ok());
         assert!(zip.by_name("archives/old.zip").is_err());
         assert!(zip
-            .by_name("former-archives/cuelm-backup-2026-01-02T03-04-05.zip")
+            .by_name("former-archives/helixnotes-backup-2026-01-02T03-04-05.zip")
             .is_err());
         assert!(zip.by_name(".private/notes/secret.md").is_err());
         drop(zip);
@@ -878,7 +953,7 @@ mod tests {
         assert_eq!(fs::read_to_string(output.join("old.zip")).unwrap(), "old");
         assert_eq!(
             fs::read_to_string(
-                vault.join("former-archives/cuelm-backup-2026-01-02T03-04-05.zip")
+                vault.join("former-archives/helixnotes-backup-2026-01-02T03-04-05.zip")
             )
             .unwrap(),
             "former"
@@ -891,13 +966,13 @@ mod tests {
         let root = tempdir().unwrap();
         let vault = root.path().join("vault");
         let output = root.path().join("backups");
-        let attachments = vault.join(".cuelm/attachments");
+        let attachments = vault.join(".helixnotes/attachments");
         fs::create_dir_all(&attachments).unwrap();
         fs::write(vault.join("note.md"), "old").unwrap();
         fs::write(attachments.join("picture.png"), "original").unwrap();
         fs::create_dir_all(vault.join("attachments")).unwrap();
         fs::write(vault.join("attachments/notebook.md"), "top-level original").unwrap();
-        fs::write(vault.join(".cuelm/settings.json"), "keep").unwrap();
+        fs::write(vault.join(".helixnotes/settings.json"), "keep").unwrap();
 
         let omitted = create_backup(&vault_string(&vault), &output, false).unwrap();
         let mut omitted_zip = ZipArchive::new(File::open(&omitted.path).unwrap()).unwrap();
@@ -937,7 +1012,7 @@ mod tests {
         );
         assert!(!attachments.join("extra.png").exists());
         assert_eq!(
-            fs::read_to_string(vault.join(".cuelm/settings.json")).unwrap(),
+            fs::read_to_string(vault.join(".helixnotes/settings.json")).unwrap(),
             "keep"
         );
     }
@@ -947,17 +1022,17 @@ mod tests {
         let root = tempdir().unwrap();
         let vault = root.path().join("vault");
         let output = root.path().join("backups");
-        fs::create_dir_all(vault.join(".cuelm/attachments")).unwrap();
+        fs::create_dir_all(vault.join(".helixnotes/attachments")).unwrap();
         fs::create_dir_all(&output).unwrap();
         fs::write(vault.join("note.md"), "live-note").unwrap();
-        fs::write(vault.join(".cuelm/attachments/photo"), "live-photo").unwrap();
+        fs::write(vault.join(".helixnotes/attachments/photo"), "live-photo").unwrap();
         let archive_path = output.join("legacy.zip");
         let mut zip = ZipWriter::new(File::create(&archive_path).unwrap());
         let options =
             SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
         zip.start_file("note.md", options).unwrap();
         zip.write_all(b"archived-note").unwrap();
-        zip.start_file(".cuelm/attachments/photo", options)
+        zip.start_file(".helixnotes/attachments/photo", options)
             .unwrap();
         zip.write_all(b"archived-photo").unwrap();
         zip.finish().unwrap();
@@ -976,7 +1051,7 @@ mod tests {
             "live-note"
         );
         assert_eq!(
-            fs::read_to_string(vault.join(".cuelm/attachments/photo")).unwrap(),
+            fs::read_to_string(vault.join(".helixnotes/attachments/photo")).unwrap(),
             "live-photo"
         );
     }
@@ -1023,10 +1098,10 @@ mod tests {
         let root = tempdir().unwrap();
         let vault = root.path().join("vault");
         let output = root.path().join("backups");
-        fs::create_dir_all(vault.join(".cuelm/attachments")).unwrap();
+        fs::create_dir_all(vault.join(".helixnotes/attachments")).unwrap();
         fs::create_dir_all(&output).unwrap();
         fs::write(vault.join("note.md"), "live").unwrap();
-        fs::write(vault.join(".cuelm/attachments/photo"), "untouched").unwrap();
+        fs::write(vault.join(".helixnotes/attachments/photo"), "untouched").unwrap();
         let archive_path = output.join("legacy.zip");
         let mut zip = ZipWriter::new(File::create(&archive_path).unwrap());
         zip.start_file("note.md", SimpleFileOptions::default())
@@ -1039,7 +1114,7 @@ mod tests {
             "restored"
         );
         assert_eq!(
-            fs::read_to_string(vault.join(".cuelm/attachments/photo")).unwrap(),
+            fs::read_to_string(vault.join(".helixnotes/attachments/photo")).unwrap(),
             "untouched"
         );
     }
@@ -1049,13 +1124,13 @@ mod tests {
         let root = tempdir().unwrap();
         let vault = root.path().join("vault");
         let output = root.path().join("backups");
-        fs::create_dir_all(vault.join(".cuelm")).unwrap();
+        fs::create_dir_all(vault.join(".helixnotes")).unwrap();
         fs::create_dir_all(&output).unwrap();
         fs::write(vault.join("note.md"), "original").unwrap();
-        fs::write(vault.join(".cuelm/settings.json"), "settings").unwrap();
+        fs::write(vault.join(".helixnotes/settings.json"), "settings").unwrap();
         for bad_name in [
             "../escape.md",
-            ".cuelm/settings.json",
+            ".helixnotes/settings.json",
             "dir/../../escape.md",
         ] {
             let archive_path = output.join("unsafe.zip");
@@ -1076,7 +1151,7 @@ mod tests {
                 "original"
             );
             assert_eq!(
-                fs::read_to_string(vault.join(".cuelm/settings.json")).unwrap(),
+                fs::read_to_string(vault.join(".helixnotes/settings.json")).unwrap(),
                 "settings"
             );
             assert!(!root.path().join("escape.md").exists());
@@ -1145,7 +1220,7 @@ mod tests {
         fs::write(vault.join("note.md"), "keep me").unwrap();
         // What the old exclusion produced: nothing but the manifest.
         let empty = output.join(format!(
-            "cuelm-backup-2026-01-01T00-00-00-{}-{}.zip",
+            "helixnotes-backup-2026-01-01T00-00-00-{}-{}.zip",
             "a".repeat(64),
             Uuid::new_v4()
         ));
@@ -1187,7 +1262,7 @@ mod tests {
         // An archive from before vault identities: it cannot be attributed, so it is not flagged.
         fs::copy(
             &own.path,
-            output.join("cuelm-backup-2020-01-01T00-00-00.zip"),
+            output.join("helixnotes-backup-2020-01-01T00-00-00.zip"),
         )
         .unwrap();
         assert!(!own.other_vault);

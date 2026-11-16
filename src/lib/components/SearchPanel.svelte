@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { t as ui, tr as uiText } from '$lib/i18n';
 	import { tick } from 'svelte';
 	import { showSearch, appConfig, notebooks } from '$lib/stores/app';
 	import { searchNotes } from '$lib/api';
@@ -176,7 +177,7 @@
 			const opened = await onSelectNote(result, notebook, () => isCurrent(generation, vault));
 			if (!isCurrent(generation, vault)) return;
 			if (!opened) {
-				error = 'Could not open this note.';
+				error = uiText("ui.could_not_open_this_note");
 				return;
 			}
 			close();
@@ -200,7 +201,7 @@
 
 {#if $showSearch}
 	<div class="search-overlay" role="presentation" onclick={close} onkeydowncapture={handleEscape}>
-		<div class="search-panel" role="dialog" aria-modal="true" aria-label="Search notes" tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={handleKeydown}>
+		<div class="search-panel" role="dialog" aria-modal="true" aria-label={$ui("ui.search_notes_246ce5")} tabindex="-1" onclick={(e) => e.stopPropagation()} onkeydown={handleKeydown}>
 			<div class="search-input-wrapper">
 				<svg class="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<circle cx="11" cy="11" r="8" />
@@ -209,9 +210,9 @@
 				<input
 					bind:this={inputEl}
 					type="text"
-					placeholder="Search notes..."
+					placeholder={$ui("ui.search_notes_9520e1")}
 					role="combobox"
-					aria-label="Search notes"
+					aria-label={$ui("ui.search_notes_246ce5")}
 					aria-controls="global-search-results"
 					aria-expanded={results.length > 0}
 					aria-autocomplete="list"
@@ -226,11 +227,11 @@
 
 			{#if error}<div class="search-error" role="alert">{error}</div>{/if}
 			{#if composing}
-				<div class="search-empty">Type to search across all notes</div>
+				<div class="search-empty">{$ui("ui.type_to_search_across_all_notes")}</div>
 			{:else if loading}
-				<div class="search-empty" role="status">Searching…</div>
+				<div class="search-empty" role="status">{$ui("ui.searching")}</div>
 			{:else if results.length > 0}
-				<div class="search-results" id="global-search-results" role="listbox" aria-label="Search results" bind:this={resultsEl}>
+				<div class="search-results" id="global-search-results" role="listbox" aria-label={$ui("ui.search_results")} bind:this={resultsEl}>
 					{#each rows as row, i (row.result.path)}
 						{@const result = row.result}
 						<button
@@ -270,26 +271,26 @@
 						<line x1="8" y1="8" x2="14" y2="14" />
 						<line x1="14" y1="8" x2="8" y2="14" />
 					</svg>
-					<span>{total > 0 ? 'Results changed. Choose an earlier page.' : `No results for "${query}"`}</span>
+					<span>{total > 0 ? $ui("ui.results_changed_choose_an_earlier_page") : $ui("ui.no_results_for", { value0: query })}</span>
 				</div>
 			{:else if !error}
 				<div class="search-empty">
-					<span>Type to search across all notes</span>
+					<span>{$ui("ui.type_to_search_across_all_notes")}</span>
 				</div>
 			{/if}
 			{#if total > 0}
 				<div class="search-footer">
 					<span class="search-count" role="status">
-						{#if results.length}{offset + 1}–{offset + results.length} of {total}{:else}{total} result{total !== 1 ? 's' : ''}{/if}
+						{#if results.length}{$ui("ui.of_0e1840", { value0: offset + 1, value1: offset + results.length, value2: total })}{:else}{$ui("ui.result", { value0: total, value1: total !== 1 ? 's' : '' })}{/if}
 					</span>
 					{#if total > PAGE_SIZE || offset > 0}
-						<div class="search-pages" aria-label="Result pages">
-							<button onclick={previousPage} disabled={loading || opening || offset === 0} aria-label="Previous results page">Previous</button>
-							<button onclick={() => startSearch(query, offset + PAGE_SIZE, true)} disabled={loading || opening || offset + PAGE_SIZE >= total} aria-label="Next results page">Next</button>
+						<div class="search-pages" aria-label={$ui("ui.result_pages")}>
+							<button onclick={previousPage} disabled={loading || opening || offset === 0} aria-label={$ui("ui.previous_results_page")}>{$ui("ui.previous")}</button>
+							<button onclick={() => startSearch(query, offset + PAGE_SIZE, true)} disabled={loading || opening || offset + PAGE_SIZE >= total} aria-label={$ui("ui.next_results_page")}>{$ui("ui.next")}</button>
 						</div>
 					{/if}
 					{#if !isMobile}
-						<span class="search-hints"><kbd>&uarr;</kbd><kbd>&darr;</kbd> navigate <kbd>&crarr;</kbd> open</span>
+						<span class="search-hints"><kbd>&uarr;</kbd><kbd>&darr;</kbd> {$ui("ui.navigate")} <kbd>&crarr;</kbd> {$ui("ui.open")}</span>
 					{/if}
 				</div>
 			{/if}

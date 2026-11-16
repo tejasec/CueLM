@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { t as ui, label as uiLabel } from '$lib/i18n';
 	import { tick } from 'svelte';
 	import { activeNote, activeNotePath, appConfig, navHistory } from '$lib/stores/app';
 	import { getNoteSwitcherTitles, getQuickAccess } from '$lib/api';
@@ -220,7 +221,7 @@
 		bind:this={trigger}
 		class="switcher-trigger"
 		type="button"
-		aria-label="Switch note"
+		aria-label={$ui("ui.switch_note")}
 		aria-haspopup="dialog"
 		aria-expanded={open}
 		onclick={toggleSwitcher}
@@ -236,14 +237,14 @@
 			bind:this={popover}
 			class="switcher-popover"
 			role="dialog"
-			aria-label="Note switcher"
+			aria-label={$ui("ui.note_switcher")}
 			tabindex="-1"
 			onkeydown={handlePopoverKeydown}
 		>
 			{#if loading}
-				<div class="switcher-status">Loading notes…</div>
+				<div class="switcher-status">{$ui("ui.loading_notes")}</div>
 			{:else if sections.recent.length === 0 && sections.quickAccess.length === 0}
-				<div class="switcher-status">No notes available</div>
+				<div class="switcher-status">{$ui("ui.no_notes_available")}</div>
 			{:else}
 				{#each [
 					{ label: 'Recent', rows: sections.recent },
@@ -251,7 +252,7 @@
 				] as section (section.label)}
 					{#if section.rows.length > 0}
 						<section class="switcher-section" aria-labelledby={`note-switcher-${section.label.replace(' ', '-').toLowerCase()}`}>
-							<h2 id={`note-switcher-${section.label.replace(' ', '-').toLowerCase()}`}>{section.label}</h2>
+							<h2 id={`note-switcher-${section.label.replace(' ', '-').toLowerCase()}`}>{$uiLabel(section.label)}</h2>
 							{#each section.rows as row (row.path)}
 								<div class="note-row" class:current-row={row.current} title={row.path}>
 									{#if row.current}<span class="current-marker" aria-hidden="true"></span>{/if}
@@ -268,8 +269,8 @@
 									<button
 										class="open-window"
 										type="button"
-										aria-label={`Open ${row.title} in new window`}
-										title={`Open ${row.title} in new window`}
+										aria-label={$ui("ui.open_in_new_window_3dff16", { value0: row.title })}
+										title={$ui("ui.open_in_new_window_3dff16", { value0: row.title })}
 										onclick={() => { if (loadedVaultPath) void openNoteWindow(loadedVaultPath, row.path, row.title); }}
 									>
 										<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">

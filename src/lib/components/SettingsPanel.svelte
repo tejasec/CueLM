@@ -1,5 +1,14 @@
 <script lang="ts">
+	import { t as ui, label as uiLabel, tr as uiText, locale } from '$lib/i18n';
 	import { untrack } from 'svelte';
+	import { t, language, languageOptions, applyLanguage, normalizeLanguage, type Language } from '$lib/i18n';
+	import { setLanguage } from '$lib/api';
+	import ThemedSelect from './ThemedSelect.svelte';
+	import DailyNoteTemplate from './DailyNoteTemplate.svelte';
+	import NewNoteEditorSetting from './NewNoteEditorSetting.svelte';
+	import { newNoteEditorMode, type EditorMode } from '$lib/editor/mode';
+	import { setNewNoteEditorMode } from '$lib/api';
+	import AiModelPicker from './AiModelPicker.svelte';
 	import { showSettings, syncState, theme, resolvedTheme, appConfig, platformIsMobile, activeVaultConfig, updateAvailable as globalUpdateAvailable, updateObj as globalUpdateObj, installType, settingsTab, vaultReady, androidApkUrl, checkForUpdateMobile, notebookSortMode, isManagedInstall, customThemes } from '$lib/stores/app';
 	import { setTheme, setSystemThemes, setAccentColor, setFontSize, setScrollToChangeFontSize, setFontFamily, setLineHeight, setUiScale, setContentWidth, setGeneralSettings, importObsidian, createBackup, listBackups, restoreBackup, deleteBackup, setBackupSettings, setAiSettings, testAiConnection, setSyncSettings, testSyncConnection, syncNow, saveCustomTheme, deleteCustomTheme, exportCustomTheme, importCustomThemes, getVaultStats, findOrphanedAttachments, trashOrphanedAttachments } from '$lib/api';
 	import { darkThemes, isMobile, isAndroid } from '$lib/platform';
@@ -16,7 +25,7 @@
 
 	const modKey = navigator.platform.startsWith('Mac') ? '⌘' : 'Ctrl';
 
-	type Tab = 'general' | 'editor' | 'styling' | 'import' | 'backup' | 'maintenance' | 'ai' | 'sync' | 'updates';
+	type Tab = 'general' | 'editor' | 'styling' | 'import' | 'backup' | 'maintenance' | 'integrations' | 'ai' | 'sync' | 'updates';
 	let activeTab = $state<Tab>('styling');
 
 	// Updates state
@@ -37,7 +46,7 @@
 	$effect(() => {
 		const tab = $settingsTab;
 		if (tab) {
-			activeTab = tab as Tab;
+			activeTab = isMobile && tab === 'integrations' ? 'general' : tab as Tab;
 			$settingsTab = null;
 		}
 	});
@@ -68,9 +77,9 @@
 				const global = $globalUpdateAvailable;
 				if (global) {
 					updateAvailable = { version: global.version, body: global.body };
-					updateMessage = { type: 'info', text: `Version ${global.version} is available!` };
+					updateMessage = { type: 'info', text: uiText("ui.version_is_available", { value0: global.version }) };
 				} else {
-					updateMessage = { type: 'success', text: 'You are on the latest version.' };
+					updateMessage = { type: 'success', text: uiText("ui.you_are_on_the_latest_version") };
 				}
 			} else {
 				const { check: checkUpdate } = await import('@tauri-apps/plugin-updater');
@@ -80,13 +89,13 @@
 					$globalUpdateObj = update;
 					updateAvailable = { version: update.version, body: update.body, date: update.date };
 					globalUpdateAvailable.set({ version: update.version, body: update.body });
-					updateMessage = { type: 'info', text: `Version ${update.version} is available!` };
+					updateMessage = { type: 'info', text: uiText("ui.version_is_available", { value0: update.version }) };
 				} else {
-					updateMessage = { type: 'success', text: 'You are on the latest version.' };
+					updateMessage = { type: 'success', text: uiText("ui.you_are_on_the_latest_version") };
 				}
 			}
 		} catch (e) {
-			updateMessage = { type: 'error', text: `Failed to check: ${e}` };
+			updateMessage = { type: 'error', text: uiText("ui.failed_to_check", { value0: e }) };
 		} finally {
 			updateChecking = false;
 		}
@@ -96,7 +105,7 @@
 		if (!updateObj) return;
 		updateDownloading = true;
 		updateProgress = 0;
-		updateMessage = { type: 'info', text: 'Downloading update...' };
+		updateMessage = { type: 'info', text: uiText("ui.downloading_update") };
 		try {
 			let totalBytes = 0;
 			let downloadedBytes = 0;
@@ -112,9 +121,9 @@
 					updateProgress = 100;
 				}
 			});
-			updateMessage = { type: 'success', text: 'Update installed! Restart the app to apply.' };
+			updateMessage = { type: 'success', text: uiText("ui.update_installed_restart_the_app_to_apply") };
 		} catch (e) {
-			updateMessage = { type: 'error', text: `Update failed: ${e}` };
+			updateMessage = { type: 'error', text: uiText("ui.update_failed", { value0: e }) };
 		} finally {
 			updateDownloading = false;
 		}
@@ -178,7 +187,7 @@
 		scanningOrphanedAttachments = true;
 		orphanError = '';
 		try {
-			if (!(await onBeforeVaultSwitch())) throw new Error('Save the current note before scanning attachments.');
+			if (!(await onBeforeVaultSwitch())) throw new Error(uiText("error.saveBeforeScan"));
 			if (!current()) return;
 			const found = await findOrphanedAttachments(vault);
 			if (!current()) return;
@@ -200,7 +209,7 @@
 		trashingOrphanedAttachments = true;
 		orphanError = '';
 		try {
-			if (!(await onBeforeVaultSwitch())) throw new Error('Save the current note before cleaning attachments.');
+			if (!(await onBeforeVaultSwitch())) throw new Error(uiText("error.saveBeforeClean"));
 			if (!current()) return;
 			await trashOrphanedAttachments(vault, names);
 			if (!current()) return;
@@ -262,7 +271,7 @@
 		let stop: (() => void) | undefined;
 		let finished = false;
 		try {
-			if (!(await onBeforeVaultSwitch())) throw new Error('Save the current note before creating a backup.');
+			if (!(await onBeforeVaultSwitch())) throw new Error(uiText("error.saveBeforeBackup"));
 			if (!current()) return;
 			stop = await listen<{ vault_path: string; success: boolean; entry?: BackupEntry; error?: string }>('backup-done', (event) => {
 				const data = event.payload;
@@ -272,7 +281,7 @@
 				backupUnlisten = null;
 				backupLoading = false;
 				if (data.success) {
-					backupMessage = { type: 'success', text: 'Backup created successfully' };
+					backupMessage = { type: 'success', text: uiText("ui.backup_created_successfully") };
 					const timestamp = data.entry?.created;
 					const currentVault = activeVaultConfig($appConfig);
 					if (timestamp && currentVault && $appConfig) {
@@ -281,7 +290,7 @@
 					}
 					void loadBackups();
 				} else {
-					backupMessage = { type: 'error', text: `Backup failed: ${data.error}` };
+					backupMessage = { type: 'error', text: uiText("ui.backup_failed", { value0: data.error }) };
 				}
 			});
 			if (!current() || finished) { stop(); return; }
@@ -291,7 +300,7 @@
 			stop?.();
 			if (current()) {
 				backupUnlisten = null;
-				backupMessage = { type: 'error', text: `Backup failed: ${e}` };
+				backupMessage = { type: 'error', text: uiText("ui.backup_failed", { value0: e }) };
 				backupLoading = false;
 			}
 		}
@@ -308,7 +317,7 @@
 		let stop: (() => void) | undefined;
 		let finished = false;
 		try {
-			if (!(await onBeforeVaultSwitch())) throw new Error('Save the current note before restoring a backup.');
+			if (!(await onBeforeVaultSwitch())) throw new Error(uiText("error.saveBeforeRestore"));
 			if (!current()) return;
 			stop = await listen<{ vault_path: string; success: boolean; error?: string }>('restore-done', (event) => {
 				const data = event.payload;
@@ -317,8 +326,8 @@
 				stop?.();
 				backupUnlisten = null;
 				backupMessage = data.success
-					? { type: 'success', text: 'Backup restored successfully.' }
-					: { type: 'error', text: `Restore failed: ${data.error}` };
+					? { type: 'success', text: uiText("ui.backup_restored_successfully") }
+					: { type: 'error', text: uiText("ui.restore_failed", { value0: data.error }) };
 				backupLoading = false;
 			});
 			if (!current() || finished) { stop(); return; }
@@ -328,7 +337,7 @@
 			stop?.();
 			if (current()) {
 				backupUnlisten = null;
-				backupMessage = { type: 'error', text: `Restore failed: ${e}` };
+				backupMessage = { type: 'error', text: uiText("ui.restore_failed", { value0: e }) };
 				backupLoading = false;
 			}
 		}
@@ -346,7 +355,7 @@
 	}
 
 	async function handleSelectBackupFolder() {
-		const selected = await openDialog({ directory: true, multiple: false, title: 'Select backup folder' });
+		const selected = await openDialog({ directory: true, multiple: false, title: $ui('ui.select_backup_folder') });
 		if (selected && $appConfig) {
 			await setBackupSettings($appConfig.backup_enabled, $appConfig.backup_frequency, $appConfig.backup_max_count, selected as string, $appConfig.backup_include_attachments);
 			$appConfig = { ...$appConfig, backup_location: selected as string };
@@ -368,7 +377,7 @@
 	function formatBackupDate(iso: string): string {
 		try {
 			const d = new Date(iso);
-			return d.toLocaleString();
+			return d.toLocaleString($locale);
 		} catch {
 			return iso;
 		}
@@ -388,7 +397,7 @@
 	let _ollamaApiKey = $state($appConfig?.ollama_api_key ?? '');
 	let _openaiCompatibleBaseUrl = $state($appConfig?.openai_compatible_base_url ?? '');
 	let _openaiCompatibleKey = $state($appConfig?.openai_compatible_api_key ?? '');
-	let aiModel = $state($appConfig?.ai_model ?? 'claude-sonnet-5');
+	let aiModel = $state($appConfig?.ai_model ?? '');
 	let aiWritingStyle = $state($appConfig?.ai_writing_style ?? '');
 	let aiShowKey = $state(false);
 	let aiShowCompatibleKey = $state(false);
@@ -396,46 +405,52 @@
 	let aiTestLoading = $state(false);
 	let aiTestMessage = $state<{ type: 'success' | 'error'; text: string } | null>(null);
 
-	// General-purpose text models verified against provider catalogs on 2026-09-27.
-	const anthropicModels = [
-		{ value: 'claude-sonnet-5', label: 'Claude Sonnet 5', desc: 'Balanced' },
-		{ value: 'claude-opus-5-5', label: 'Claude Opus 5.5', desc: 'Complex work' },
-		{ value: 'claude-fable-5-1', label: 'Claude Fable 5.1', desc: 'Deep reasoning' },
-		{ value: 'claude-haiku-4-5-20251001', label: 'Claude Haiku 4.5', desc: 'Fast' },
-	];
-	const openaiModels = [
-		{ value: 'gpt-6-sol', label: 'GPT-6 Sol', desc: 'Balanced' },
-		{ value: 'gpt-6-astra', label: 'GPT-6 Astra', desc: 'Deep reasoning' },
-		{ value: 'gpt-6-luna', label: 'GPT-6 Luna', desc: 'Fast' },
-	];
-	let aiModels = $derived(aiProvider === 'openai' ? openaiModels : anthropicModels);
+	const initialAi = untrack(() => $appConfig);
+	const rememberedModels = new Map<string, string>([
+		['anthropic', initialAi?.anthropic_model ?? ''], ['openai', initialAi?.openai_model ?? ''],
+		['ollama', initialAi?.ollama_model ?? ''], ['openai_compatible', initialAi?.openai_compatible_model ?? ''],
+	]);
+	if (initialAi?.ai_provider) rememberedModels.set(initialAi.ai_provider, initialAi.ai_model);
+	let aiSaveQueue: Promise<void> = Promise.resolve();
 
-	async function saveAiSettings() {
-		const baseUrl = aiProvider === 'ollama' ? (_ollamaBaseUrl || null) : null;
-		await setAiSettings(
-			aiProvider,
-			aiApiKey || null,
-			aiModel,
-			aiWritingStyle || null,
-			baseUrl,
-			_ollamaApiKey || null,
-			_openaiCompatibleBaseUrl || null,
-			_openaiCompatibleKey || null,
-		);
-		if ($appConfig) {
-			$appConfig = {
-				...$appConfig,
-				ai_provider: aiProvider,
-				ai_api_key: _anthropicKey || null,
-				openai_api_key: _openaiKey || null,
-				ollama_base_url: _ollamaBaseUrl || null,
-				ollama_api_key: _ollamaApiKey || null,
-				openai_compatible_base_url: _openaiCompatibleBaseUrl || null,
-				openai_compatible_api_key: _openaiCompatibleKey || null,
-				ai_model: aiModel,
-				ai_writing_style: aiWritingStyle || null,
-			};
-		}
+	function saveAiSettings(): Promise<void> {
+		// Capture before awaiting: rapid provider/key changes must never pair a key with
+		// another provider, or let an older save overwrite the newest settings.
+		const p = aiProvider, key = aiApiKey.trim() || null, model = aiModel.trim();
+		const style = aiWritingStyle || null, base = _ollamaBaseUrl || null;
+		const ollamaKey = _ollamaApiKey.trim() || null;
+		const compatibleUrl = _openaiCompatibleBaseUrl || null, compatibleKey = _openaiCompatibleKey.trim() || null;
+		const save = aiSaveQueue.catch(() => {}).then(async () => {
+			await setAiSettings(p, key, model, style, p === 'ollama' ? base : null, ollamaKey, compatibleUrl, compatibleKey);
+			if (p) rememberedModels.set(p, model);
+			appConfig.update(config => config ? {
+				...config, ai_provider: p, ai_model: model, ai_writing_style: style,
+				...(p === 'openai' ? { openai_api_key: key, openai_model: model || null } : {}),
+				...(p === 'anthropic' ? { ai_api_key: key, anthropic_model: model || null } : {}),
+				...(p === 'ollama' ? { ollama_base_url: base, ollama_api_key: ollamaKey, ollama_model: model || null } : {}),
+				...(p === 'openai_compatible' ? { openai_compatible_base_url: compatibleUrl, openai_compatible_api_key: compatibleKey, openai_compatible_model: model || null } : {}),
+			} : config);
+		});
+		aiSaveQueue = save;
+		// Keep fire-and-forget blur handlers from producing unhandled rejections.
+		void save.catch(error => { aiTestMessage = { type: 'error', text: String(error) }; });
+		return save;
+	}
+
+	function selectAiProvider(next: string | null) {
+		if (next === aiProvider) return;
+		if (aiProvider) rememberedModels.set(aiProvider, aiModel);
+		aiProvider = next;
+		aiModel = next ? rememberedModels.get(next) ?? '' : '';
+		aiTestMessage = null;
+		void saveAiSettings();
+	}
+
+	async function chooseAiModel(next: string) {
+		const previous = aiModel, provider = aiProvider;
+		aiModel = next;
+		try { await saveAiSettings(); }
+		catch (error) { if (aiProvider === provider && aiModel === next) aiModel = previous; throw error; }
 	}
 
 	async function handleTestAi() {
@@ -444,14 +459,15 @@
 		const unlisten = await listen<{ success: boolean; message?: string; error?: string }>('ai-test-result', (event) => {
 			const data = event.payload;
 			if (data.success) {
-				aiTestMessage = { type: 'success', text: 'Connection successful!' };
+				aiTestMessage = { type: 'success', text: uiText("ui.connection_successful") };
 			} else {
-				aiTestMessage = { type: 'error', text: data.error ?? 'Connection failed' };
+				aiTestMessage = { type: 'error', text: data.error ?? uiText("error.connection") };
 			}
 			aiTestLoading = false;
 			unlisten();
 		});
 		try {
+			await saveAiSettings();
 			await testAiConnection();
 		} catch (e) {
 			aiTestMessage = { type: 'error', text: String(e) };
@@ -529,8 +545,8 @@
 		const unlisten = await listen<{ success: boolean; message?: string; error?: string }>('sync-test-result', (event) => {
 			const data = event.payload;
 			syncTestMessage = data.success
-				? { type: 'success', text: data.message ?? 'Connection successful' }
-				: { type: 'error', text: data.error ?? 'Connection failed' };
+				? { type: 'success', text: uiText("ui.connection_successful") }
+				: { type: 'error', text: data.error ?? uiText("error.connection") };
 			syncTestLoading = false;
 			unlisten();
 		});
@@ -548,18 +564,19 @@
 	$effect(() => {
 		const state = $syncState;
 		const vault = maintenanceVault;
+		const translate = $ui;
 		untrack(() => {
 			if (state.running) syncMessage = null;
 			else if (state.error) syncMessage = { type: 'error', text: state.error };
 			else if (state.result && state.result.vault === vault) {
 				const s = state.result.summary;
 				const parts: string[] = [];
-				if (s.uploaded) parts.push(`${s.uploaded} uploaded`);
-				if (s.downloaded) parts.push(`${s.downloaded} downloaded`);
+				if (s.uploaded) parts.push(translate('sync.uploaded', { count: s.uploaded }));
+				if (s.downloaded) parts.push(translate('sync.downloaded', { count: s.downloaded }));
 				const deleted = (s.deleted_local ?? 0) + (s.deleted_remote ?? 0);
-				if (deleted) parts.push(`${deleted} deleted`);
-				if (s.conflicts) parts.push(`${s.conflicts} conflict ${s.conflicts === 1 ? 'copy' : 'copies'}`);
-				syncMessage = { type: 'success', text: parts.length ? `Synced: ${parts.join(', ')}.` : 'Already up to date.' };
+				if (deleted) parts.push(translate('sync.deleted', { count: deleted }));
+				if (s.conflicts) parts.push(translate('sync.conflicts', { count: s.conflicts }));
+				syncMessage = { type: 'success', text: parts.length ? translate('sync.summary', { summary: parts.join(', ') }) : translate('sync.upToDate') };
 			}
 		});
 	});
@@ -895,7 +912,7 @@
 			const path = await saveDialog({ filters: [{ name: 'JSON', extensions: ['json'] }], defaultPath: `${safeName}.json` });
 			if (path) {
 				await exportCustomTheme(ct.id, path);
-				customThemeMessage = { type: 'success', text: `"${ct.name}" exported.` };
+				customThemeMessage = { type: 'success', text: uiText("ui.exported", { value0: ct.name }) };
 			}
 		} catch (e) {
 			customThemeMessage = { type: 'error', text: String(e) };
@@ -918,13 +935,28 @@
 					}
 					$appConfig = { ...$appConfig };
 				}
-				customThemeMessage = { type: 'success', text: `Imported ${imported.length} theme${imported.length !== 1 ? 's' : ''}.` };
+				customThemeMessage = { type: 'success', text: uiText("ui.imported_theme", { value0: imported.length, value1: imported.length !== 1 ? 's' : '' }) };
 			}
 		} catch (e) {
 			customThemeMessage = { type: 'error', text: String(e) };
 		} finally {
 			customThemeImporting = false;
 		}
+	}
+
+	let languageSaving = $state(false);
+	let languageError = $state('');
+	async function changeLanguage(value: string) {
+		const next: Language = normalizeLanguage(value);
+		languageSaving = true;
+		languageError = '';
+		try {
+			await setLanguage(next);
+			applyLanguage(next);
+			appConfig.update(config => config ? { ...config, language: next } : config);
+		} catch (error) {
+			languageError = $t('language.saveFailed', { error: String(error) });
+		} finally { languageSaving = false; }
 	}
 
 	// General settings
@@ -947,7 +979,11 @@
 	let showLineNumbers = $state($appConfig?.show_line_numbers ?? false);
 	let showLinkArrows = $state($appConfig?.show_link_arrows ?? true);
 	let defaultViewMode = $state($appConfig?.default_view_mode ?? false);
-	let newNotesInSourceMode = $state($appConfig?.new_notes_in_source_mode ?? false);
+	const newNoteMode = $derived(newNoteEditorMode($appConfig));
+	async function saveNewNoteMode(mode: EditorMode) {
+		await setNewNoteEditorMode(mode);
+		appConfig.update(config => config ? { ...config, new_note_editor_mode: mode, new_notes_in_source_mode: mode !== 'rich' } : config);
+	}
 	let showTrayIcon = $state($appConfig?.show_tray_icon ?? false);
 	let closeToTray = $state($appConfig?.close_to_tray ?? false);
 	let enableWikiLinks = $state($appConfig?.enable_wiki_links ?? true);
@@ -1021,7 +1057,7 @@
 			$appConfig.show_line_numbers = showLineNumbers;
 			$appConfig.show_link_arrows = showLinkArrows;
 			$appConfig.default_view_mode = defaultViewMode;
-			$appConfig.new_notes_in_source_mode = newNotesInSourceMode;
+			$appConfig.new_notes_in_source_mode = newNoteMode !== 'rich';
 			$appConfig.show_tray_icon = showTrayIcon;
 			$appConfig.close_to_tray = closeToTray;
 			$appConfig.enable_wiki_links = enableWikiLinks;
@@ -1031,7 +1067,7 @@
 			$appConfig.show_daily_notes = showDailyNotes;
 			$appConfig.show_trash = showTrash;
 			}
-			setGeneralSettings(compactNotes, timeFormat, weekStart, dailyTitleFormat, gpuAcceleration, autostart, pdfPreview, pdfHeight, titleMode, hideTitleInBody, showLineNumbers, showLinkArrows, defaultViewMode, newNotesInSourceMode, showTrayIcon, closeToTray, enableWikiLinks, showNoteDates, showNoteSwitcher, startupView, restoreLastSession, showAllNotes, showQuickAccess, showTasks, showDailyNotes, showTrash)
+			setGeneralSettings(compactNotes, timeFormat, weekStart, dailyTitleFormat, gpuAcceleration, autostart, pdfPreview, pdfHeight, titleMode, hideTitleInBody, showLineNumbers, showLinkArrows, defaultViewMode, newNoteMode !== 'rich', showTrayIcon, closeToTray, enableWikiLinks, showNoteDates, showNoteSwitcher, startupView, restoreLastSession, showAllNotes, showQuickAccess, showTasks, showDailyNotes, showTrash)
 			.catch((e) => console.error('Failed to save general settings:', e));
 	}
 
@@ -1164,11 +1200,8 @@
 	}
 
 	function close() {
-		// Ensure AI settings are saved when closing (in case input wasn't blurred)
-		// Only save if the key differs from what's already stored
-		if (aiProvider && aiApiKey && aiApiKey !== ($appConfig?.ai_api_key ?? '')) {
-			saveAiSettings();
-		}
+		// Flush the latest captured AI fields, including cleared keys and manual IDs.
+		if (aiProvider) void saveAiSettings();
 		$showSettings = false;
 	}
 
@@ -1178,6 +1211,8 @@
 
 	function handleEscape(event: KeyboardEvent) {
 		if (event.key !== 'Escape') return;
+		// Let an expanded select consume Escape before closing its containing dialog.
+		if (event.target instanceof Element && event.target.closest('[role="combobox"][aria-expanded="true"]')) return;
 		event.preventDefault();
 		event.stopPropagation();
 		if (restoreConfirm) restoreConfirm = null;
@@ -1244,7 +1279,6 @@
 			pdfPreview = $appConfig.pdf_preview ?? false;
 			pdfHeight = $appConfig.pdf_height ?? 600;
 			titleMode = $appConfig.title_mode ?? 'input';
-			newNotesInSourceMode = $appConfig.new_notes_in_source_mode ?? false;
 			showAllNotes = $appConfig.show_all_notes ?? true;
 			showQuickAccess = $appConfig.show_quick_access ?? true;
 			showTasks = $appConfig.show_tasks ?? true;
@@ -1268,8 +1302,8 @@
 	<div class="settings-overlay" class:mobile={isMobile} onclick={closeSettingsFromOverlay} onkeydowncapture={handleEscape} onkeydown={handleEscape}>
 		<div class="settings-panel" class:mobile={isMobile} role="dialog" aria-modal="true" aria-labelledby="settings-title" tabindex="-1">
 			<div class="settings-header">
-				<h2 id="settings-title">Settings</h2>
-				<button class="close-btn" onclick={close} aria-label="Close settings">
+				<h2 id="settings-title">{$ui("ui.settings")}</h2>
+				<button class="close-btn" onclick={close} aria-label={$ui("ui.close_settings")}>
 					<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 						<line x1="18" y1="6" x2="6" y2="18" />
 						<line x1="6" y1="6" x2="18" y2="18" />
@@ -1283,26 +1317,26 @@
 						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<path d="M12.22 2h-.44a2 2 0 00-2 2v.18a2 2 0 01-1 1.73l-.43.25a2 2 0 01-2 0l-.15-.08a2 2 0 00-2.73.73l-.22.38a2 2 0 00.73 2.73l.15.1a2 2 0 011 1.72v.51a2 2 0 01-1 1.74l-.15.09a2 2 0 00-.73 2.73l.22.38a2 2 0 002.73.73l.15-.08a2 2 0 012 0l.43.25a2 2 0 011 1.73V20a2 2 0 002 2h.44a2 2 0 002-2v-.18a2 2 0 011-1.73l.43-.25a2 2 0 012 0l.15.08a2 2 0 002.73-.73l.22-.39a2 2 0 00-.73-2.73l-.15-.08a2 2 0 01-1-1.74v-.5a2 2 0 011-1.74l.15-.09a2 2 0 00.73-2.73l-.22-.38a2 2 0 00-2.73-.73l-.15.08a2 2 0 01-2 0l-.43-.25a2 2 0 01-1-1.73V4a2 2 0 00-2-2z"/><circle cx="12" cy="12" r="3"/>
 						</svg>
-						General
+						{$ui("ui.general")}
 					</button>
 					<button class="tab-btn" class:active={activeTab === 'editor'} onclick={() => activeTab = 'editor'}>
 						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<path d="M21.174 6.812a1 1 0 00-3.986-3.987L3.842 16.174a2 2 0 00-.5.83l-1.321 4.352a.5.5 0 00.623.622l4.353-1.32a2 2 0 00.83-.497z"/><path d="M15 5l4 4"/>
 						</svg>
-						Editor
+						{$ui("ui.editor")}
 					</button>
 					<button class="tab-btn" class:active={activeTab === 'styling'} onclick={() => activeTab = 'styling'}>
 						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<path d="M12 2v4"/><path d="m6.8 14-3.5 2"/><path d="m20.7 16-3.5-2"/><path d="M6.8 10 3.3 8"/><path d="m20.7 8-3.5 2"/><path d="m9 22 3-8 3 8"/><path d="M8 22h8"/><circle cx="12" cy="12" r="2"/>
 						</svg>
-						Styling
+						{$ui("ui.styling")}
 					</button>
 					{#if !isMobile}
 					<button class="tab-btn" class:active={activeTab === 'import'} onclick={() => activeTab = 'import'}>
 						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<path d="M12 3v12"/><path d="m8 11 4 4 4-4"/><path d="M8 5H4a2 2 0 00-2 2v10a2 2 0 002 2h16a2 2 0 002-2V7a2 2 0 00-2-2h-4"/>
 						</svg>
-						Import
+						{$ui("ui.import")}
 					</button>
 				{/if}
 					{#if !isMobile}
@@ -1310,33 +1344,39 @@
 						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<path d="M21 12a9 9 0 00-9-9 9.75 9.75 0 00-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 009 9 9.75 9.75 0 006.74-2.74L21 16"/><path d="M16 16h5v5"/>
 						</svg>
-						Backup
+						{$ui("ui.backup")}
 					</button>
 					{/if}
 					<button class="tab-btn" class:active={activeTab === 'maintenance'} onclick={() => activeTab = 'maintenance'}>
 						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<line x1="22" x2="2" y1="12" y2="12"/><path d="M5.45 5.11 2 12v6a2 2 0 002 2h16a2 2 0 002-2v-6l-3.45-6.89A2 2 0 0016.76 4H7.24a2 2 0 00-1.79 1.11z"/><line x1="6" x2="6.01" y1="16" y2="16"/><line x1="10" x2="10.01" y1="16" y2="16"/>
 						</svg>
-						Maintenance
+						{$ui("ui.maintenance")}
 					</button>
+					{#if !isMobile}
+					<button class="tab-btn" class:active={activeTab === 'integrations'} onclick={() => activeTab = 'integrations'}>
+						<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" aria-hidden="true"><path d="m8 3 2 4m6-4-2 4M7 7h10v4a5 5 0 0 1-10 0V7Zm5 9v5" /></svg>
+						{$ui('mcp.integrations')}
+					</button>
+					{/if}
 					<button class="tab-btn" class:active={activeTab === 'ai'} onclick={() => activeTab = 'ai'}>
 						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<path d="M12 8V4l-2-2"/><rect x="4" y="8" width="16" height="12" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M9 13v2"/><path d="M15 13v2"/>
 						</svg>
-						AI
+						{$ui("ui.ai")}
 					</button>
 					<button class="tab-btn" class:active={activeTab === 'sync'} onclick={() => activeTab = 'sync'}>
 						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0115-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 01-15 6.7L3 16"/>
 						</svg>
-						Sync
+						{$ui("ui.sync")}
 					</button>
 					{#if !isAndroid}
 					<button class="tab-btn" class:active={activeTab === 'updates'} onclick={() => activeTab = 'updates'}>
 						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<path d="M21 12a9 9 0 00-9-9 9.75 9.75 0 00-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 3"/>
 						</svg>
-						Updates
+						{$ui("ui.updates")}
 					</button>
 					{/if}
 				</nav>
@@ -1345,72 +1385,83 @@
 					{#if activeTab === 'general'}
 						<div class="tab-content">
 							<div class="settings-section">
-								<h3>Notes List</h3>
+								<h3>{$t('language.title')}</h3>
+								<label class="setting-label" for="interface-language">{$t('language.description')}</label>
+								<ThemedSelect id="interface-language" label={$t('language.title')} value={$language}
+									disabled={languageSaving} onchange={changeLanguage}
+									options={[
+										{ value: 'system', label: $t('language.system') },
+										...languageOptions.map(option => ({ value: option.code, label: option.name, lang: option.code })),
+									]} />
+								{#if languageError}<p role="alert">{languageError}</p>{/if}
+							</div>
+							<div class="settings-section">
+								<h3>{$ui("ui.notes_list")}</h3>
 								<label class="setting-toggle">
 									<span class="setting-label">
-										<span class="setting-name">Compact mode</span>
-										<span class="setting-desc">Show notes in a denser layout without preview</span>
+										<span class="setting-name">{$ui("ui.compact_mode")}</span>
+										<span class="setting-desc">{$ui("ui.show_notes_in_a_denser_layout_without_preview")}</span>
 									</span>
-									<button class="toggle-switch" class:on={compactNotes} role="switch" aria-checked={compactNotes} aria-label="Compact notes" onclick={() => { compactNotes = !compactNotes; saveGeneralSettings(); }}>
+									<button class="toggle-switch" class:on={compactNotes} role="switch" aria-checked={compactNotes} aria-label={$ui("ui.compact_notes")} onclick={() => { compactNotes = !compactNotes; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
 								<label class="setting-toggle">
 									<span class="setting-label">
-										<span class="setting-name">Show dates</span>
-										<span class="setting-desc">Show the date next to each note in the list</span>
+										<span class="setting-name">{$ui("ui.show_dates")}</span>
+										<span class="setting-desc">{$ui("ui.show_the_date_next_to_each_note_in_the_list")}</span>
 									</span>
-									<button class="toggle-switch" class:on={showNoteDates} role="switch" aria-checked={showNoteDates} aria-label="Show note dates" onclick={() => { showNoteDates = !showNoteDates; saveGeneralSettings(); }}>
+									<button class="toggle-switch" class:on={showNoteDates} role="switch" aria-checked={showNoteDates} aria-label={$ui("ui.show_note_dates")} onclick={() => { showNoteDates = !showNoteDates; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
 							</div>
 
 							<div class="settings-section">
-								<h3>Notebooks</h3>
+								<h3>{$ui("ui.notebooks")}</h3>
 								<div class="setting-toggle">
 									<span class="setting-label">
-										<span class="setting-name">Sort order</span>
-										<span class="setting-desc">Alphabetical (default) or manual. Drag notebooks above/below each other to reorder.</span>
+										<span class="setting-name">{$ui("ui.sort_order")}</span>
+										<span class="setting-desc">{$ui("ui.alphabetical_default_or_manual_drag_notebooks_above_below_each_d2ae0c")}</span>
 									</span>
 								</div>
 								<div class="setting-options" style="margin-top: 8px;">
-									<button class="option-btn" class:active={$notebookSortMode === 'alphabetical'} onclick={() => { $notebookSortMode = 'alphabetical'; }}>Alphabetical</button>
-									<button class="option-btn" class:active={$notebookSortMode === 'manual'} onclick={() => { $notebookSortMode = 'manual'; }}>Manual</button>
+									<button class="option-btn" class:active={$notebookSortMode === 'alphabetical'} onclick={() => { $notebookSortMode = 'alphabetical'; }}>{$ui("ui.alphabetical")}</button>
+									<button class="option-btn" class:active={$notebookSortMode === 'manual'} onclick={() => { $notebookSortMode = 'manual'; }}>{$ui("ui.manual")}</button>
 								</div>
 							</div>
 
 							{#if !isMobile}
 							<div class="settings-section">
-								<h3>Sidebar</h3>
-								<p class="setting-desc" style="margin: 0 0 10px;">Hide navigation items you don't use, leaving search and the notebook tree. Any item you hide stays reachable from the command palette ({modKey}+P).</p>
+								<h3>{$ui("ui.sidebar")}</h3>
+								<p class="setting-desc" style="margin: 0 0 10px;">{$ui("ui.hide_navigation_items_you_don_t_use_leaving_search_and_the_not_3467aa", { value0: modKey })}</p>
 								<label class="setting-toggle">
-									<span class="setting-label"><span class="setting-name">All Notes</span></span>
-									<button class="toggle-switch" class:on={showAllNotes} role="switch" aria-checked={showAllNotes} aria-label="Show All Notes" onclick={() => { showAllNotes = !showAllNotes; saveGeneralSettings(); }}>
+									<span class="setting-label"><span class="setting-name">{$ui("ui.all_notes")}</span></span>
+									<button class="toggle-switch" class:on={showAllNotes} role="switch" aria-checked={showAllNotes} aria-label={$ui("ui.show_all_notes_44136b")} onclick={() => { showAllNotes = !showAllNotes; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
 								<label class="setting-toggle">
-									<span class="setting-label"><span class="setting-name">Quick Access</span></span>
-									<button class="toggle-switch" class:on={showQuickAccess} role="switch" aria-checked={showQuickAccess} aria-label="Show Quick Access" onclick={() => { showQuickAccess = !showQuickAccess; saveGeneralSettings(); }}>
+									<span class="setting-label"><span class="setting-name">{$ui("ui.quick_access")}</span></span>
+									<button class="toggle-switch" class:on={showQuickAccess} role="switch" aria-checked={showQuickAccess} aria-label={$ui("ui.show_quick_access")} onclick={() => { showQuickAccess = !showQuickAccess; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
 								<label class="setting-toggle">
-									<span class="setting-label"><span class="setting-name">Tasks</span></span>
-									<button class="toggle-switch" class:on={showTasks} role="switch" aria-checked={showTasks} aria-label="Show Tasks" onclick={() => { showTasks = !showTasks; saveGeneralSettings(); }}>
+									<span class="setting-label"><span class="setting-name">{$ui("ui.tasks")}</span></span>
+									<button class="toggle-switch" class:on={showTasks} role="switch" aria-checked={showTasks} aria-label={$ui("ui.show_tasks")} onclick={() => { showTasks = !showTasks; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
 								<label class="setting-toggle">
-									<span class="setting-label"><span class="setting-name">Daily Notes</span></span>
-									<button class="toggle-switch" class:on={showDailyNotes} role="switch" aria-checked={showDailyNotes} aria-label="Show Daily Notes" onclick={() => { showDailyNotes = !showDailyNotes; saveGeneralSettings(); }}>
+									<span class="setting-label"><span class="setting-name">{$ui("ui.daily_notes")}</span></span>
+									<button class="toggle-switch" class:on={showDailyNotes} role="switch" aria-checked={showDailyNotes} aria-label={$ui("ui.show_daily_notes")} onclick={() => { showDailyNotes = !showDailyNotes; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
 								<label class="setting-toggle">
-									<span class="setting-label"><span class="setting-name">Trash</span></span>
-									<button class="toggle-switch" class:on={showTrash} role="switch" aria-checked={showTrash} aria-label="Show Trash" onclick={() => { showTrash = !showTrash; saveGeneralSettings(); }}>
+									<span class="setting-label"><span class="setting-name">{$ui("ui.trash")}</span></span>
+									<button class="toggle-switch" class:on={showTrash} role="switch" aria-checked={showTrash} aria-label={$ui("ui.show_trash")} onclick={() => { showTrash = !showTrash; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
@@ -1419,13 +1470,13 @@
 
 							{#if !$platformIsMobile}
 							<div class="settings-section">
-								<h3>Interface</h3>
+								<h3>{$ui("ui.interface")}</h3>
 								<label class="setting-toggle">
 									<span class="setting-label">
-										<span class="setting-name">Show note switcher in title bar</span>
-										<span class="setting-desc">Show recent and Quick Access notes in the title bar.</span>
+										<span class="setting-name">{$ui("ui.show_note_switcher_in_title_bar")}</span>
+										<span class="setting-desc">{$ui("ui.show_recent_and_quick_access_notes_in_the_title_bar")}</span>
 									</span>
-									<button class="toggle-switch" class:on={showNoteSwitcher} role="switch" aria-checked={showNoteSwitcher} aria-label="Show note switcher in title bar" onclick={() => { showNoteSwitcher = !showNoteSwitcher; saveGeneralSettings(); }}>
+									<button class="toggle-switch" class:on={showNoteSwitcher} role="switch" aria-checked={showNoteSwitcher} aria-label={$ui("ui.show_note_switcher_in_title_bar")} onclick={() => { showNoteSwitcher = !showNoteSwitcher; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
@@ -1433,67 +1484,71 @@
 							{/if}
 
 							<div class="settings-section">
-								<h3>Startup</h3>
+								<h3>{$ui("ui.startup")}</h3>
 								<div class="setting-label">
-									<span class="setting-name">Default view</span>
-									<span class="setting-desc">Used when session restore is off or the previous view is unavailable.</span>
+									<span class="setting-name">{$ui("ui.default_view")}</span>
+									<span class="setting-desc">{$ui("ui.used_when_session_restore_is_off_or_the_previous_view_is_unavailable")}</span>
 								</div>
 								<div class="setting-options" style="margin-top: 8px;">
-									<button class="option-btn" class:active={startupView === 'all'} onclick={() => { startupView = 'all'; saveGeneralSettings(); }}>All Notes</button>
-									<button class="option-btn" class:active={startupView === 'quickaccess'} onclick={() => { startupView = 'quickaccess'; saveGeneralSettings(); }}>Quick Access</button>
-									<button class="option-btn" class:active={startupView === 'tasks'} onclick={() => { startupView = 'tasks'; saveGeneralSettings(); }}>Tasks</button>
-									<button class="option-btn" class:active={startupView === 'daily'} onclick={() => { startupView = 'daily'; saveGeneralSettings(); }}>Daily Notes</button>
+									<button class="option-btn" class:active={startupView === 'all'} onclick={() => { startupView = 'all'; saveGeneralSettings(); }}>{$ui("ui.all_notes")}</button>
+									<button class="option-btn" class:active={startupView === 'quickaccess'} onclick={() => { startupView = 'quickaccess'; saveGeneralSettings(); }}>{$ui("ui.quick_access")}</button>
+									<button class="option-btn" class:active={startupView === 'tasks'} onclick={() => { startupView = 'tasks'; saveGeneralSettings(); }}>{$ui("ui.tasks")}</button>
+									<button class="option-btn" class:active={startupView === 'daily'} onclick={() => { startupView = 'daily'; saveGeneralSettings(); }}>{$ui("ui.daily_notes")}</button>
 								</div>
 								<label class="setting-toggle" style="margin-top: 12px;">
 									<span class="setting-label">
-										<span class="setting-name">Restore last session on launch</span>
-										<span class="setting-desc">Reopen the last view and note when possible. This overrides the default view.</span>
+										<span class="setting-name">{$ui("ui.restore_last_session_on_launch")}</span>
+										<span class="setting-desc">{$ui("ui.reopen_the_last_view_and_note_when_possible_this_overrides_the_ede038")}</span>
 									</span>
-									<button class="toggle-switch" class:on={restoreLastSession} role="switch" aria-checked={restoreLastSession} aria-label="Restore last session on launch" onclick={() => { restoreLastSession = !restoreLastSession; saveGeneralSettings(); }}>
+									<button class="toggle-switch" class:on={restoreLastSession} role="switch" aria-checked={restoreLastSession} aria-label={$ui("ui.restore_last_session_on_launch")} onclick={() => { restoreLastSession = !restoreLastSession; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
 							</div>
 
 							<div class="settings-section">
-								<h3>Time Format</h3>
+								<h3>{$ui("ui.time_format")}</h3>
 								<div class="setting-options">
-									<button class="option-btn" class:active={timeFormat === 'relative'} onclick={() => { timeFormat = 'relative'; saveGeneralSettings(); }}>Relative</button>
-									<button class="option-btn" class:active={timeFormat === '12h'} onclick={() => { timeFormat = '12h'; saveGeneralSettings(); }}>12-hour</button>
-									<button class="option-btn" class:active={timeFormat === '24h'} onclick={() => { timeFormat = '24h'; saveGeneralSettings(); }}>24-hour</button>
+									<button class="option-btn" class:active={timeFormat === 'relative'} onclick={() => { timeFormat = 'relative'; saveGeneralSettings(); }}>{$ui("ui.relative")}</button>
+									<button class="option-btn" class:active={timeFormat === '12h'} onclick={() => { timeFormat = '12h'; saveGeneralSettings(); }}>{$ui("ui.12_hour")}</button>
+									<button class="option-btn" class:active={timeFormat === '24h'} onclick={() => { timeFormat = '24h'; saveGeneralSettings(); }}>{$ui("ui.24_hour")}</button>
 								</div>
 							</div>
 
 							<div class="settings-section">
-								<h3>Start week on</h3>
+								<h3>{$ui("ui.start_week_on")}</h3>
 								<div class="setting-options">
-									<button class="option-btn" class:active={weekStart === 'monday'} onclick={() => { weekStart = 'monday'; saveGeneralSettings(); }}>Monday</button>
-									<button class="option-btn" class:active={weekStart === 'sunday'} onclick={() => { weekStart = 'sunday'; saveGeneralSettings(); }}>Sunday</button>
+									<button class="option-btn" class:active={weekStart === 'monday'} onclick={() => { weekStart = 'monday'; saveGeneralSettings(); }}>{$ui("ui.monday")}</button>
+									<button class="option-btn" class:active={weekStart === 'sunday'} onclick={() => { weekStart = 'sunday'; saveGeneralSettings(); }}>{$ui("ui.sunday")}</button>
 								</div>
 							</div>
 
 							<div class="settings-section">
-								<h3>Daily note title format</h3>
+								<h3>{$ui("ui.daily_note_title_format")}</h3>
 								<div class="setting-options">
-									<button class="option-btn" class:active={dailyTitleFormat === 'localized'} onclick={() => { dailyTitleFormat = 'localized'; saveGeneralSettings(); }}>Localized</button>
+									<button class="option-btn" class:active={dailyTitleFormat === 'localized'} onclick={() => { dailyTitleFormat = 'localized'; saveGeneralSettings(); }}>{$ui("ui.localized")}</button>
 									<button class="option-btn" class:active={dailyTitleFormat === 'iso'} onclick={() => { dailyTitleFormat = 'iso'; saveGeneralSettings(); }}>2026-06-10</button>
-									<button class="option-btn" class:active={dailyTitleFormat === 'long'} onclick={() => { dailyTitleFormat = 'long'; saveGeneralSettings(); }}>June 10, 2026</button>
+									<button class="option-btn" class:active={dailyTitleFormat === 'long'} onclick={() => { dailyTitleFormat = 'long'; saveGeneralSettings(); }}>{$ui("ui.june_10_2026")}</button>
 									<button class="option-btn" class:active={dailyTitleFormat === 'us'} onclick={() => { dailyTitleFormat = 'us'; saveGeneralSettings(); }}>06/10/2026</button>
 									<button class="option-btn" class:active={dailyTitleFormat === 'eu'} onclick={() => { dailyTitleFormat = 'eu'; saveGeneralSettings(); }}>10/06/2026</button>
 								</div>
 							</div>
 
+							{#if $appConfig?.active_vault}
+								<DailyNoteTemplate vaultPath={$appConfig.active_vault} />
+							{/if}
+
 							{#if isMobile}
 							<div class="settings-section">
-								<h3>Vault</h3>
-								<p class="setting-desc" style="margin-bottom: 12px; color: var(--text-tertiary); font-size: 13px;">Current: <strong style="color: var(--text-primary);">{$appConfig?.active_vault?.split('/').pop() ?? 'Unknown'}</strong></p>
+								<h3>{$ui("ui.vault")}</h3>
+								<p class="setting-desc" style="margin-bottom: 12px; color: var(--text-tertiary); font-size: 13px;">{$ui("ui.current")} <strong style="color: var(--text-primary);">{$appConfig?.active_vault?.split('/').pop() ?? 'Unknown'}</strong></p>
 								<button class="import-btn" onclick={async () => { if (!(await onBeforeVaultSwitch())) return; $showSettings = false; $vaultReady = false; }}>
 									<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 										<rect x="3" y="3" width="18" height="16" rx="2"/>
 										<circle cx="12" cy="11" r="3.5"/>
 										<path d="M12 7.5V6M12 16v-1.5M7 19v2M17 19v2"/>
 									</svg>
-									Manage Vaults
+									{$ui("ui.manage_vaults")}
 								</button>
 							</div>
 							{/if}
@@ -1501,45 +1556,45 @@
 
 							{#if !isMobile}
 							<div class="settings-section">
-								<h3>Performance</h3>
+								<h3>{$ui("ui.performance")}</h3>
 								<label class="setting-toggle">
 									<span class="setting-label">
-										<span class="setting-name">GPU Acceleration</span>
-										<span class="setting-desc">Use hardware acceleration for rendering (requires restart)</span>
+										<span class="setting-name">{$ui("ui.gpu_acceleration")}</span>
+										<span class="setting-desc">{$ui("ui.use_hardware_acceleration_for_rendering_requires_restart")}</span>
 									</span>
-									<button class="toggle-switch" class:on={gpuAcceleration} role="switch" aria-checked={gpuAcceleration} aria-label="GPU acceleration" onclick={() => { gpuAcceleration = !gpuAcceleration; saveGeneralSettings(); }}>
+									<button class="toggle-switch" class:on={gpuAcceleration} role="switch" aria-checked={gpuAcceleration} aria-label={$ui("ui.gpu_acceleration_9433c5")} onclick={() => { gpuAcceleration = !gpuAcceleration; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
 							</div>
 
 							<div class="settings-section">
-								<h3>System</h3>
+								<h3>{$ui("ui.system")}</h3>
 								<label class="setting-toggle">
 									<span class="setting-label">
-										<span class="setting-name">Start at system startup</span>
-										<span class="setting-desc">Launch CueLM when your computer starts</span>
+										<span class="setting-name">{$ui("ui.start_at_system_startup")}</span>
+										<span class="setting-desc">{$ui("ui.launch_helixnotes_when_your_computer_starts")}</span>
 									</span>
-									<button class="toggle-switch" class:on={autostart} role="switch" aria-checked={autostart} aria-label="Start at system startup" onclick={() => { autostart = !autostart; saveGeneralSettings(); }}>
+									<button class="toggle-switch" class:on={autostart} role="switch" aria-checked={autostart} aria-label={$ui("ui.start_at_system_startup")} onclick={() => { autostart = !autostart; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
 								<label class="setting-toggle">
 									<span class="setting-label">
-										<span class="setting-name">Show in system tray</span>
-										<span class="setting-desc">Show an icon in the notification area (requires restart)</span>
+										<span class="setting-name">{$ui("ui.show_in_system_tray")}</span>
+										<span class="setting-desc">{$ui("ui.show_an_icon_in_the_notification_area_requires_restart")}</span>
 									</span>
-									<button class="toggle-switch" class:on={showTrayIcon} role="switch" aria-checked={showTrayIcon} aria-label="Show in system tray" onclick={() => { showTrayIcon = !showTrayIcon; if (!showTrayIcon) closeToTray = false; saveGeneralSettings(); }}>
+									<button class="toggle-switch" class:on={showTrayIcon} role="switch" aria-checked={showTrayIcon} aria-label={$ui("ui.show_in_system_tray")} onclick={() => { showTrayIcon = !showTrayIcon; if (!showTrayIcon) closeToTray = false; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
 								{#if showTrayIcon}
 								<label class="setting-toggle">
 									<span class="setting-label">
-										<span class="setting-name">Close to tray</span>
-										<span class="setting-desc">Minimize to tray instead of quitting when closing the window</span>
+										<span class="setting-name">{$ui("ui.close_to_tray")}</span>
+										<span class="setting-desc">{$ui("ui.minimize_to_tray_instead_of_quitting_when_closing_the_window")}</span>
 									</span>
-									<button class="toggle-switch" class:on={closeToTray} role="switch" aria-checked={closeToTray} aria-label="Close to tray" onclick={() => { closeToTray = !closeToTray; saveGeneralSettings(); }}>
+									<button class="toggle-switch" class:on={closeToTray} role="switch" aria-checked={closeToTray} aria-label={$ui("ui.close_to_tray")} onclick={() => { closeToTray = !closeToTray; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
@@ -1550,55 +1605,55 @@
 					{:else if activeTab === 'maintenance'}
 						<div class="tab-content">
 							<div class="settings-section">
-								<h3>Vault Overview</h3>
+								<h3>{$ui("ui.vault_overview")}</h3>
 								{#if vaultStats}
 									<div class="maintenance-stats">
 										<div class="maintenance-stat-row">
-											<span class="maintenance-stat-label">Notes</span>
+											<span class="maintenance-stat-label">{$ui("ui.notes_704400")}</span>
 											<span class="maintenance-stat-value">{vaultStats.total_notes}</span>
 										</div>
 										<div class="maintenance-stat-row">
-											<span class="maintenance-stat-label">Attachments</span>
+											<span class="maintenance-stat-label">{$ui("ui.attachments")}</span>
 											<span class="maintenance-stat-value">{vaultStats.total_attachments}</span>
 										</div>
 										<div class="maintenance-stat-row">
-											<span class="maintenance-stat-label">Notes size</span>
+											<span class="maintenance-stat-label">{$ui("ui.notes_size")}</span>
 											<span class="maintenance-stat-value">{formatVaultSize(vaultStats.notes_size)}</span>
 										</div>
 										<div class="maintenance-stat-row">
-											<span class="maintenance-stat-label">Attachments size</span>
+											<span class="maintenance-stat-label">{$ui("ui.attachments_size")}</span>
 											<span class="maintenance-stat-value">{formatVaultSize(vaultStats.attachments_size)}</span>
 										</div>
 										<div class="maintenance-stat-row maintenance-stat-total">
-											<span class="maintenance-stat-label">Total vault size</span>
+											<span class="maintenance-stat-label">{$ui("ui.total_vault_size")}</span>
 											<span class="maintenance-stat-value">{formatVaultSize(vaultStats.total_size)}</span>
 										</div>
 									</div>
 								{:else if vaultStatsError}
-									<p class="setting-desc">Vault statistics could not be loaded.</p>
+									<p class="setting-desc">{$ui("ui.vault_statistics_could_not_be_loaded")}</p>
 								{:else}
-									<p class="setting-desc">Loading vault statistics…</p>
+									<p class="setting-desc">{$ui("ui.loading_vault_statistics")}</p>
 								{/if}
 							</div>
 
 							<div class="settings-section">
-								<h3>Orphaned Attachments</h3>
+								<h3>{$ui("ui.orphaned_attachments")}</h3>
 								<div class="vault-maintenance">
-									<p class="setting-desc">Review attachment files not referenced by saved notes or icon settings. Save changes in other note windows before scanning.</p>
+									<p class="setting-desc">{$ui("ui.review_attachment_files_not_referenced_by_saved_notes_or_icon_c8e22b")}</p>
 									{#if orphanError}<p class="cleanup-message" role="alert">{orphanError}</p>{/if}
 									{#if orphanedAttachments === null}
 										<button class="import-btn cleanup-action" onclick={scanOrphanedAttachments} disabled={scanningOrphanedAttachments}>
 											{#if scanningOrphanedAttachments}
 												<svg class="spinner-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" opacity="0.25" /><path d="M12 2a10 10 0 019.95 9" /></svg>
-												Scanning…
+												{$ui("ui.scanning")}
 											{:else}
-												Find orphaned attachments
+												{$ui("ui.find_orphaned_attachments")}
 											{/if}
 										</button>
 									{:else if orphanedAttachments.length === 0}
-										<p class="cleanup-message">No orphaned attachments. Nothing to clean up.</p>
+										<p class="cleanup-message">{$ui("ui.no_orphaned_attachments_nothing_to_clean_up")}</p>
 									{:else}
-										<p class="cleanup-message">{orphanedAttachments.length} {orphanedAttachments.length === 1 ? 'attachment is' : 'attachments are'} not referenced by any note ({formatVaultSize(orphanedAttachmentTotal)}).</p>
+										<p class="cleanup-message">{$ui("ui.not_referenced_by_any_note", { value0: orphanedAttachments.length, value1: orphanedAttachments.length === 1 ? 'attachment is' : 'attachments are', value2: formatVaultSize(orphanedAttachmentTotal) })}</p>
 										<div class="cleanup-list">
 											{#each orphanedAttachments as attachment}
 												<div class="cleanup-row">
@@ -1610,12 +1665,12 @@
 										<button class="import-btn cleanup-action" onclick={trashFoundOrphanedAttachments} disabled={trashingOrphanedAttachments}>
 											{#if trashingOrphanedAttachments}
 												<svg class="spinner-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" opacity="0.25" /><path d="M12 2a10 10 0 019.95 9" /></svg>
-												Moving…
+												{$ui("ui.moving")}
 											{:else}
-												Move {orphanedAttachments.length} to Trash
+												{$ui("ui.move_to_trash_500366", { value0: orphanedAttachments.length })}
 											{/if}
 										</button>
-										<p class="cleanup-hint">Moved to the vault's trash folder (recoverable), not permanently deleted.</p>
+										<p class="cleanup-hint">{$ui("ui.moved_to_the_vault_s_trash_folder_recoverable_not_permanently_deleted")}</p>
 									{/if}
 								</div>
 							</div>
@@ -1623,65 +1678,57 @@
 					{:else if activeTab === 'editor'}
 						<div class="tab-content">
 							<div class="settings-section">
-								<h3>Title</h3>
+								<h3>{$ui("ui.title")}</h3>
 								<label class="setting-toggle">
 									<span class="setting-label">
-										<span class="setting-name">Hide title in note body</span>
-										<span class="setting-desc">Hide the first heading when it matches the note title</span>
+										<span class="setting-name">{$ui("ui.hide_title_in_note_body")}</span>
+										<span class="setting-desc">{$ui("ui.hide_the_first_heading_when_it_matches_the_note_title")}</span>
 									</span>
-									<button class="toggle-switch" class:on={hideTitleInBody} role="switch" aria-checked={hideTitleInBody} aria-label="Hide title in note body" onclick={() => { hideTitleInBody = !hideTitleInBody; saveGeneralSettings(); }}>
+									<button class="toggle-switch" class:on={hideTitleInBody} role="switch" aria-checked={hideTitleInBody} aria-label={$ui("ui.hide_title_in_note_body")} onclick={() => { hideTitleInBody = !hideTitleInBody; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
 								<label class="setting-toggle" style="margin-top: 12px;">
 									<span class="setting-label">
-										<span class="setting-name">Show link arrows</span>
-										<span class="setting-desc">Display the arrow icon after external links</span>
+										<span class="setting-name">{$ui("ui.show_link_arrows")}</span>
+										<span class="setting-desc">{$ui("ui.display_the_arrow_icon_after_external_links")}</span>
 									</span>
-									<button class="toggle-switch" class:on={showLinkArrows} role="switch" aria-checked={showLinkArrows} aria-label="Show link arrows" onclick={() => { showLinkArrows = !showLinkArrows; saveGeneralSettings(); applyLinkArrows(); }}>
+									<button class="toggle-switch" class:on={showLinkArrows} role="switch" aria-checked={showLinkArrows} aria-label={$ui("ui.show_link_arrows")} onclick={() => { showLinkArrows = !showLinkArrows; saveGeneralSettings(); applyLinkArrows(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
 								{#if !isMobile}
 								<label class="setting-toggle" style="margin-top: 12px;">
 									<span class="setting-label">
-										<span class="setting-name">Show line numbers</span>
-										<span class="setting-desc">Display line numbers in the markdown source editor</span>
+										<span class="setting-name">{$ui("ui.show_line_numbers")}</span>
+										<span class="setting-desc">{$ui("ui.display_line_numbers_in_the_markdown_source_editor")}</span>
 									</span>
-									<button class="toggle-switch" class:on={showLineNumbers} role="switch" aria-checked={showLineNumbers} aria-label="Show line numbers" onclick={() => { showLineNumbers = !showLineNumbers; saveGeneralSettings(); }}>
+									<button class="toggle-switch" class:on={showLineNumbers} role="switch" aria-checked={showLineNumbers} aria-label={$ui("ui.show_line_numbers")} onclick={() => { showLineNumbers = !showLineNumbers; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
 								{/if}
 								<label class="setting-toggle" style="margin-top: 12px;">
 									<span class="setting-label">
-										<span class="setting-name">Open notes in View Mode</span>
-										<span class="setting-desc">Notes open as read-only by default. Click the eye icon to switch to editing.</span>
+										<span class="setting-name">{$ui("ui.open_notes_in_view_mode")}</span>
+										<span class="setting-desc">{$ui("ui.notes_open_as_read_only_by_default_click_the_eye_icon_to_switc_df703a")}</span>
 									</span>
-									<button class="toggle-switch" class:on={defaultViewMode} role="switch" aria-checked={defaultViewMode} aria-label="Open notes in View Mode" onclick={() => { defaultViewMode = !defaultViewMode; saveGeneralSettings(); }}>
+									<button class="toggle-switch" class:on={defaultViewMode} role="switch" aria-checked={defaultViewMode} aria-label={$ui("ui.open_notes_in_view_mode")} onclick={() => { defaultViewMode = !defaultViewMode; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
-								<label class="setting-toggle" style="margin-top: 12px;">
-									<span class="setting-label">
-										<span class="setting-name">Open new notes in source mode</span>
-										<span class="setting-desc">Start empty notes in the plain-text Markdown editor instead of rich-text mode</span>
-									</span>
-									<button class="toggle-switch" class:on={newNotesInSourceMode} role="switch" aria-checked={newNotesInSourceMode} aria-label="Open new notes in source mode" onclick={() => { newNotesInSourceMode = !newNotesInSourceMode; saveGeneralSettings(); }}>
-										<span class="toggle-knob"></span>
-									</button>
-								</label>
+								<NewNoteEditorSetting value={newNoteMode} onchange={saveNewNoteMode} />
 							</div>
 
 
 							<div class="settings-section">
-								<h3>Wiki Links & Graph</h3>
+								<h3>{$ui("ui.wiki_links_graph")}</h3>
 								<label class="setting-toggle">
 									<span class="setting-label">
-										<span class="setting-name">Enable wiki links</span>
-										<span class="setting-desc">Link notes with [[Note Title]] syntax and visualize connections in a graph view</span>
+										<span class="setting-name">{$ui("ui.enable_wiki_links")}</span>
+										<span class="setting-desc">{$ui("ui.link_notes_with_note_title_syntax_and_visualize_connections_in_400c92")}</span>
 									</span>
-									<button class="toggle-switch" class:on={enableWikiLinks} role="switch" aria-checked={enableWikiLinks} aria-label="Enable wiki links" onclick={() => { enableWikiLinks = !enableWikiLinks; saveGeneralSettings(); }}>
+									<button class="toggle-switch" class:on={enableWikiLinks} role="switch" aria-checked={enableWikiLinks} aria-label={$ui("ui.enable_wiki_links")} onclick={() => { enableWikiLinks = !enableWikiLinks; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
@@ -1690,13 +1737,13 @@
 
 							{#if !isMobile}
 							<div class="settings-section">
-								<h3>PDF Preview</h3>
+								<h3>{$ui("ui.pdf_preview")}</h3>
 								<label class="setting-toggle">
 									<span class="setting-label">
-										<span class="setting-name">Inline PDF preview</span>
-										<span class="setting-desc">Render embedded PDF files as inline previews inside notes</span>
+										<span class="setting-name">{$ui("ui.inline_pdf_preview")}</span>
+										<span class="setting-desc">{$ui("ui.render_embedded_pdf_files_as_inline_previews_inside_notes")}</span>
 									</span>
-									<button class="toggle-switch" class:on={pdfPreview} role="switch" aria-checked={pdfPreview} aria-label="Inline PDF preview" onclick={() => { pdfPreview = !pdfPreview; saveGeneralSettings(); }}>
+									<button class="toggle-switch" class:on={pdfPreview} role="switch" aria-checked={pdfPreview} aria-label={$ui("ui.inline_pdf_preview")} onclick={() => { pdfPreview = !pdfPreview; saveGeneralSettings(); }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
@@ -1704,7 +1751,7 @@
 
 							{#if pdfPreview}
 								<div class="settings-section">
-									<h3>PDF Height</h3>
+									<h3>{$ui("ui.pdf_height")}</h3>
 									<div class="font-size-options">
 										{#each pdfHeightPresets as preset}
 											<button
@@ -1712,12 +1759,12 @@
 												class:active={pdfHeight === preset.value}
 												onclick={() => { pdfHeight = preset.value; saveGeneralSettings(); }}
 											>
-												<span class="font-size-label">{preset.label}</span>
-												<span class="font-size-value">{preset.value}px</span>
+												<span class="font-size-label">{$uiLabel(preset.label)}</span>
+												<span class="font-size-value">{$ui("ui.px", { value0: preset.value })}</span>
 											</button>
 										{/each}
 									</div>
-									<span class="setting-hint">Default height for PDF previews in notes</span>
+									<span class="setting-hint">{$ui("ui.default_height_for_pdf_previews_in_notes")}</span>
 								</div>
 							{/if}
 						{/if}
@@ -1726,7 +1773,7 @@
 						<div class="tab-content">
 							<div class="two-col-sections">
 							<div class="settings-section">
-								<h3>Theme</h3>
+								<h3>{$ui("ui.theme")}</h3>
 								<div class="dropdown-wrap">
 									<button
 										class="dropdown-trigger"
@@ -1739,7 +1786,7 @@
 												<span class="preview-accent-bar"></span>
 											</span>
 										</span>
-										<span class="dropdown-trigger-label">{activeThemePreset.label}</span>
+										<span class="dropdown-trigger-label">{$uiLabel(activeThemePreset.label)}</span>
 										<svg class="dropdown-chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
 									</button>
 									{#if themeDropdownOpen}
@@ -1756,7 +1803,7 @@
 															<span class="preview-accent-bar"></span>
 														</span>
 													</span>
-													<span class="dropdown-item-label">{preset.label}</span>
+													<span class="dropdown-item-label">{$uiLabel(preset.label)}</span>
 													{#if $theme === preset.id}
 														<svg class="dropdown-check" viewBox="0 0 16 16" fill="none"><path d="M3 8l4 4 6-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
 													{/if}
@@ -1766,12 +1813,12 @@
 									{/if}
 								</div>
 								{#if $theme === 'system'}
-									<span class="setting-hint">Follows the operating system appearance.</span>
+									<span class="setting-hint">{$ui("ui.follows_the_operating_system_appearance")}</span>
 								{/if}
 							</div>
 
 							<div class="settings-section">
-								<h3>Accent Color</h3>
+								<h3>{$ui("ui.accent_color")}</h3>
 								<div class="dropdown-wrap">
 									<button
 										class="dropdown-trigger"
@@ -1779,7 +1826,7 @@
 										onclick={() => { accentDropdownOpen = !accentDropdownOpen; themeDropdownOpen = false; }}
 									>
 										<span class="accent-dot" style="background: {activeAccentColor}"></span>
-										<span class="dropdown-trigger-label">{isCustomAccent ? 'Custom' : activeAccentPreset.name}</span>
+										<span class="dropdown-trigger-label">{isCustomAccent ? $ui("ui.custom") : $uiLabel(activeAccentPreset.name)}</span>
 										<svg class="dropdown-chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
 									</button>
 									{#if accentDropdownOpen}
@@ -1791,7 +1838,7 @@
 													onclick={() => { selectAccent(preset); accentDropdownOpen = false; }}
 												>
 													<span class="accent-dot" style="background: {isThemeDark ? preset.dark : preset.light}"></span>
-													<span class="dropdown-item-label">{preset.name}</span>
+													<span class="dropdown-item-label">{$uiLabel(preset.name)}</span>
 													{#if activeAccent === preset.name}
 														<svg class="dropdown-check" viewBox="0 0 16 16" fill="none"><path d="M3 8l4 4 6-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
 													{/if}
@@ -1800,7 +1847,7 @@
 											<div class="dropdown-divider"></div>
 											<label class="dropdown-item custom-accent-item" class:active={isCustomAccent}>
 												<span class="accent-dot" style="background: {customAccentColor}"></span>
-												<span class="dropdown-item-label">Custom</span>
+												<span class="dropdown-item-label">{$ui("ui.custom")}</span>
 												<input
 													type="color"
 													class="color-wheel-input"
@@ -1820,7 +1867,7 @@
 							{#if $theme === 'system'}
 								{#each systemPairRows as row}
 									<div class="settings-section">
-										<h3>{row.title}</h3>
+										<h3>{$uiLabel(row.title)}</h3>
 										<div class="dropdown-wrap">
 											<button
 												class="dropdown-trigger"
@@ -1834,7 +1881,7 @@
 															<span class="preview-accent-bar"></span>
 														</span>
 													</span>
-													<span class="dropdown-trigger-label">{preset.label}</span>
+													<span class="dropdown-trigger-label">{preset.id.startsWith('custom-') ? preset.label : $uiLabel(preset.label)}</span>
 												{/each}
 												<svg class="dropdown-chevron" viewBox="0 0 16 16" fill="none"><path d="M4 6l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
 											</button>
@@ -1852,7 +1899,7 @@
 																	<span class="preview-accent-bar"></span>
 																</span>
 															</span>
-															<span class="dropdown-item-label">{preset.label}</span>
+															<span class="dropdown-item-label">{preset.id.startsWith('custom-') ? preset.label : $uiLabel(preset.label)}</span>
 															{#if row.selected === preset.id}
 																<svg class="dropdown-check" viewBox="0 0 16 16" fill="none"><path d="M3 8l4 4 6-6" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
 															{/if}
@@ -1869,10 +1916,10 @@
 							<!-- Custom Themes -->
 							<div class="settings-section">
 								<div class="section-header-row">
-									<h3>Custom Themes</h3>
+									<h3>{$ui("ui.custom_themes")}</h3>
 									<button class="create-theme-btn" onclick={openNewCustomThemeEditor}>
 										<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-										New Theme
+										{$ui("ui.new_theme")}
 									</button>
 								</div>
 
@@ -1880,7 +1927,7 @@
 									<div class="custom-theme-list">
 										{#each $customThemes as ct}
 											<div class="custom-theme-row" class:active={$theme === ct.id}>
-												<button class="custom-theme-swatch-btn" onclick={() => selectCustomTheme(ct)} title="Apply {ct.name}">
+												<button class="custom-theme-swatch-btn" onclick={() => selectCustomTheme(ct)} title={$ui("ui.apply_025e87", { value0: ct.name })}>
 													<span class="custom-theme-swatch" style="background: {ct.colors.bg_primary}; border-color: {ct.colors.border_color}">
 														<span class="swatch-sidebar" style="background: {ct.colors.bg_secondary}"></span>
 													</span>
@@ -1890,11 +1937,11 @@
 													{/if}
 												</button>
 												<div class="custom-theme-actions">
-													<button class="icon-btn" title="Edit" onclick={() => openEditCustomThemeEditor(ct)}>
+													<button class="icon-btn" title={$ui("ui.edit")} onclick={() => openEditCustomThemeEditor(ct)}>
 														<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.174 6.812a1 1 0 00-3.986-3.987L3.842 16.174a2 2 0 00-.5.83l-1.321 4.352a.5.5 0 00.623.622l4.353-1.32a2 2 0 00.83-.497z"/></svg>
 													</button>
 													{#if !isMobile}
-													<button class="icon-btn" title="Export" disabled={customThemeExportingId === ct.id} onclick={() => handleExportCustomTheme(ct)}>
+													<button class="icon-btn" title={$ui("ui.export")} disabled={customThemeExportingId === ct.id} onclick={() => handleExportCustomTheme(ct)}>
 														<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
 													</button>
 													{/if}
@@ -1906,14 +1953,14 @@
 										{/each}
 									</div>
 								{:else}
-									<p class="setting-hint" style="margin-top: 8px;">No custom themes yet. Create one to define your own colors.</p>
+									<p class="setting-hint" style="margin-top: 8px;">{$ui("ui.no_custom_themes_yet_create_one_to_define_your_own_colors")}</p>
 								{/if}
 
 								{#if !isMobile}
 									<div class="custom-theme-io">
 										<button class="backup-link-btn" onclick={handleImportCustomThemes} disabled={customThemeImporting}>
 											<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-											{customThemeImporting ? 'Importing...' : 'Import theme'}
+											{customThemeImporting ? $ui("ui.importing") : $ui("ui.import_theme")}
 										</button>
 									</div>
 								{/if}
@@ -1936,29 +1983,29 @@
 								<div class="custom-theme-modal-overlay" onclick={cancelCustomThemeFromOverlay} onkeydown={handleEscape}>
 									<div class="custom-theme-modal" role="dialog" aria-modal="true" aria-labelledby="custom-theme-title" tabindex="-1">
 										<div class="custom-theme-modal-header">
-											<h3 id="custom-theme-title">{customThemeEditing.id.startsWith('custom-') && $customThemes.some(c => c.id === customThemeEditing!.id) ? 'Edit Theme' : 'New Custom Theme'}</h3>
-											<button class="close-btn" onclick={cancelCustomThemeEditor} aria-label="Close theme editor">
+											<h3 id="custom-theme-title">{customThemeEditing.id.startsWith('custom-') && $customThemes.some(c => c.id === customThemeEditing!.id) ? $ui("ui.edit_theme") : $ui("ui.new_custom_theme")}</h3>
+											<button class="close-btn" onclick={cancelCustomThemeEditor} aria-label={$ui("ui.close_theme_editor")}>
 												<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
 											</button>
 										</div>
 
 										<div class="custom-theme-modal-body">
 											<div class="ct-field">
-												<label class="ct-label" for="custom-theme-name">Theme Name</label>
-												<input id="custom-theme-name" class="ct-name-input" type="text" placeholder="My Theme" bind:value={customThemeEditing.name} maxlength={40} />
+												<label class="ct-label" for="custom-theme-name">{$ui("ui.theme_name")}</label>
+												<input id="custom-theme-name" class="ct-name-input" type="text" placeholder={$ui("ui.my_theme")} bind:value={customThemeEditing.name} maxlength={40} />
 											</div>
 
 											<div class="ct-field">
-												<span class="ct-label">Mode</span>
+												<span class="ct-label">{$ui("ui.mode")}</span>
 												<div class="setting-options">
-													<button class="option-btn" class:active={!customThemeEditing.is_dark} onclick={() => { if (customThemeEditing) { customThemeEditing.is_dark = false; previewCustomTheme(); } }}>Light</button>
-													<button class="option-btn" class:active={customThemeEditing.is_dark} onclick={() => { if (customThemeEditing) { customThemeEditing.is_dark = true; previewCustomTheme(); } }}>Dark</button>
+													<button class="option-btn" class:active={!customThemeEditing.is_dark} onclick={() => { if (customThemeEditing) { customThemeEditing.is_dark = false; previewCustomTheme(); } }}>{$ui("ui.light")}</button>
+													<button class="option-btn" class:active={customThemeEditing.is_dark} onclick={() => { if (customThemeEditing) { customThemeEditing.is_dark = true; previewCustomTheme(); } }}>{$ui("ui.dark")}</button>
 												</div>
 											</div>
 
 											<div class="ct-colors-grid">
 												<div class="ct-color-group">
-													<span class="ct-group-label">Backgrounds</span>
+													<span class="ct-group-label">{$ui("ui.backgrounds")}</span>
 													{#each [
 														{ key: 'bg_primary', label: 'Primary' },
 														{ key: 'bg_secondary', label: 'Sidebar' },
@@ -1974,13 +2021,13 @@
 																value={customThemeEditing.colors[field.key as keyof CustomThemeColors]}
 																oninput={(e) => { if (customThemeEditing) { (customThemeEditing.colors as any)[field.key] = e.currentTarget.value; previewCustomTheme(); } }}
 															/>
-															<span class="ct-color-label">{field.label}</span>
+															<span class="ct-color-label">{$uiLabel(field.label)}</span>
 														</label>
 													{/each}
 												</div>
 
 												<div class="ct-color-group">
-													<span class="ct-group-label">Text &amp; Borders</span>
+													<span class="ct-group-label">{$ui("ui.text_borders")}</span>
 													{#each [
 														{ key: 'text_primary', label: 'Primary Text' },
 														{ key: 'text_secondary', label: 'Secondary Text' },
@@ -1993,14 +2040,14 @@
 																value={customThemeEditing.colors[field.key as keyof CustomThemeColors]}
 																oninput={(e) => { if (customThemeEditing) { (customThemeEditing.colors as any)[field.key] = e.currentTarget.value; previewCustomTheme(); } }}
 															/>
-															<span class="ct-color-label">{field.label}</span>
+															<span class="ct-color-label">{$uiLabel(field.label)}</span>
 														</label>
 													{/each}
 												</div>
 											</div>
 
 											<div class="ct-preview">
-												<span class="ct-preview-label">Preview</span>
+												<span class="ct-preview-label">{$ui("ui.preview")}</span>
 												<div class="ct-preview-window" style="--p-bg: {customThemeEditing.colors.bg_primary}; --p-sidebar: {customThemeEditing.colors.bg_secondary}; --p-card: {customThemeEditing.colors.bg_tertiary}; --p-text: {customThemeEditing.colors.text_primary}; --p-text2: {customThemeEditing.colors.text_secondary}; --p-border: {customThemeEditing.colors.border_color}; --p-hover: {customThemeEditing.colors.bg_hover};">
 													<div class="ct-preview-sidebar">
 														<div class="ct-preview-item active"></div>
@@ -2018,15 +2065,15 @@
 										</div>
 
 										<div class="custom-theme-modal-footer">
-											<button class="cancel-btn" onclick={cancelCustomThemeEditor}>Cancel</button>
-											<button class="save-btn" onclick={saveCustomThemeEditor} disabled={!customThemeEditing.name.trim()}>Save Theme</button>
+											<button class="cancel-btn" onclick={cancelCustomThemeEditor}>{$ui("ui.cancel")}</button>
+											<button class="save-btn" onclick={saveCustomThemeEditor} disabled={!customThemeEditing.name.trim()}>{$ui("ui.save_theme")}</button>
 										</div>
 									</div>
 								</div>
 							{/if}
 
 							<div class="settings-section">
-								<h3>Font Size</h3>
+								<h3>{$ui("ui.font_size")}</h3>
 								<div class="font-size-options">
 									{#each fontSizePresets as preset}
 										<button
@@ -2034,18 +2081,18 @@
 											class:active={activeFontSize === preset.size}
 											onclick={() => selectFontSize(preset.size)}
 										>
-											<span class="font-size-label">{preset.label}</span>
-											<span class="font-size-value">{preset.size}px</span>
+											<span class="font-size-label">{$uiLabel(preset.label)}</span>
+											<span class="font-size-value">{$ui("ui.px", { value0: preset.size })}</span>
 										</button>
 									{/each}
 								</div>
 								{#if !isMobile}
 									<label class="setting-toggle">
 										<span class="setting-label">
-											<span class="setting-name">Scroll to change font size</span>
-											<span class="setting-desc">Allow Cmd/Ctrl + scroll to resize editor text</span>
+											<span class="setting-name">{$ui("ui.scroll_to_change_font_size")}</span>
+											<span class="setting-desc">{$ui("ui.allow_cmd_ctrl_scroll_to_resize_editor_text")}</span>
 										</span>
-										<button class="toggle-switch" class:on={scrollToChangeFontSize} role="switch" aria-checked={scrollToChangeFontSize} aria-label="Scroll to change font size" onclick={toggleScrollToChangeFontSize}>
+										<button class="toggle-switch" class:on={scrollToChangeFontSize} role="switch" aria-checked={scrollToChangeFontSize} aria-label={$ui("ui.scroll_to_change_font_size")} onclick={toggleScrollToChangeFontSize}>
 											<span class="toggle-knob"></span>
 										</button>
 									</label>
@@ -2054,7 +2101,7 @@
 
 							{#if !isMobile || isAndroid}
 								<div class="settings-section">
-									<h3>Interface Scale</h3>
+									<h3>{$ui("ui.interface_scale")}</h3>
 									<div class="font-size-options">
 										{#each uiScalePresets as preset}
 											<button
@@ -2062,17 +2109,17 @@
 												class:active={activeUiScale === preset.value}
 												onclick={() => selectUiScale(preset.value)}
 											>
-												<span class="font-size-label">{preset.label}</span>
+												<span class="font-size-label">{$uiLabel(preset.label)}</span>
 											</button>
 										{/each}
 									</div>
-									<p class="setting-hint">Zooms the whole app: every panel, menu, and the editor. Use Default ({Math.round(defaultUiScale * 100)}%) to reset.</p>
+									<p class="setting-hint">{$ui("ui.zooms_the_whole_app_every_panel_menu_and_the_editor_use_default_to_reset", { value0: Math.round(defaultUiScale * 100) })}</p>
 								</div>
 							{/if}
 
 							{#if !isMobile}
 								<div class="settings-section">
-									<h3>Note Width</h3>
+									<h3>{$ui("ui.note_width")}</h3>
 									<div class="font-size-options">
 										{#each contentWidthPresets as preset}
 											<button
@@ -2080,16 +2127,16 @@
 												class:active={activeContentWidth === preset.value}
 												onclick={() => selectContentWidth(preset.value)}
 											>
-												<span class="font-size-label">{preset.label}</span>
+												<span class="font-size-label">{$uiLabel(preset.label)}</span>
 											</button>
 										{/each}
 									</div>
-									<p class="setting-hint">Caps the width of the note text for easier reading on wide screens; the column stays centered. Most noticeable in Focus Mode. "Full" uses the entire width.</p>
+									<p class="setting-hint">{$ui("ui.caps_the_width_of_the_note_text_for_easier_reading_on_wide_scr_01d029")}</p>
 								</div>
 							{/if}
 
 							<div class="settings-section">
-								<h3>Line Spacing</h3>
+								<h3>{$ui("ui.line_spacing")}</h3>
 								<div class="font-size-options">
 									{#each lineHeightPresets as preset}
 										<button
@@ -2097,16 +2144,16 @@
 											class:active={activeLineHeight === preset.value}
 											onclick={() => selectLineHeight(preset.value)}
 										>
-											<span class="font-size-label">{preset.label}</span>
+											<span class="font-size-label">{$uiLabel(preset.label)}</span>
 											<span class="font-size-value">{preset.value}</span>
 										</button>
 									{/each}
 								</div>
-								<p class="setting-hint">Sets the spacing in the editor. Text copied to Word or email is pasted with single spacing.</p>
+								<p class="setting-hint">{$ui("ui.sets_the_spacing_in_the_editor_text_copied_to_word_or_email_is_cfff75")}</p>
 							</div>
 
 							<div class="settings-section">
-								<h3>Font</h3>
+								<h3>{$ui("ui.font")}</h3>
 								<div class="font-family-options">
 									{#each fontFamilyPresets as preset}
 										<button
@@ -2114,7 +2161,7 @@
 											class:active={activeFontFamily === preset.value}
 											onclick={() => selectFontFamily(preset)}
 										>
-											<span class="font-family-preview" style="font-family: {preset.stack}">Aa</span>
+											<span class="font-family-preview" style="font-family: {preset.stack}">{$ui("ui.aa")}</span>
 											<span class="font-family-name">{preset.name}</span>
 										</button>
 									{/each}
@@ -2124,26 +2171,26 @@
 					{:else if activeTab === 'backup'}
 						<div class="tab-content">
 							<div class="settings-section">
-								<h3>Automatic Backup</h3>
+								<h3>{$ui("ui.automatic_backup")}</h3>
 
 								<label class="setting-toggle">
-									<span>Enable automatic backup</span>
-									<button class="toggle-switch" class:on={$appConfig?.backup_enabled} role="switch" aria-checked={$appConfig?.backup_enabled ?? false} aria-label="Enable automatic backup" onclick={() => { if ($appConfig) { $appConfig = { ...$appConfig, backup_enabled: !$appConfig.backup_enabled }; saveBackupSettings(); } }}>
+									<span>{$ui("ui.enable_automatic_backup")}</span>
+									<button class="toggle-switch" class:on={$appConfig?.backup_enabled} role="switch" aria-checked={$appConfig?.backup_enabled ?? false} aria-label={$ui("ui.enable_automatic_backup")} onclick={() => { if ($appConfig) { $appConfig = { ...$appConfig, backup_enabled: !$appConfig.backup_enabled }; saveBackupSettings(); } }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
 
 								<div class="backup-setting-group">
-									<span class="backup-setting-label">Backup frequency</span>
+									<span class="backup-setting-label">{$ui("ui.backup_frequency")}</span>
 									<div class="setting-options">
 										{#each [{ value: '1h', label: '1 hour' }, { value: '6h', label: '6 hours' }, { value: '12h', label: '12 hours' }, { value: '24h', label: '24 hours' }] as opt}
-											<button class="option-btn" class:active={($appConfig?.backup_frequency ?? '24h') === opt.value} onclick={() => { if ($appConfig) { $appConfig = { ...$appConfig, backup_frequency: opt.value }; saveBackupSettings(); } }}>{opt.label}</button>
+											<button class="option-btn" class:active={($appConfig?.backup_frequency ?? '24h') === opt.value} onclick={() => { if ($appConfig) { $appConfig = { ...$appConfig, backup_frequency: opt.value }; saveBackupSettings(); } }}>{$uiLabel(opt.label)}</button>
 										{/each}
 									</div>
 								</div>
 
 								<div class="backup-setting-group">
-									<span class="backup-setting-label">Maximum backups</span>
+									<span class="backup-setting-label">{$ui("ui.maximum_backups")}</span>
 									<div class="setting-options">
 										{#each [5, 10, 20, 50] as count}
 											<button class="option-btn" class:active={($appConfig?.backup_max_count ?? 10) === count} onclick={() => { if ($appConfig) { $appConfig = { ...$appConfig, backup_max_count: count }; saveBackupSettings(); } }}>{count}</button>
@@ -2153,10 +2200,10 @@
 
 								<label class="setting-toggle">
 									<span class="setting-label">
-										<span class="setting-name">Include attachments</span>
-										<span class="setting-desc">Include images and files in backups (increases size significantly)</span>
+										<span class="setting-name">{$ui("ui.include_attachments")}</span>
+										<span class="setting-desc">{$ui("ui.include_images_and_files_in_backups_increases_size_significantly")}</span>
 									</span>
-									<button class="toggle-switch" class:on={$appConfig?.backup_include_attachments} role="switch" aria-checked={$appConfig?.backup_include_attachments ?? false} aria-label="Include attachments in backups" onclick={() => { if ($appConfig) { $appConfig = { ...$appConfig, backup_include_attachments: !$appConfig.backup_include_attachments }; saveBackupSettings(); } }}>
+									<button class="toggle-switch" class:on={$appConfig?.backup_include_attachments} role="switch" aria-checked={$appConfig?.backup_include_attachments ?? false} aria-label={$ui("ui.include_attachments_in_backups")} onclick={() => { if ($appConfig) { $appConfig = { ...$appConfig, backup_include_attachments: !$appConfig.backup_include_attachments }; saveBackupSettings(); } }}>
 										<span class="toggle-knob"></span>
 									</button>
 								</label>
@@ -2167,7 +2214,7 @@
 										<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 											<path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z"/>
 										</svg>
-										{$appConfig?.backup_location ? 'Change backup folder' : 'Select backup folder'}
+										{$appConfig?.backup_location ? $ui("ui.change_backup_folder") : $ui("ui.select_backup_folder")}
 									</button>
 									{#if $appConfig?.backup_location}
 										<p class="backup-path">{$appConfig.backup_location}</p>
@@ -2176,23 +2223,23 @@
 									<button class="backup-link-btn" onclick={handleBackupNow} disabled={backupLoading}>
 										{#if backupLoading}
 											<svg class="spinner-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" opacity="0.25" /><path d="M12 2a10 10 0 019.95 9" /></svg>
-											Backing up...
+											{$ui("ui.backing_up")}
 										{:else}
 											<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 												<path d="M19 21H5a2 2 0 01-2-2V5a2 2 0 012-2h11l5 5v11a2 2 0 01-2 2z" />
 												<polyline points="17 21 17 13 7 13 7 21" />
 												<polyline points="7 3 7 8 15 8" />
 											</svg>
-											Backup now
+											{$ui("ui.backup_now")}
 										{/if}
 									</button>
 								</div>
 
 								<p class="backup-last-time">
 									{#if lastBackupTime}
-										Last backup: {formatBackupDate(lastBackupTime)}
+										{$ui("ui.last_backup", { value0: formatBackupDate(lastBackupTime) })}
 									{:else}
-										No backups yet
+										{$ui("ui.no_backups_yet")}
 									{/if}
 								</p>
 
@@ -2209,9 +2256,9 @@
 							</div>
 
 							<div class="settings-section">
-								<h3>Restore Backup</h3>
+								<h3>{$ui("ui.restore_backup")}</h3>
 								{#if backups.length === 0}
-									<p class="backup-empty">No backups found</p>
+									<p class="backup-empty">{$ui("ui.no_backups_found")}</p>
 								{:else}
 									<div class="backup-list">
 										{#each backups as entry}
@@ -2220,11 +2267,11 @@
 													<span class="backup-date">{formatBackupDate(entry.created)}</span>
 													<span class="backup-size">{formatBackupSize(entry.size)}</span>
 													{#if entry.other_vault}
-														<span class="backup-size" title="This backup was made from a different vault folder">other vault</span>
+														<span class="backup-size" title={$ui("ui.this_backup_was_made_from_a_different_vault_folder")}>{$ui("ui.other_vault")}</span>
 													{/if}
 												</div>
 												<div class="backup-item-actions">
-													<button class="backup-action-btn" title="Restore" onclick={() => restoreConfirm = entry}>
+													<button class="backup-action-btn" title={$ui("ui.restore")} onclick={() => restoreConfirm = entry}>
 														<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 															<polyline points="1 4 1 10 7 10" />
 															<path d="M3.51 15a9 9 0 102.13-9.36L1 10" />
@@ -2247,14 +2294,14 @@
 								<!-- svelte-ignore a11y_no_static_element_interactions -->
 								<div class="restore-confirm-overlay" onclick={dismissRestoreConfirm} onkeydown={handleEscape}>
 									<div class="restore-confirm" role="alertdialog" aria-modal="true" aria-labelledby="restore-confirm-title" tabindex="-1">
-										<h4 id="restore-confirm-title">Restore Backup?</h4>
-										<p>This will replace all notes in your vault with the backup from <strong>{formatBackupDate(restoreConfirm.created)}</strong>. This action cannot be undone.</p>
+										<h4 id="restore-confirm-title">{$ui("ui.restore_backup_e97bd3")}</h4>
+										<p>{$ui("ui.this_will_replace_all_notes_in_your_vault_with_the_backup_from")} <strong>{formatBackupDate(restoreConfirm.created)}</strong>{$ui("ui.this_action_cannot_be_undone")}</p>
 										{#if restoreConfirm.other_vault}
-											<p><strong>This backup was made from a different vault folder.</strong> Restoring it replaces this vault's notes with that vault's. Continue only if this vault was moved or renamed since then.</p>
+											<p><strong>{$ui("ui.this_backup_was_made_from_a_different_vault_folder_5583a1")}</strong> {$ui("ui.restoring_it_replaces_this_vault_s_notes_with_that_vault_s_con_c2f4dc")}</p>
 										{/if}
 										<div class="restore-confirm-actions">
-											<button class="restore-cancel" onclick={() => restoreConfirm = null}>Cancel</button>
-											<button class="restore-confirm-btn" onclick={() => handleRestore(restoreConfirm!)}>Restore</button>
+											<button class="restore-cancel" onclick={() => restoreConfirm = null}>{$ui("ui.cancel")}</button>
+											<button class="restore-confirm-btn" onclick={() => handleRestore(restoreConfirm!)}>{$ui("ui.restore")}</button>
 										</div>
 									</div>
 								</div>
@@ -2264,23 +2311,23 @@
 					{:else if activeTab === 'import'}
 						<div class="tab-content">
 							<div class="settings-section">
-								<h3>Import from Obsidian</h3>
-								<p class="import-desc">Fully converts an Obsidian vault to CueLM format: normalizes frontmatter (tags, IDs, dates, title headings), converts <code>[[wiki-links]]</code> to standard markdown links, converts <code>==highlights==</code> and <code>%%comments%%</code>, and relocates attachments to <code>.cuelm/attachments/</code>. Open the Obsidian vault directory as your CueLM vault first.</p>
+								<h3>{$ui("ui.import_from_obsidian")}</h3>
+								<p class="import-desc">{$ui("ui.fully_converts_an_obsidian_vault_to_helixnotes_format_normaliz_2a841f")} <code>[[wiki-links]]</code> {$ui("ui.to_standard_markdown_links_converts")} <code>==highlights==</code> {$ui("ui.and")} <code>%%comments%%</code>{$ui("ui.and_relocates_attachments_to")} <code>.helixnotes/attachments/</code>{$ui("ui.open_the_obsidian_vault_directory_as_your_helixnotes_vault_first")}</p>
 								<div class="import-warn">
 									<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" /><line x1="12" y1="9" x2="12" y2="13" /><line x1="12" y1="17" x2="12.01" y2="17" /></svg>
-									<span>This modifies files in place. Make a backup before running!</span>
+									<span>{$ui("ui.this_modifies_files_in_place_make_a_backup_before_running")}</span>
 								</div>
 								<button class="import-btn" onclick={runObsidianImport} disabled={importLoading}>
 									{#if importLoading}
 										<svg class="spinner-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" opacity="0.25" /><path d="M12 2a10 10 0 019.95 9" /></svg>
-										Importing...
+										{$ui("ui.importing")}
 									{:else}
 										<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 											<path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4" />
 											<polyline points="7 10 12 15 17 10" />
 											<line x1="12" y1="15" x2="12" y2="3" />
 										</svg>
-										Import Obsidian Vault
+										{$ui("ui.import_obsidian_vault")}
 									{/if}
 								</button>
 
@@ -2288,13 +2335,13 @@
 								<div class="import-result success">
 									<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 11-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></svg>
 									<div class="import-stats">
-										<span>Import complete</span>
+										<span>{$ui("ui.import_complete")}</span>
 										<ul>
-											{#if importResult.frontmatter_normalized}<li>Normalized frontmatter in {importResult.frontmatter_normalized} notes</li>{/if}
-											{#if importResult.links_converted}<li>Converted {importResult.links_converted} wiki-links to markdown</li>{/if}
-											{#if importResult.syntax_converted}<li>Converted Obsidian syntax (highlights, comments) in {importResult.syntax_converted} notes</li>{/if}
-											{#if importResult.attachments_moved}<li>Moved {importResult.attachments_moved} attachments to .cuelm/attachments/</li>{/if}
-											{#if !importResult.frontmatter_normalized && !importResult.links_converted && !importResult.syntax_converted && !importResult.attachments_moved}<li>No changes needed</li>{/if}
+											{#if importResult.frontmatter_normalized}<li>{$ui("ui.normalized_frontmatter_in_notes", { value0: importResult.frontmatter_normalized })}</li>{/if}
+											{#if importResult.links_converted}<li>{$ui("ui.converted_wiki_links_to_markdown", { value0: importResult.links_converted })}</li>{/if}
+											{#if importResult.syntax_converted}<li>{$ui("ui.converted_obsidian_syntax_highlights_comments_in_notes", { value0: importResult.syntax_converted })}</li>{/if}
+											{#if importResult.attachments_moved}<li>{$ui("ui.moved_attachments_to_helixnotes_attachments", { value0: importResult.attachments_moved })}</li>{/if}
+											{#if !importResult.frontmatter_normalized && !importResult.links_converted && !importResult.syntax_converted && !importResult.attachments_moved}<li>{$ui("ui.no_changes_needed")}</li>{/if}
 										</ul>
 									</div>
 								</div>
@@ -2308,29 +2355,33 @@
 							</div>
 						</div>
 
+					{:else if activeTab === 'integrations' && !isMobile}
+						{#await import('./McpSettings.svelte') then { default: McpSettings }}
+							<div class="settings-section"><McpSettings /></div>
+						{/await}
 					{:else if activeTab === 'ai'}
 						<div class="tab-content">
 							<div class="settings-section">
-								<h3>Provider</h3>
+								<h3>{$ui("ui.provider")}</h3>
 								<div class="setting-options" style="flex-wrap: wrap;">
-									<button class="option-btn" class:active={!aiProvider} onclick={() => { if (!aiProvider) return; aiProvider = null; aiTestMessage = null; saveAiSettings(); }}>Disabled</button>
-									<button class="option-btn" class:active={aiProvider === 'ollama'} onclick={() => { if (aiProvider === 'ollama') return; aiProvider = 'ollama'; aiModel = 'gemma3:4b'; aiTestMessage = null; saveAiSettings(); }}>Ollama</button>
-									<button class="option-btn" class:active={aiProvider === 'anthropic'} onclick={() => { if (aiProvider === 'anthropic') return; aiProvider = 'anthropic'; aiModel = 'claude-sonnet-5'; aiTestMessage = null; saveAiSettings(); }}>Anthropic</button>
-									<button class="option-btn" class:active={aiProvider === 'openai'} onclick={() => { if (aiProvider === 'openai') return; aiProvider = 'openai'; aiModel = 'gpt-6-sol'; aiTestMessage = null; saveAiSettings(); }}>OpenAI</button>
-									<button class="option-btn" class:active={aiProvider === 'openai_compatible'} onclick={() => { if (aiProvider === 'openai_compatible') return; aiProvider = 'openai_compatible'; aiModel = ''; aiTestMessage = null; saveAiSettings(); }}>OpenAI Compatible</button>
+									<button class="option-btn" class:active={!aiProvider} onclick={() => selectAiProvider(null)}>{$ui("ui.disabled")}</button>
+									<button class="option-btn" class:active={aiProvider === 'ollama'} onclick={() => selectAiProvider('ollama')}>{$ui("ui.ollama")}</button>
+									<button class="option-btn" class:active={aiProvider === 'anthropic'} onclick={() => selectAiProvider('anthropic')}>{$ui("ui.anthropic")}</button>
+									<button class="option-btn" class:active={aiProvider === 'openai'} onclick={() => selectAiProvider('openai')}>{$ui("ui.openai")}</button>
+									<button class="option-btn" class:active={aiProvider === 'openai_compatible'} onclick={() => selectAiProvider('openai_compatible')}>{$ui("ui.openai_compatible")}</button>
 								</div>
 							</div>
 
 							{#if aiProvider}
 								{#if aiProvider === 'ollama' || aiProvider === 'openai_compatible'}
-									<p class="setting-hint" style="color: var(--text-success, #4ade80); margin-top: -4px; margin-bottom: 12px;">Your data stays on your device. No text is sent to any external server.</p>
+									<p class="setting-hint" style="color: var(--text-success, #4ade80); margin-top: -4px; margin-bottom: 12px;">{$t('ai.serverPrivacy')}</p>
 								{:else}
-									<p class="setting-hint" style="color: var(--text-warning, #f59e0b); margin-top: -4px; margin-bottom: 12px;">Your selected text and note content will be sent to {aiProvider === 'openai' ? 'OpenAI' : 'Anthropic'} servers for processing.</p>
+									<p class="setting-hint" style="color: var(--text-warning, #f59e0b); margin-top: -4px; margin-bottom: 12px;">{$ui("ui.your_selected_text_and_note_content_will_be_sent_to_servers_fo_becb17", { value0: aiProvider === 'openai' ? 'OpenAI' : 'Anthropic' })}</p>
 								{/if}
 
 								{#if aiProvider === 'ollama'}
 									<div class="settings-section">
-										<h3>Server URL</h3>
+										<h3>{$ui("ui.server_url")}</h3>
 										<input
 											type="text"
 											class="ai-key-input"
@@ -2339,20 +2390,20 @@
 											oninput={(e) => { _ollamaBaseUrl = (e.target as HTMLInputElement).value; }}
 											onblur={saveAiSettings}
 										/>
-										<p class="setting-hint">Ollama server address. Install from <a href="https://ollama.com" target="_blank" class="ai-link">ollama.com</a></p>
+										<p class="setting-hint">{$ui("ui.ollama_server_address_install_from")} <a href="https://ollama.com" target="_blank" class="ai-link">{$ui("ui.ollama_com")}</a></p>
 									</div>
 									<div class="settings-section">
-										<h3>API Key <span style="font-weight: 400; text-transform: none; font-size: 11px;">(optional)</span></h3>
+										<h3>{$ui("ui.api_key")} <span style="font-weight: 400; text-transform: none; font-size: 11px;">{$ui("ui.optional")}</span></h3>
 										<div class="ai-key-row">
 											<input
 												type={aiShowOllamaKey ? 'text' : 'password'}
 												class="ai-key-input"
-												placeholder="Only required if your server requires auth"
+												placeholder={$ui("ui.only_required_if_your_server_requires_auth")}
 												value={_ollamaApiKey}
 												oninput={(e) => { _ollamaApiKey = (e.target as HTMLInputElement).value; }}
 												onblur={saveAiSettings}
 											/>
-											<button class="ai-key-toggle" onclick={() => aiShowOllamaKey = !aiShowOllamaKey} title={aiShowOllamaKey ? 'Hide' : 'Show'}>
+											<button class="ai-key-toggle" onclick={() => aiShowOllamaKey = !aiShowOllamaKey} title={aiShowOllamaKey ? $ui("ui.hide") : $ui("ui.show")}>
 												{#if aiShowOllamaKey}
 													<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
 												{:else}
@@ -2363,7 +2414,7 @@
 									</div>
 								{:else if aiProvider === 'openai_compatible'}
 									<div class="settings-section">
-										<h3>Server URL</h3>
+										<h3>{$ui("ui.server_url")}</h3>
 										<input
 											type="text"
 											class="ai-key-input"
@@ -2372,20 +2423,20 @@
 											oninput={(e) => { _openaiCompatibleBaseUrl = (e.target as HTMLInputElement).value; }}
 											onblur={saveAiSettings}
 										/>
-										<p class="setting-hint">Base URL for any OpenAI-compatible server (LM Studio, LocalAI, vLLM, Nvidia NIM, etc.). Enter the server root; the app appends <code>/v1/chat/completions</code> (a trailing <code>/v1</code> is fine too).</p>
+										<p class="setting-hint">{$ui("ui.base_url_for_any_openai_compatible_server_lm_studio_localai_vl_a01725")} <code>/v1/chat/completions</code> {$ui("ui.a_trailing")} <code>/v1</code> {$ui("ui.is_fine_too")}</p>
 									</div>
 									<div class="settings-section">
-										<h3>API Key <span style="font-weight: 400; text-transform: none; font-size: 11px;">(optional)</span></h3>
+										<h3>{$ui("ui.api_key")} <span style="font-weight: 400; text-transform: none; font-size: 11px;">{$ui("ui.optional")}</span></h3>
 										<div class="ai-key-row">
 											<input
 												type={aiShowCompatibleKey ? 'text' : 'password'}
 												class="ai-key-input"
-												placeholder="Leave empty if no auth required"
+												placeholder={$ui("ui.leave_empty_if_no_auth_required")}
 												value={_openaiCompatibleKey}
 												oninput={(e) => { _openaiCompatibleKey = (e.target as HTMLInputElement).value; }}
 												onblur={saveAiSettings}
 											/>
-											<button class="ai-key-toggle" onclick={() => aiShowCompatibleKey = !aiShowCompatibleKey} title={aiShowCompatibleKey ? 'Hide' : 'Show'}>
+											<button class="ai-key-toggle" onclick={() => aiShowCompatibleKey = !aiShowCompatibleKey} title={aiShowCompatibleKey ? $ui("ui.hide") : $ui("ui.show")}>
 												{#if aiShowCompatibleKey}
 													<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
 												{:else}
@@ -2396,17 +2447,17 @@
 									</div>
 								{:else}
 									<div class="settings-section">
-										<h3>API Key</h3>
+										<h3>{$ui("ui.api_key")}</h3>
 										<div class="ai-key-row">
 											<input
 												type={aiShowKey ? 'text' : 'password'}
 												class="ai-key-input"
-												placeholder={aiProvider === 'openai' ? 'sk-...' : 'sk-ant-...'}
+												placeholder={aiProvider === 'openai' ? $ui("ui.sk") : $ui("ui.sk_ant")}
 												value={aiApiKey}
 												oninput={(e) => { const v = (e.target as HTMLInputElement).value; if (aiProvider === 'openai') _openaiKey = v; else _anthropicKey = v; }}
 												onblur={saveAiSettings}
 											/>
-											<button class="ai-key-toggle" onclick={() => aiShowKey = !aiShowKey} title={aiShowKey ? 'Hide' : 'Show'}>
+											<button class="ai-key-toggle" onclick={() => aiShowKey = !aiShowKey} title={aiShowKey ? $ui("ui.hide") : $ui("ui.show")}>
 												{#if aiShowKey}
 													<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
 												{:else}
@@ -2415,66 +2466,52 @@
 											</button>
 										</div>
 										{#if aiProvider === 'openai'}
-											<p class="setting-hint">Get your API key from <a href="https://platform.openai.com/api-keys" target="_blank" class="ai-link">platform.openai.com</a></p>
+											<p class="setting-hint">{$ui("ui.get_your_api_key_from")} <a href="https://platform.openai.com/api-keys" target="_blank" class="ai-link">{$ui("ui.platform_openai_com")}</a></p>
 										{:else}
-											<p class="setting-hint">Get your API key from <a href="https://console.anthropic.com/settings/keys" target="_blank" class="ai-link">console.anthropic.com</a></p>
+											<p class="setting-hint">{$ui("ui.get_your_api_key_from")} <a href="https://console.anthropic.com/settings/keys" target="_blank" class="ai-link">{$ui("ui.console_anthropic_com")}</a></p>
 										{/if}
 									</div>
 								{/if}
 
 								<div class="settings-section">
-									<h3>Model</h3>
+									<h3>{$ui("ui.model")}</h3>
 									{#if aiProvider === 'ollama' || aiProvider === 'openai_compatible'}
 										<input
 											type="text"
 											class="ai-key-input"
-											placeholder={aiProvider === 'ollama' ? 'gemma3:4b' : 'Enter model name'}
+											placeholder={aiProvider === 'ollama' ? $ui("ui.gemma3_4b") : $ui("ui.enter_model_name")}
 											value={aiModel}
 											oninput={(e) => { aiModel = (e.target as HTMLInputElement).value; }}
 											onblur={saveAiSettings}
 										/>
-										<p class="setting-hint">{aiProvider === 'ollama' ? 'Enter the model name as shown by <code>ollama list</code>' : 'Enter the model name as required by your server'}</p>
+										<p class="setting-hint">{aiProvider === 'ollama' ? $ui("ui.enter_the_model_name_as_shown_by_code_ollama_list_code") : $ui("ui.enter_the_model_name_as_required_by_your_server")}</p>
 									{:else}
-										<div class="ai-model-options">
-											{#each aiModels as m}
-												<button
-													class="ai-model-btn"
-													class:active={aiModel === m.value}
-													onclick={() => { aiModel = m.value; saveAiSettings(); }}
-												>
-													<span class="ai-model-name">{m.label}</span>
-													<span class="ai-model-desc">{m.desc}</span>
-												</button>
-											{/each}
-										</div>
-										{#if aiModel && !aiModels.some(model => model.value === aiModel)}
-											<p class="setting-hint">Saved model: <code>{aiModel}</code>. It remains selected until you choose another model.</p>
-										{/if}
+										<AiModelPicker provider={aiProvider} apiKey={aiApiKey} value={aiModel} onchange={chooseAiModel} />
 									{/if}
 								</div>
 
 								<div class="settings-section">
-									<h3>Writing Style</h3>
+									<h3>{$ui("ui.writing_style")}</h3>
 									<textarea
 										class="ai-style-input"
-										placeholder="e.g. Professional and concise. Use active voice. Avoid jargon."
+										placeholder={$ui("ui.e_g_professional_and_concise_use_active_voice_avoid_jargon")}
 										value={aiWritingStyle}
 										oninput={(e) => { aiWritingStyle = (e.target as HTMLTextAreaElement).value; }}
 										onblur={saveAiSettings}
 										rows="3"
 									></textarea>
-									<p class="setting-hint">Describe your preferred tone, style, or personality. This will be applied to all AI actions.</p>
+									<p class="setting-hint">{$ui("ui.describe_your_preferred_tone_style_or_personality_this_will_be_457959")}</p>
 								</div>
 
 								<div class="settings-section">
-									<h3>Connection</h3>
-									<button class="import-btn" onclick={handleTestAi} disabled={aiTestLoading || (aiProvider === 'openai_compatible' && !_openaiCompatibleBaseUrl) || (aiProvider !== 'ollama' && aiProvider !== 'openai_compatible' && !aiApiKey)}>
+									<h3>{$ui("ui.connection")}</h3>
+									<button class="import-btn" onclick={handleTestAi} disabled={aiTestLoading || !aiModel.trim() || (aiProvider === 'openai_compatible' && !_openaiCompatibleBaseUrl) || (aiProvider !== 'ollama' && aiProvider !== 'openai_compatible' && !aiApiKey)}>
 										{#if aiTestLoading}
 											<svg class="spinner-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" opacity="0.25" /><path d="M12 2a10 10 0 019.95 9" /></svg>
-											Testing...
+											{$ui("ui.testing")}
 										{:else}
 											<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 11-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></svg>
-											Test Connection
+											{$ui("ui.test_connection")}
 										{/if}
 									</button>
 									{#if aiTestMessage}
@@ -2490,11 +2527,11 @@
 								</div>
 
 								<div class="settings-section">
-									<h3>Usage</h3>
+									<h3>{$ui("ui.usage")}</h3>
 									{#if isMobile}
-									<p class="import-desc">Use the AI button in the toolbar or header to access AI writing tools: improve, fix grammar, rewrite, summarize, translate, and more.</p>
+									<p class="import-desc">{$ui("ui.use_the_ai_button_in_the_toolbar_or_header_to_access_ai_writin_24df67")}</p>
 								{:else}
-									<p class="import-desc">Select text in the editor and right-click to access AI writing tools: improve, fix grammar, rewrite, summarize, translate, and more.</p>
+									<p class="import-desc">{$ui("ui.select_text_in_the_editor_and_right_click_to_access_ai_writing_c6c7b3")}</p>
 								{/if}
 								</div>
 							{/if}
@@ -2503,33 +2540,33 @@
 					{:else if activeTab === 'sync'}
 						<div class="tab-content">
 							<div class="settings-section">
-								<h3>Provider</h3>
+								<h3>{$ui("ui.provider")}</h3>
 								<div class="setting-options">
-									<button class="option-btn" class:active={!syncProvider} onclick={() => { syncProvider = null; syncMessage = null; syncTestMessage = null; saveSyncSettings(); }}>Disabled</button>
+									<button class="option-btn" class:active={!syncProvider} onclick={() => { syncProvider = null; syncMessage = null; syncTestMessage = null; saveSyncSettings(); }}>{$ui("ui.disabled")}</button>
 									<button class="option-btn" class:active={syncProvider === 'webdav'} onclick={() => { syncProvider = 'webdav'; syncMessage = null; syncTestMessage = null; saveSyncSettings(); }}>WebDAV</button>
 								</div>
-								<p class="setting-hint">Sync your vault to your own WebDAV server (Nextcloud, ownCloud, a NAS).</p>
+								<p class="setting-hint">{$ui("ui.sync_your_vault_to_your_own_webdav_server_nextcloud_owncloud_a_nas")}</p>
 							</div>
 
 							{#if syncProvider === 'webdav'}
 								<div class="settings-section">
-									<h3>Server URL</h3>
+									<h3>{$ui("ui.server_url")}</h3>
 									<div class="ai-key-row">
-										<input type="text" class="ai-key-input" placeholder="https://cloud.example.com/remote.php/dav/files/USER/CueLM" value={syncUrl} oninput={(e) => { syncUrl = (e.target as HTMLInputElement).value; }} onblur={saveSyncSettings} />
+										<input type="text" class="ai-key-input" placeholder="https://cloud.example.com/remote.php/dav/files/USER/HelixNotes" value={syncUrl} oninput={(e) => { syncUrl = (e.target as HTMLInputElement).value; }} onblur={saveSyncSettings} />
 									</div>
-									<p class="setting-hint" style="overflow-x: auto;">WebDAV folder URL, e.g. <code style="white-space: nowrap;">https://your-server/remote.php/dav/files/USER/Folder</code></p>
+									<p class="setting-hint" style="overflow-x: auto;">{$ui("ui.webdav_folder_url_e_g")} <code style="white-space: nowrap;">https://your-server/remote.php/dav/files/USER/Folder</code></p>
 								</div>
 								<div class="settings-section">
-									<h3>Username</h3>
+									<h3>{$ui("ui.username")}</h3>
 									<div class="ai-key-row">
-										<input type="text" class="ai-key-input" placeholder="your username" value={syncUsername} oninput={(e) => { syncUsername = (e.target as HTMLInputElement).value; }} onblur={saveSyncSettings} />
+										<input type="text" class="ai-key-input" placeholder={$ui("ui.your_username")} value={syncUsername} oninput={(e) => { syncUsername = (e.target as HTMLInputElement).value; }} onblur={saveSyncSettings} />
 									</div>
 								</div>
 								<div class="settings-section">
-									<h3>Password</h3>
+									<h3>{$ui("ui.password")}</h3>
 									<div class="ai-key-row">
-										<input type={syncShowPassword ? 'text' : 'password'} class="ai-key-input" placeholder="app password" value={syncPassword} oninput={(e) => { syncPassword = (e.target as HTMLInputElement).value; }} onblur={saveSyncSettings} />
-										<button class="ai-key-toggle" onclick={() => syncShowPassword = !syncShowPassword} title={syncShowPassword ? 'Hide' : 'Show'}>
+										<input type={syncShowPassword ? 'text' : 'password'} class="ai-key-input" placeholder={$ui("ui.app_password")} value={syncPassword} oninput={(e) => { syncPassword = (e.target as HTMLInputElement).value; }} onblur={saveSyncSettings} />
+										<button class="ai-key-toggle" onclick={() => syncShowPassword = !syncShowPassword} title={syncShowPassword ? $ui("ui.hide") : $ui("ui.show")}>
 											{#if syncShowPassword}
 												<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0112 20c-7 0-11-8-11-8a18.45 18.45 0 015.06-5.94M9.9 4.24A9.12 9.12 0 0112 4c7 0 11 8 11 8a18.5 18.5 0 01-2.16 3.19m-6.72-1.07a3 3 0 11-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
 											{:else}
@@ -2537,18 +2574,18 @@
 											{/if}
 										</button>
 									</div>
-									<p class="setting-hint">Use an app password, not your main one. Stored locally on this device.</p>
+									<p class="setting-hint">{$ui("ui.use_an_app_password_not_your_main_one_stored_locally_on_this_device")}</p>
 								</div>
 
 								<div class="settings-section">
-									<h3>Connection</h3>
+									<h3>{$ui("ui.connection")}</h3>
 									<button class="import-btn" onclick={handleTestSync} disabled={syncTestLoading || !syncUrl}>
 										{#if syncTestLoading}
 											<svg class="spinner-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" opacity="0.25" /><path d="M12 2a10 10 0 019.95 9" /></svg>
-											Testing...
+											{$ui("ui.testing")}
 										{:else}
 											<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 11.08V12a10 10 0 11-5.93-9.14" /><polyline points="22 4 12 14.01 9 11.01" /></svg>
-											Test Connection
+											{$ui("ui.test_connection")}
 										{/if}
 									</button>
 									{#if syncTestMessage}
@@ -2564,14 +2601,14 @@
 								</div>
 
 								<div class="settings-section">
-									<h3>Sync</h3>
+									<h3>{$ui("ui.sync")}</h3>
 									<button class="import-btn" onclick={handleSyncNow} disabled={syncRunning || !syncUrl}>
 										{#if syncRunning}
 											<svg class="spinner-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" opacity="0.25" /><path d="M12 2a10 10 0 019.95 9" /></svg>
-											Syncing...
+											{$ui("ui.syncing")}
 										{:else}
 											<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2v6h-6"/><path d="M3 12a9 9 0 0115-6.7L21 8"/><path d="M3 22v-6h6"/><path d="M21 12a9 9 0 01-15 6.7L3 16"/></svg>
-											Sync Now
+											{$ui("ui.sync_now_c91134")}
 										{/if}
 									</button>
 									{#if syncMessage}
@@ -2585,41 +2622,41 @@
 										</div>
 									{/if}
 									{#if activeVaultConfig($appConfig)?.last_sync_time}
-										<p class="setting-hint">Last sync: {new Date(activeVaultConfig($appConfig)!.last_sync_time!).toLocaleString()}</p>
+										<p class="setting-hint">{$ui("ui.last_sync", { value0: new Date(activeVaultConfig($appConfig)!.last_sync_time!).toLocaleString($locale) })}</p>
 									{/if}
-									<p class="setting-hint">If a note is edited on two devices, both are kept (one as a "(conflict)" copy).</p>
+									<p class="setting-hint">{$ui("ui.if_a_note_is_edited_on_two_devices_both_are_kept_one_as_a_conflict_copy")}</p>
 								</div>
 								<div class="settings-section">
-									<h3>Automatic Sync</h3>
+									<h3>{$ui("ui.automatic_sync")}</h3>
 									<div class="setting-options">
 										{#each [{ v: 0, l: 'Off' }, { v: 5, l: '5 min' }, { v: 15, l: '15 min' }, { v: 30, l: '30 min' }, { v: 60, l: '60 min' }] as opt}
 											<button class="option-btn" class:active={syncIntervalMinutes === opt.v} onclick={() => { syncIntervalMinutes = opt.v; saveSyncSettings(); }}>{opt.l}</button>
 										{/each}
 									</div>
-									<p class="setting-hint">How often to sync in the background.</p>
+									<p class="setting-hint">{$ui("ui.how_often_to_sync_in_the_background")}</p>
 									<label class="setting-toggle" style="margin-top: 12px;">
 										<span class="setting-label">
-											<span class="setting-name">Sync when a note changes</span>
-											<span class="setting-desc">Sync shortly after you edit a note.</span>
+											<span class="setting-name">{$ui("ui.sync_when_a_note_changes")}</span>
+											<span class="setting-desc">{$ui("ui.sync_shortly_after_you_edit_a_note")}</span>
 										</span>
-										<button class="toggle-switch" class:on={syncOnChange} role="switch" aria-checked={syncOnChange} aria-label="Sync when a note changes" onclick={() => { syncOnChange = !syncOnChange; saveSyncSettings(); }}><span class="toggle-knob"></span></button>
+										<button class="toggle-switch" class:on={syncOnChange} role="switch" aria-checked={syncOnChange} aria-label={$ui("ui.sync_when_a_note_changes")} onclick={() => { syncOnChange = !syncOnChange; saveSyncSettings(); }}><span class="toggle-knob"></span></button>
 									</label>
 									<label class="setting-toggle">
 										<span class="setting-label">
-											<span class="setting-name">Sync when the vault opens</span>
-											<span class="setting-desc">Sync once when the app starts.</span>
+											<span class="setting-name">{$ui("ui.sync_when_the_vault_opens")}</span>
+											<span class="setting-desc">{$ui("ui.sync_once_when_the_app_starts")}</span>
 										</span>
-										<button class="toggle-switch" class:on={syncOnOpen} role="switch" aria-checked={syncOnOpen} aria-label="Sync when the vault opens" onclick={() => { syncOnOpen = !syncOnOpen; saveSyncSettings(); }}><span class="toggle-knob"></span></button>
+										<button class="toggle-switch" class:on={syncOnOpen} role="switch" aria-checked={syncOnOpen} aria-label={$ui("ui.sync_when_the_vault_opens")} onclick={() => { syncOnOpen = !syncOnOpen; saveSyncSettings(); }}><span class="toggle-knob"></span></button>
 									</label>
 								</div>
 								<div class="settings-section">
-									<h3>Folder Request Parallelism</h3>
+									<h3>{$ui("ui.folder_request_parallelism")}</h3>
 									<div class="setting-options">
 										{#each [...new Set([1, 3, 6, 12, syncFolderRequests || defaultFolderRequests])].sort((a, b) => a - b) as opt}
 											<button class="option-btn" class:active={(syncFolderRequests || defaultFolderRequests) === opt} onclick={() => { syncFolderRequests = opt; saveSyncSettings(); }}>{opt}</button>
 										{/each}
 									</div>
-									<p class="setting-hint">How many folders are listed on the server at once. 6 suits most servers; choose 1 if yours rejects concurrent requests.</p>
+									<p class="setting-hint">{$ui("ui.how_many_folders_are_listed_on_the_server_at_once_6_suits_most_30d9ab")}</p>
 								</div>
 							{/if}
 						</div>
@@ -2627,27 +2664,27 @@
 					{:else if activeTab === 'updates'}
 						<div class="tab-content">
 							<div class="settings-section">
-								<h3>Current Version</h3>
-								<p class="update-version">CueLM <strong>v{appVersion}</strong></p>
+								<h3>{$ui("ui.current_version")}</h3>
+								<p class="update-version">HelixNotes <strong>v{appVersion}</strong></p>
 							</div>
 
 							{#if isManagedInstall($installType)}
 							<div class="settings-section">
-								<h3>Updates</h3>
-								<p class="setting-hint">CueLM was installed through your system package manager, which delivers updates. The app does not check for or install updates on its own.</p>
+								<h3>{$ui("ui.updates")}</h3>
+								<p class="setting-hint">{$ui("ui.helixnotes_was_installed_through_your_system_package_manager_w_669884")}</p>
 							</div>
 							{:else}
 							<div class="settings-section">
-								<h3>Check for Updates</h3>
+								<h3>{$ui("ui.check_for_updates")}</h3>
 								<button class="import-btn" onclick={handleCheckUpdate} disabled={updateChecking || updateDownloading}>
 									{#if updateChecking}
 										<svg class="spinner-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" opacity="0.25" /><path d="M12 2a10 10 0 019.95 9" /></svg>
-										Checking...
+										{$ui("ui.checking")}
 									{:else}
 										<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 											<path d="M21 12a9 9 0 00-9-9 9.75 9.75 0 00-6.74 2.74L3 8"/><path d="M3 3v5h5"/>
 										</svg>
-										Check for Updates
+										{$ui("ui.check_for_updates")}
 									{/if}
 								</button>
 							</div>
@@ -2655,11 +2692,11 @@
 
 							{#if updateAvailable}
 								<div class="settings-section">
-									<h3>Update Available</h3>
+									<h3>{$ui("ui.update_available")}</h3>
 									<div class="update-info">
-										<p class="update-new-version">Version <strong>{updateAvailable.version}</strong></p>
+										<p class="update-new-version">{$ui("ui.version")} <strong>{updateAvailable.version}</strong></p>
 										{#if updateAvailable.date}
-											<p class="update-date">{new Date(updateAvailable.date).toLocaleDateString()}</p>
+											<p class="update-date">{new Date(updateAvailable.date).toLocaleDateString($locale)}</p>
 										{/if}
 										{#if updateAvailable.body}
 											<div class="update-notes">{updateAvailable.body}</div>
@@ -2669,12 +2706,12 @@
 									<button class="update-install-btn" onclick={handleDownloadAndInstall} disabled={updateDownloading}>
 										{#if updateDownloading}
 											<svg class="spinner-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10" opacity="0.25" /><path d="M12 2a10 10 0 019.95 9" /></svg>
-											{updateProgress > 0 ? `Downloading ${updateProgress}%` : 'Downloading...'}
+											{updateProgress > 0 ? $ui("ui.downloading", { value0: updateProgress }) : $ui("ui.downloading_66f3ac")}
 										{:else}
 											<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 												<path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
 											</svg>
-											Download & Install
+											{$ui("ui.download_install")}
 										{/if}
 									</button>
 									{#if updateDownloading && updateProgress > 0}
@@ -2684,27 +2721,27 @@
 									{/if}
 								{:else if $installType === 'deb'}
 									<div class="update-apt-info">
-										<p>Update via your package manager:</p>
+										<p>{$ui("ui.update_via_your_package_manager")}</p>
 										<code>sudo apt update && sudo apt upgrade helix-notes</code>
 									</div>
 								{:else if $installType === 'aur'}
 									<div class="update-apt-info">
-										<p>Update via your AUR helper:</p>
-										<code>yay -Syu cuelm</code>
+										<p>{$ui("ui.update_via_your_aur_helper")}</p>
+										<code>yay -Syu helixnotes</code>
 									</div>
 								{:else if $installType === 'android'}
 									<button class="update-install-btn" onclick={() => { openUrl('https://cuelm.com/#download').catch(() => {}); }}>
 										<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 											<path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>
 										</svg>
-										Download from Website
+										{$ui("ui.download_from_website")}
 									</button>
 								{:else}
-									<a class="update-install-btn" href="https://gitlab.com/ArkHost/CueLM/-/releases" target="_blank" rel="noopener">
+									<a class="update-install-btn" href="https://gitlab.com/ArkHost/HelixNotes/-/releases" target="_blank" rel="noopener">
 										<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 											<path d="M18 13v6a2 2 0 01-2 2H5a2 2 0 01-2-2V8a2 2 0 012-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>
 										</svg>
-										Download
+										{$ui("ui.download")}
 									</a>
 								{/if}
 								</div>
@@ -2828,6 +2865,7 @@
 
 	.settings-body {
 		flex: 1;
+		min-width: 0;
 		padding: 20px 24px 24px;
 		overflow-y: auto;
 	}
@@ -2850,6 +2888,7 @@
 	}
 
 	.settings-section h3 {
+		overflow-wrap: anywhere;
 		font-size: 12px;
 		font-weight: 600;
 		text-transform: uppercase;
@@ -2883,6 +2922,7 @@
 		gap: 2px;
 		flex: 1;
 		min-width: 0;
+		overflow-wrap: anywhere;
 	}
 
 	.setting-name {
@@ -2932,6 +2972,7 @@
 
 	.setting-options {
 		display: flex;
+		flex-wrap: wrap;
 		gap: 8px;
 	}
 
@@ -3247,6 +3288,9 @@
 
 	.import-btn {
 		display: inline-flex;
+		max-width: 100%;
+		white-space: normal;
+		overflow-wrap: anywhere;
 		align-items: center;
 		gap: 8px;
 		padding: 10px 18px;
@@ -3585,6 +3629,9 @@
 
 	.ai-key-input {
 		flex: 1;
+		min-width: 0;
+		width: 100%;
+		box-sizing: border-box;
 		padding: 8px 12px;
 		border: 1px solid var(--border-color);
 		border-radius: 8px;
@@ -3605,6 +3652,7 @@
 
 	.ai-style-input {
 		width: 100%;
+		box-sizing: border-box;
 		padding: 8px 12px;
 		border: 1px solid var(--border-color);
 		border-radius: 8px;
@@ -3642,56 +3690,13 @@
 	}
 
 	.ai-link {
+		overflow-wrap: anywhere;
 		color: var(--accent);
 		text-decoration: none;
 	}
 
 	.ai-link:hover {
 		text-decoration: underline;
-	}
-
-	.ai-model-options {
-		display: flex;
-		gap: 8px;
-	}
-
-	.ai-model-btn {
-		flex: 1;
-		display: flex;
-		flex-direction: column;
-		align-items: center;
-		gap: 4px;
-		padding: 12px 8px;
-		border: 1px solid var(--border-color);
-		border-radius: 10px;
-		background: var(--bg-secondary);
-		cursor: pointer;
-		transition: all 0.15s;
-	}
-
-	.ai-model-btn:hover {
-		background: var(--bg-hover);
-		border-color: var(--text-tertiary);
-	}
-
-	.ai-model-btn.active {
-		border-color: var(--accent);
-		background: var(--accent-light);
-	}
-
-	.ai-model-name {
-		font-size: 13px;
-		font-weight: 500;
-		color: var(--text-primary);
-	}
-
-	.ai-model-btn.active .ai-model-name {
-		color: var(--accent);
-	}
-
-	.ai-model-desc {
-		font-size: 11px;
-		color: var(--text-tertiary);
 	}
 
 	/* Updates tab */

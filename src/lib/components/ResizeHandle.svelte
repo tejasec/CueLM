@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { t as ui } from '$lib/i18n';
 	import { onDestroy } from 'svelte';
 
 	let { onResize, label, value, min, max, controls }: {
@@ -62,4 +63,4 @@
 	role={value === undefined ? 'presentation' : 'separator'} tabindex={value === undefined ? undefined : 0}
 	aria-label={label} aria-orientation={value === undefined ? undefined : 'vertical'}
 	aria-valuenow={value} aria-valuemin={min} aria-valuemax={max} aria-controls={controls}
-	title={value === undefined ? undefined : 'Use Left and Right arrow keys to resize'}></div>
+	title={value === undefined ? undefined : $ui("ui.use_left_and_right_arrow_keys_to_resize")}></div>

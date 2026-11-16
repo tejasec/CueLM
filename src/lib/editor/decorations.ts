@@ -63,12 +63,12 @@ export function buildTaskMetaDecorations(doc: ProseMirrorNode): DecorationSet {
 }
 
 /** Placeholder only needs the caret's empty textblock, not a recursive document emptiness scan. */
-export function focusedPlaceholderDecorations(state: EditorState): DecorationSet {
+export function focusedPlaceholderDecorations(state: EditorState, labels = { section: 'Section title...', body: 'Start writing...' }): DecorationSet {
 	const { $anchor } = state.selection;
 	const node = $anchor.parent;
 	if (!$anchor.depth || !node.isTextblock || node.content.size) return DecorationSet.empty;
 	const pos = $anchor.before();
-	const placeholder = node.type.name === 'detailsSummary' ? 'Section title...' : 'Start writing...';
+	const placeholder = node.type.name === 'detailsSummary' ? labels.section : labels.body;
 	return DecorationSet.create(state.doc, [Decoration.node(pos, pos + node.nodeSize, {
 		class: 'is-empty', 'data-placeholder': placeholder,
 	})]);

@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { t as ui, label as uiLabel, tr as uiText } from '$lib/i18n';
 	import { onDestroy, tick } from 'svelte';
 	import { get } from 'svelte/store';
 	import {
@@ -44,8 +45,8 @@
 		NOTEBOOK_ICON_OPTIONS,
 		COMMON_NOTEBOOK_ICON_COUNT,
 		isCommonNotebookIcon,
-		decodeBuiltinNotebookIcon,
 		decodeNotebookIcon,
+		decodeBuiltinNotebookIcon,
 		encodeBuiltinNotebookIcon,
 		normalizeNotebookIconKey,
 		type NotebookIconId
@@ -105,6 +106,13 @@
 	let dropPosition = $state<'above' | 'into' | 'below' | null>(null);
 	let draggedNotebookPath = $state<string | null>(null);
 	let nbPointer: { src: string } | null = null;
+	let recordingContextMenu = $state<{ x: number; y: number; recording: RecordingEntry } | null>(null);
+	let iconPickerRecording = $state<RecordingEntry | null>(null);
+	let deleteConfirmRecording = $state<RecordingEntry | null>(null);
+	let editingRecording = $state<string | null>(null);
+	let editRecordingValue = $state('');
+	let renameRecordingInput = $state<HTMLInputElement | null>(null);
+	let collapsedRecordings = $state<string[]>([]);
 
 	// Notebook paths arrive from Rust with native separators (backslashes on Windows), so path math must be separator-agnostic.
 	const norm = (p: string) => (p ?? '').replace(/\\/g, '/');
@@ -208,25 +216,23 @@
 		const styleRevision = tagAppearance.snapshot(ownerVault!);
 		try {
 			// Mobile derives tags from notes instead of issuing another full-vault scan.
-			const [nbs, appearances, qaNotes, rootCount, nextTags, recs] = await Promise.all([
+			const [nbs, appearances, qaNotes, rootCount, nextTags] = await Promise.all([
 				getNotebooks(),
 				Promise.allSettled([getNotebookIcons(ownerVault!), getTagStyles(ownerVault!)]),
 				getQuickAccess(ownerVault!),
 				countRootNotes(),
 				isMobile ? Promise.resolve(null) : getAllTags(),
-				getRecordings($appConfig?.active_vault).catch(() => []),
 			]);
 			if (!ownerIsCurrent() || request !== refreshRequest) return;
 			$notebooks = nbs;
-			if (recs) $recordings = recs;
 			const [icons, styles] = appearances;
 			if (notebookAppearance.acceptsSnapshot(ownerVault!, iconRevision)) {
 				if (icons.status === 'fulfilled') $notebookIcons = icons.value;
-				else iconError = `Could not read notebook icons: ${String(icons.reason)}`;
+				else iconError = uiText("ui.could_not_read_notebook_icons", { value0: String(icons.reason) });
 			}
 			if (tagAppearance.acceptsSnapshot(ownerVault!, styleRevision)) {
 				if (styles.status === 'fulfilled') $tagStyles = styles.value;
-				else iconError = `Could not read tag appearances: ${String(styles.reason)}`;
+				else iconError = uiText("ui.could_not_read_tag_appearances", { value0: String(styles.reason) });
 			}
 			$quickAccessPaths = qaNotes.map(n => n.relative_path);
 			$rootNoteCount = rootCount;
@@ -234,217 +240,6 @@
 		} catch (e) {
 			console.error('Failed to refresh sidebar:', e);
 		}
-	}
-
-	let recordingContextMenu = $state<{ x: number; y: number; recording: RecordingEntry } | null>(null);
-	let iconPickerRecording = $state<RecordingEntry | null>(null);
-	let deleteConfirmRecording = $state<RecordingEntry | null>(null);
-	let editingRecording = $state<string | null>(null);
-	let editRecordingValue = $state('');
-	let renameRecordingInput = $state<HTMLInputElement | null>(null);
-	let collapsedRecordings = $state<string[]>([]);
-
-	function loadRecordingIcons(vault: string) {
-		try {
-			const saved = localStorage.getItem(`cuelm_rec_icons_${vault}`);
-			if (saved) {
-				$recordingIcons = JSON.parse(saved);
-			} else {
-				$recordingIcons = {};
-			}
-		} catch {
-			$recordingIcons = {};
-		}
-	}
-
-	function saveRecordingIcons(vault: string, icons: Record<string, string>) {
-		try {
-			localStorage.setItem(`cuelm_rec_icons_${vault}`, JSON.stringify(icons));
-		} catch (e) {
-			console.error('Failed to save recording icons:', e);
-		}
-	}
-
-	export async function refreshRecordings() {
-		try {
-			const vault = $appConfig?.active_vault;
-			if (vault) loadRecordingIcons(vault);
-			const recs = await getRecordings(vault);
-			$recordings = recs;
-		} catch (e) {
-			console.error('Failed to refresh recordings:', e);
-		}
-	}
-
-	function buildRecordingsTree(list: RecordingEntry[]): RecordingEntry[] {
-		const parents: RecordingEntry[] = [];
-		const childrenMap = new Map<string, RecordingEntry[]>();
-
-		for (const rec of list) {
-			if (rec.parent_name) {
-				const existing = childrenMap.get(rec.parent_name) || [];
-				existing.push(rec);
-				childrenMap.set(rec.parent_name, existing);
-			} else {
-				parents.push({ ...rec, children: [] });
-			}
-		}
-
-		for (const p of parents) {
-			const stem = p.name.replace(/\.[^/.]+$/, "");
-			p.children = childrenMap.get(stem) || [];
-		}
-
-		for (const [parentName, subs] of childrenMap.entries()) {
-			if (!parents.some(p => p.name.replace(/\.[^/.]+$/, "") === parentName)) {
-				parents.push(...subs.map(s => ({ ...s, children: [] })));
-			}
-		}
-
-		return parents;
-	}
-	let sortedRecordings = $derived(buildRecordingsTree($recordings));
-
-	function handleNewRecording() {
-		const vault = $appConfig?.active_vault;
-		const recPath = vault ? `${vault}/Recordings` : '';
-		openAudioRecorder(recPath).catch((err) => {
-			console.error('Failed to open AudioRecorder:', err);
-		});
-	}
-
-	function handleRecordingClick(rec: RecordingEntry) {
-		const vault = $appConfig?.active_vault;
-		const recDir = vault ? `${vault}/Recordings` : '';
-		playRecordingInAudioRecorder(recDir, rec.path).catch(console.error);
-	}
-
-	function onRecordingContextMenu(e: MouseEvent, rec: RecordingEntry) {
-		e.preventDefault();
-		e.stopPropagation();
-		const { x, y } = clampMenu(e.clientX, e.clientY, 200, 180);
-		recordingContextMenu = { x, y, recording: rec };
-	}
-
-	function openRecordingActionsMenu(e: Event, rec: RecordingEntry) {
-		e.preventDefault();
-		e.stopPropagation();
-		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
-		const { x, y } = clampMenu(rect.right - 200, rect.bottom + 4, 200, 180);
-		recordingContextMenu = { x, y, recording: rec };
-	}
-
-	function toggleRecordingCollapse(rec: RecordingEntry, e: Event) {
-		e.stopPropagation();
-		if (collapsedRecordings.includes(rec.path)) {
-			collapsedRecordings = collapsedRecordings.filter(p => p !== rec.path);
-		} else {
-			collapsedRecordings = [...collapsedRecordings, rec.path];
-		}
-	}
-
-	function startNewSubRecording(rec: RecordingEntry) {
-		recordingContextMenu = null;
-		const vault = $appConfig?.active_vault;
-		const recPath = vault ? `${vault}/Recordings` : '';
-		const parentStem = rec.name.replace(/\.[^/.]+$/, "");
-		const subPrefix = `${parentStem}__sub__`;
-		if (collapsedRecordings.includes(rec.path)) {
-			collapsedRecordings = collapsedRecordings.filter(p => p !== rec.path);
-		}
-		openAudioRecorder(recPath, subPrefix).catch(console.error);
-	}
-
-	async function startRenameRecording(rec: RecordingEntry) {
-		recordingContextMenu = null;
-		editingRecording = rec.path;
-		editRecordingValue = rec.display_name ? rec.display_name.replace(/\.[^/.]+$/, "") : rec.name.replace(/\.[^/.]+$/, "");
-		await tick();
-		renameRecordingInput?.focus();
-		renameRecordingInput?.select();
-	}
-
-	async function handleRenameRecording(rec: RecordingEntry) {
-		if (!editRecordingValue.trim() || editRecordingValue.trim() === (rec.display_name || rec.name).replace(/\.[^/.]+$/, "")) {
-			editingRecording = null;
-			return;
-		}
-		try {
-			const vault = $appConfig?.active_vault;
-			if (!vault) return;
-			const newPath = await renameRecording(vault, rec.path, editRecordingValue.trim());
-			if ($recordingIcons[rec.relative_path]) {
-				const icon = $recordingIcons[rec.relative_path];
-				const updated = { ...$recordingIcons };
-				delete updated[rec.relative_path];
-				const newRelative = newPath.slice(vault.length + 1).replace(/\\/g, '/');
-				updated[newRelative] = icon;
-				$recordingIcons = updated;
-				saveRecordingIcons(vault, updated);
-			}
-			editingRecording = null;
-			await refreshRecordings();
-		} catch (e) {
-			console.error('Failed to rename recording:', e);
-			editingRecording = null;
-		}
-	}
-
-	async function openRecordingIconPicker(rec: RecordingEntry) {
-		recordingContextMenu = null;
-		iconPickerRecording = rec;
-		await tick();
-	}
-
-	function selectRecordingIcon(rec: RecordingEntry, iconId: NotebookIconId) {
-		const vault = $appConfig?.active_vault;
-		if (!vault) return;
-		const key = rec.relative_path;
-		const updated = { ...$recordingIcons, [key]: encodeBuiltinNotebookIcon(iconId) };
-		$recordingIcons = updated;
-		saveRecordingIcons(vault, updated);
-		iconPickerRecording = null;
-	}
-
-	function removeRecordingIcon(rec: RecordingEntry) {
-		const vault = $appConfig?.active_vault;
-		if (!vault) return;
-		const key = rec.relative_path;
-		const updated = { ...$recordingIcons };
-		delete updated[key];
-		$recordingIcons = updated;
-		saveRecordingIcons(vault, updated);
-		iconPickerRecording = null;
-	}
-
-	function handleDeleteRecording(rec: RecordingEntry) {
-		recordingContextMenu = null;
-		deleteConfirmRecording = rec;
-	}
-
-	async function confirmDeleteRecording(rec: RecordingEntry) {
-		deleteConfirmRecording = null;
-		try {
-			const vault = $appConfig?.active_vault;
-			if (!vault) return;
-			await deleteRecording(vault, rec.path);
-			if ($recordingIcons[rec.relative_path]) {
-				const updated = { ...$recordingIcons };
-				delete updated[rec.relative_path];
-				$recordingIcons = updated;
-				saveRecordingIcons(vault, updated);
-			}
-			await refreshRecordings();
-		} catch (e) {
-			console.error('Failed to delete recording:', e);
-		}
-	}
-
-	function formatDuration(sec?: number): string {
-		if (!sec || sec <= 0) return '';
-		const m = Math.floor(sec / 60);
-		const s = Math.floor(sec % 60);
-		return `${m}:${s < 10 ? '0' : ''}${s}`;
 	}
 
 	function selectAllNotes() {
@@ -919,7 +714,7 @@
 		try {
 			const selected = await openDialog({
 				multiple: false,
-				filters: [{ name: 'Images', extensions: ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico'] }]
+				filters: [{ name: $ui('ui.images'), extensions: ['png', 'jpg', 'jpeg', 'gif', 'svg', 'webp', 'ico'] }]
 			});
 			if (!selected || !ownerIsCurrent() || !latest()) return;
 			const filePath = selected as string;
@@ -1004,6 +799,210 @@
 		stylePickerTag = tag;
 	}
 
+
+	function loadRecordingIcons(vault: string) {
+		try {
+			const saved = localStorage.getItem(`cuelm_rec_icons_${vault}`);
+			if (saved) {
+				$recordingIcons = JSON.parse(saved);
+			} else {
+				$recordingIcons = {};
+			}
+		} catch {
+			$recordingIcons = {};
+		}
+	}
+
+	function saveRecordingIcons(vault: string, icons: Record<string, string>) {
+		try {
+			localStorage.setItem(`cuelm_rec_icons_${vault}`, JSON.stringify(icons));
+		} catch (e) {
+			console.error('Failed to save recording icons:', e);
+		}
+	}
+
+	export async function refreshRecordings() {
+		try {
+			const vault = $appConfig?.active_vault;
+			if (vault) loadRecordingIcons(vault);
+			const recs = await getRecordings(vault);
+			$recordings = recs;
+		} catch (e) {
+			console.error('Failed to refresh recordings:', e);
+		}
+	}
+
+	function buildRecordingsTree(list: RecordingEntry[]): RecordingEntry[] {
+		const parents: RecordingEntry[] = [];
+		const childrenMap = new Map<string, RecordingEntry[]>();
+
+		for (const rec of list) {
+			if (rec.parent_name) {
+				const existing = childrenMap.get(rec.parent_name) || [];
+				existing.push(rec);
+				childrenMap.set(rec.parent_name, existing);
+			} else {
+				parents.push({ ...rec, children: [] });
+			}
+		}
+
+		for (const p of parents) {
+			const stem = p.name.replace(/\.[^/.]+$/, "");
+			p.children = childrenMap.get(stem) || [];
+		}
+
+		for (const [parentName, subs] of childrenMap.entries()) {
+			if (!parents.some(p => p.name.replace(/\.[^/.]+$/, "") === parentName)) {
+				parents.push(...subs.map(s => ({ ...s, children: [] })));
+			}
+		}
+
+		return parents;
+	}
+	let sortedRecordings = $derived(buildRecordingsTree($recordings));
+
+	function handleNewRecording() {
+		const vault = $appConfig?.active_vault;
+		const recPath = vault ? `${vault}/Recordings` : '';
+		openAudioRecorder(recPath).catch((err) => {
+			console.error('Failed to open AudioRecorder:', err);
+		});
+	}
+
+	function handleRecordingClick(rec: RecordingEntry) {
+		const vault = $appConfig?.active_vault;
+		const recDir = vault ? `${vault}/Recordings` : '';
+		playRecordingInAudioRecorder(recDir, rec.path).catch(console.error);
+	}
+
+	function onRecordingContextMenu(e: MouseEvent, rec: RecordingEntry) {
+		e.preventDefault();
+		e.stopPropagation();
+		const { x, y } = clampMenu(e.clientX, e.clientY, 200, 180);
+		recordingContextMenu = { x, y, recording: rec };
+	}
+
+	function openRecordingActionsMenu(e: Event, rec: RecordingEntry) {
+		e.preventDefault();
+		e.stopPropagation();
+		const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+		const { x, y } = clampMenu(rect.right - 200, rect.bottom + 4, 200, 180);
+		recordingContextMenu = { x, y, recording: rec };
+	}
+
+	function toggleRecordingCollapse(rec: RecordingEntry, e: Event) {
+		e.stopPropagation();
+		if (collapsedRecordings.includes(rec.path)) {
+			collapsedRecordings = collapsedRecordings.filter(p => p !== rec.path);
+		} else {
+			collapsedRecordings = [...collapsedRecordings, rec.path];
+		}
+	}
+
+	function startNewSubRecording(rec: RecordingEntry) {
+		recordingContextMenu = null;
+		const vault = $appConfig?.active_vault;
+		const recPath = vault ? `${vault}/Recordings` : '';
+		const parentStem = rec.name.replace(/\.[^/.]+$/, "");
+		const subPrefix = `${parentStem}__sub__`;
+		if (collapsedRecordings.includes(rec.path)) {
+			collapsedRecordings = collapsedRecordings.filter(p => p !== rec.path);
+		}
+		openAudioRecorder(recPath, subPrefix).catch(console.error);
+	}
+
+	async function startRenameRecording(rec: RecordingEntry) {
+		recordingContextMenu = null;
+		editingRecording = rec.path;
+		editRecordingValue = rec.display_name ? rec.display_name.replace(/\.[^/.]+$/, "") : rec.name.replace(/\.[^/.]+$/, "");
+		await tick();
+		renameRecordingInput?.focus();
+		renameRecordingInput?.select();
+	}
+
+	async function handleRenameRecording(rec: RecordingEntry) {
+		if (!editRecordingValue.trim() || editRecordingValue.trim() === (rec.display_name || rec.name).replace(/\.[^/.]+$/, "")) {
+			editingRecording = null;
+			return;
+		}
+		try {
+			const vault = $appConfig?.active_vault;
+			if (!vault) return;
+			const newPath = await renameRecording(vault, rec.path, editRecordingValue.trim());
+			if ($recordingIcons[rec.relative_path]) {
+				const icon = $recordingIcons[rec.relative_path];
+				const updated = { ...$recordingIcons };
+				delete updated[rec.relative_path];
+				const newRelative = newPath.slice(vault.length + 1).replace(/\\/g, '/');
+				updated[newRelative] = icon;
+				$recordingIcons = updated;
+				saveRecordingIcons(vault, updated);
+			}
+			editingRecording = null;
+			await refreshRecordings();
+		} catch (e) {
+			console.error('Failed to rename recording:', e);
+			editingRecording = null;
+		}
+	}
+
+	async function openRecordingIconPicker(rec: RecordingEntry) {
+		recordingContextMenu = null;
+		iconPickerRecording = rec;
+		await tick();
+	}
+
+	function selectRecordingIcon(rec: RecordingEntry, iconId: NotebookIconId) {
+		const vault = $appConfig?.active_vault;
+		if (!vault) return;
+		const key = rec.relative_path;
+		const updated = { ...$recordingIcons, [key]: encodeBuiltinNotebookIcon(iconId) };
+		$recordingIcons = updated;
+		saveRecordingIcons(vault, updated);
+		iconPickerRecording = null;
+	}
+
+	function removeRecordingIcon(rec: RecordingEntry) {
+		const vault = $appConfig?.active_vault;
+		if (!vault) return;
+		const key = rec.relative_path;
+		const updated = { ...$recordingIcons };
+		delete updated[key];
+		$recordingIcons = updated;
+		saveRecordingIcons(vault, updated);
+		iconPickerRecording = null;
+	}
+
+	function handleDeleteRecording(rec: RecordingEntry) {
+		recordingContextMenu = null;
+		deleteConfirmRecording = rec;
+	}
+
+	async function confirmDeleteRecording(rec: RecordingEntry) {
+		deleteConfirmRecording = null;
+		try {
+			const vault = $appConfig?.active_vault;
+			if (!vault) return;
+			await deleteRecording(vault, rec.path);
+			if ($recordingIcons[rec.relative_path]) {
+				const updated = { ...$recordingIcons };
+				delete updated[rec.relative_path];
+				$recordingIcons = updated;
+				saveRecordingIcons(vault, updated);
+			}
+			await refreshRecordings();
+		} catch (e) {
+			console.error('Failed to delete recording:', e);
+		}
+	}
+
+	function formatDuration(sec?: number): string {
+		if (!sec || sec <= 0) return '';
+		const m = Math.floor(sec / 60);
+		const s = Math.floor(sec % 60);
+		return `${m}:${s < 10 ? '0' : ''}${s}`;
+	}
+
 	function onTrashContextMenu(e: MouseEvent) {
 		e.preventDefault();
 		e.stopPropagation();
@@ -1035,16 +1034,15 @@
 		if (contextMenu) contextMenu = null;
 		if (trashContextMenu) trashContextMenu = null;
 		if (tagContextMenu) tagContextMenu = null;
-		if (recordingContextMenu) recordingContextMenu = null;
 	}
 </script>
 
-<svelte:window onclick={handleWindowClick} onkeydown={(e) => { if (e.key === 'Escape') { iconPickerNotebook = null; tagContextMenu = null; iconPickerRecording = null; recordingContextMenu = null; editingRecording = null; } }} />
+<svelte:window onclick={handleWindowClick} onkeydown={(e) => { if (e.key === 'Escape') { iconPickerNotebook = null; tagContextMenu = null; } }} />
 
 <aside class="sidebar" class:collapsed={!isMobile && $sidebarCollapsed} class:mobile={isMobile} class:nav-empty={!anyNavItem}>
 	{#if !isMobile}
 	<div class="sidebar-header">
-		<button class="collapse-btn" onclick={() => ($sidebarCollapsed = !$sidebarCollapsed)} title="Toggle sidebar">
+		<button class="collapse-btn" onclick={() => ($sidebarCollapsed = !$sidebarCollapsed)} title={$ui("ui.toggle_sidebar")}>
 			<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 				{#if $sidebarCollapsed}
 					<polyline points="9 6 15 12 9 18" />
@@ -1053,7 +1051,7 @@
 				{/if}
 			</svg>
 		</button>
-			<button class="icon-btn" onclick={() => ($showSearch = true)} title={`Search (${modKey}+F)`}>
+			<button class="icon-btn" onclick={() => ($showSearch = true)} title={$ui("ui.search_f", { value0: modKey })}>
 				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<circle cx="11" cy="11" r="8" />
 					<line x1="21" y1="21" x2="16.65" y2="16.65" />
@@ -1075,7 +1073,7 @@
 					<path d="M16 3H5a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2V8z" />
 					<polyline points="14 3 14 8 21 8" />
 				</svg>
-				<span>All Notes</span>
+				<span>{$ui("ui.all_notes")}</span>
 			</button>
 			{/if}
 
@@ -1088,7 +1086,7 @@
 				<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2" />
 				</svg>
-				<span>Quick Access</span>
+				<span>{$ui("ui.quick_access")}</span>
 			</button>
 			{/if}
 
@@ -1102,7 +1100,7 @@
 					<path d="M9 11l3 3L22 4" />
 					<path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11" />
 				</svg>
-				<span>Tasks</span>
+				<span>{$ui("ui.tasks")}</span>
 			</button>
 			{/if}
 
@@ -1118,7 +1116,7 @@
 					<line x1="8" y1="2" x2="8" y2="6" />
 					<line x1="3" y1="10" x2="21" y2="10" />
 				</svg>
-				<span>Daily Notes</span>
+				<span>{$ui("ui.daily_notes")}</span>
 			</button>
 			{/if}
 
@@ -1132,7 +1130,7 @@
 				<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2" /><line x1="10" y1="11" x2="10" y2="17" /><line x1="14" y1="11" x2="14" y2="17" />
 				</svg>
-				<span>Trash</span>
+				<span>{$ui("ui.trash")}</span>
 			</button>
 			{/if}
 		</nav>
@@ -1160,10 +1158,10 @@
 					}
 				}}
 			>
-				<span class="section-title">Notebooks</span>
+				<span class="section-title">{$ui("ui.notebooks")}</span>
 				<div class="section-actions">
 					{#if allParentPaths.length > 0}
-						<button class="icon-btn-sm" onclick={(e) => { e.stopPropagation(); toggleAllCollapse(); }} title={allCollapsed ? 'Expand all notebooks' : 'Collapse all notebooks'} aria-label={allCollapsed ? 'Expand all notebooks' : 'Collapse all notebooks'}>
+						<button class="icon-btn-sm" onclick={(e) => { e.stopPropagation(); toggleAllCollapse(); }} title={allCollapsed ? $ui("ui.expand_all_notebooks") : $ui("ui.collapse_all_notebooks")} aria-label={allCollapsed ? $ui("ui.expand_all_notebooks") : $ui("ui.collapse_all_notebooks")}>
 							<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 								{#if allCollapsed}
 									<path d="m7 15 5 5 5-5" /><path d="m7 9 5-5 5 5" />
@@ -1173,7 +1171,7 @@
 							</svg>
 						</button>
 					{/if}
-					<button class="icon-btn-sm" onclick={toggleNewNotebookInput} title={$viewMode === 'notebook' && $activeNotebook?.relative_path ? `New notebook inside ${$activeNotebook.name}` : 'New notebook'}>
+					<button class="icon-btn-sm" onclick={toggleNewNotebookInput} title={$viewMode === 'notebook' && $activeNotebook?.relative_path ? $ui("ui.new_notebook_inside", { value0: $activeNotebook.name }) : $ui("ui.new_notebook")}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" />
 						</svg>
@@ -1184,7 +1182,7 @@
 			{#if showNewNotebook}
 				<div class="new-notebook-input">
 					{#if newNotebookParent}
-						<button class="new-notebook-parent" title="Click to create a top-level notebook instead" onmousedown={(e) => { e.preventDefault(); newNotebookParent = null; }}>
+						<button class="new-notebook-parent" title={$ui("ui.click_to_create_a_top_level_notebook_instead")} onmousedown={(e) => { e.preventDefault(); newNotebookParent = null; }}>
 							{newNotebookParent.name}/<span class="new-notebook-parent-x" aria-hidden="true">×</span>
 						</button>
 					{/if}
@@ -1192,7 +1190,7 @@
 						bind:this={newNotebookInput}
 						type="text"
 						bind:value={newNotebookName}
-						placeholder={newNotebookParent ? 'Sub-notebook name...' : 'Notebook name...'}
+						placeholder={newNotebookParent ? $ui("ui.sub_notebook_name") : $ui("ui.notebook_name")}
 						onkeydown={handleNewNotebookKeydown}
 					/>
 				</div>
@@ -1214,7 +1212,7 @@
 						<path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z" />
 					</svg>
 					</span>
-					<span class="notebook-name">Unfiled Notes <span class="notebook-count">{$rootNoteCount}</span></span>
+					<span class="notebook-name">{$ui("ui.unfiled_notes")} <span class="notebook-count">{$rootNoteCount}</span></span>
 					</button>
 				{/if}
 				{#each sortedNotebooks as nb (nb.path)}
@@ -1224,7 +1222,7 @@
 		{#if isMobile && $tags.length > 0}
 				<div class="tags-section-inline">
 					<button class="section-header" onclick={() => tagsCollapsed = !tagsCollapsed}>
-						<span class="section-title">Tags</span>
+						<span class="section-title">{$ui("ui.tags_848eed")}</span>
 						<span class="tag-count" style="margin-left: auto">{$tags.length}</span>
 					</button>
 					{#if !tagsCollapsed}
@@ -1238,10 +1236,27 @@
 			{/if}
 		</div>
 
+		{#if !isMobile && $tags.length > 0}
+			<div class="tags-section">
+				<button class="section-header" onclick={() => tagsCollapsed = !tagsCollapsed}>
+					<span class="section-title">{$ui("ui.tags_848eed")}</span>
+					<span class="tag-count" style="margin-left: auto">{$tags.length}</span>
+				</button>
+				{#if !tagsCollapsed}
+					<div class="tag-list">
+						{#each $tags as [tag, count] (tag)}
+							{@render tagRow(tag, count)}
+						{/each}
+					</div>
+				{/if}
+			</div>
+		{/if}
+	{/if}
+
 		<!-- ═══ RECORDINGS SECTION ═══ -->
 		<div class="section recordings-section">
 			<div class="section-header">
-				<span class="section-title">Recordings</span>
+				<span class="section-title">{"Recordings"}</span>
 				<div class="section-actions">
 					{#if $recordings.length > 0}
 						<button
@@ -1275,7 +1290,7 @@
 			{#if !$recordingsCollapsed}
 				<div class="recording-list">
 					{#if $recordings.length === 0}
-						<div class="sidebar-empty-hint">No recordings yet</div>
+						<div class="sidebar-empty-hint">{"No recordings yet"}</div>
 					{:else}
 						{#each sortedRecordings as rec (rec.path)}
 							{@render recordingItem(rec, 0)}
@@ -1284,26 +1299,8 @@
 				</div>
 			{/if}
 		</div>
-
-		{#if !isMobile && $tags.length > 0}
-			<div class="tags-section">
-				<button class="section-header" onclick={() => tagsCollapsed = !tagsCollapsed}>
-					<span class="section-title">Tags</span>
-					<span class="tag-count" style="margin-left: auto">{$tags.length}</span>
-				</button>
-				{#if !tagsCollapsed}
-					<div class="tag-list">
-						{#each $tags as [tag, count] (tag)}
-							{@render tagRow(tag, count)}
-						{/each}
-					</div>
-				{/if}
-			</div>
-		{/if}
-	{/if}
-
 		<div class="sidebar-footer">
-			<button class="icon-btn" onclick={() => ($showInfo = true)} title="Info">
+			<button class="icon-btn" onclick={() => ($showInfo = true)} title={$ui("ui.info")}>
 				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<circle cx="12" cy="12" r="10" />
 					<line x1="12" y1="16" x2="12" y2="12" />
@@ -1311,7 +1308,7 @@
 				</svg>
 			</button>
 			<div class="sidebar-footer-right">
-			<button class="icon-btn" onclick={() => ($showSettings = true)} title="Settings">
+			<button class="icon-btn" onclick={() => ($showSettings = true)} title={$ui("ui.settings")}>
 				<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 					<circle cx="12" cy="12" r="3" />
 					<path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z" />
@@ -1324,39 +1321,39 @@
 
 {#if contextMenu}
 	{#if isMobile}
-		<button type="button" class="context-menu-backdrop" aria-label="Close notebook actions" onclick={closeContextMenu}></button>
+		<button type="button" class="context-menu-backdrop" aria-label={$ui("ui.close_notebook_actions")} onclick={closeContextMenu}></button>
 	{/if}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div class="context-menu" class:mobile={isMobile} style="left: {contextMenu.x}px; top: {contextMenu.y}px" onmousedown={(e) => e.stopPropagation()}>
 		<button onclick={() => startNewSubNotebook(contextMenu!.notebook)}>
 			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 01-2 2H4a2 2 0 01-2-2V5a2 2 0 012-2h5l2 3h9a2 2 0 012 2z" /><line x1="12" y1="11" x2="12" y2="17" /><line x1="9" y1="14" x2="15" y2="14" /></svg>
-			New Sub-notebook
+			{$ui("ui.new_sub_notebook")}
 		</button>
 		<button onclick={() => startRename(contextMenu!.notebook)}>
 			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" /><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" /></svg>
-			Rename
+			{$ui("ui.rename")}
 		</button>
 		<button onclick={() => openIconPicker(contextMenu!.notebook)}>
 			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10" /><path d="M8 14s1.5 2 4 2 4-2 4-2" /><line x1="9" y1="9" x2="9.01" y2="9" /><line x1="15" y1="9" x2="15.01" y2="9" /></svg>
-			{$notebookIcons[normalizeNotebookIconKey(contextMenu.notebook.relative_path)] ? 'Change Icon...' : 'Set Icon...'}
+			{$notebookIcons[normalizeNotebookIconKey(contextMenu.notebook.relative_path)] ? $ui("ui.change_icon") : $ui("ui.set_icon")}
 		</button>
 		<button class="danger" onclick={() => handleDelete(contextMenu!.notebook)}>
 			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2" /></svg>
-			Delete
+			{$ui("ui.delete_action")}
 		</button>
 	</div>
 {/if}
 
 {#if iconPickerNotebook}
 	<div class="icon-picker-overlay" class:mobile={isMobile}>
-		<button class="icon-picker-backdrop" aria-label="Close icon picker" onclick={() => iconPickerNotebook = null}></button>
-		<div bind:this={iconPickerElement} class="icon-picker" role="dialog" aria-modal="true" aria-label={`Choose an icon for ${iconPickerNotebook.name}`} tabindex="-1">
+		<button class="icon-picker-backdrop" aria-label={$ui("ui.close_icon_picker")} onclick={() => iconPickerNotebook = null}></button>
+		<div bind:this={iconPickerElement} class="icon-picker" role="dialog" aria-modal="true" aria-label={$ui("ui.choose_an_icon_for", { value0: iconPickerNotebook.name })} tabindex="-1">
 			<header class="icon-picker-header">
 				<div>
-					<h3>Notebook icon</h3>
+					<h3>{$ui("ui.notebook_icon")}</h3>
 					<p>{iconPickerNotebook.name}</p>
 				</div>
-				<button class="icon-picker-close" aria-label="Close icon picker" onclick={() => iconPickerNotebook = null}>
+				<button class="icon-picker-close" aria-label={$ui("ui.close_icon_picker")} onclick={() => iconPickerNotebook = null}>
 					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
 				</button>
 			</header>
@@ -1366,26 +1363,26 @@
 						class="icon-picker-option"
 						class:active={iconPickerActive === option.id}
 						style:color={iconPickerColor}
-						aria-label={option.label}
-						title={option.label}
+						aria-label={$uiLabel(option.label)}
+						title={$uiLabel(option.label)}
 						onclick={() => handleBuiltinIcon(iconPickerNotebook!, option.id)}
 					>
 						<NotebookGlyph icon={option.id} size={20} />
-						<span>{option.label}</span>
+						<span>{$uiLabel(option.label)}</span>
 					</button>
 				{/each}
 				<button class="icon-picker-more" aria-expanded={iconPickerExpanded} onclick={() => iconPickerShowAll = !iconPickerExpanded}>
-					{iconPickerExpanded ? 'Fewer icons' : 'More icons'}
+					{iconPickerExpanded ? $ui("ui.fewer_icons") : $ui("ui.more_icons")}
 				</button>
 			</div>
 			<div class="icon-color-section">
-				<span class="icon-color-label">Color</span>
+				<span class="icon-color-label">{$ui("ui.color")}</span>
 				<div class="icon-swatches">
 					<button
 						class="icon-swatch none"
 						class:active={!iconPickerColor}
-						aria-label="Use default color"
-						title="Default color"
+						aria-label={$ui("ui.use_default_color")}
+						title={$ui("ui.default_color")}
 						onclick={() => handleIconColor(iconPickerNotebook!, null)}
 					></button>
 					{#each TAG_COLOR_PRESETS as preset (preset)}
@@ -1393,17 +1390,17 @@
 							class="icon-swatch"
 							class:active={iconPickerColor === preset}
 							style:background={preset}
-							aria-label={`Use ${preset}`}
+							aria-label={$ui("ui.use", { value0: preset })}
 							title={preset}
 							onclick={() => handleIconColor(iconPickerNotebook!, preset)}
 						></button>
 					{/each}
-					<label class="icon-swatch custom" title="Custom color">
+					<label class="icon-swatch custom" title={$ui("ui.custom_color")}>
 						<input
 							type="color"
 							value={iconPickerColor?.length === 7 ? iconPickerColor : '#5b6abf'}
 							oninput={(e) => handleIconColor(iconPickerNotebook!, e.currentTarget.value)}
-							aria-label="Custom icon color"
+							aria-label={$ui("ui.custom_icon_color")}
 						/>
 					</label>
 				</div>
@@ -1411,15 +1408,15 @@
 			<div class="icon-picker-actions">
 				<button onclick={() => handleCustomIcon(iconPickerNotebook!)}>
 					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" /><circle cx="8.5" cy="8.5" r="1.5" /><path d="m21 15-5-5L5 21" /></svg>
-					Custom image...
+					{$ui("ui.custom_image")}
 				</button>
 				{#if $notebookIcons[normalizeNotebookIconKey(iconPickerNotebook.relative_path)]}
 					<button class="remove" onclick={() => handleRemoveIcon(iconPickerNotebook!)}>
 						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13" /></svg>
-						Use default
+						{$ui("ui.use_default")}
 					</button>
 				{/if}
-				<p class="icon-picker-recommendation">Colors do not apply to custom images. Recommended image size: <strong>1:1 aspect ratio</strong></p>
+				<p class="icon-picker-recommendation">{$ui("ui.colors_do_not_apply_to_custom_images_recommended_image_size")} <strong>{$ui("ui.1_1_aspect_ratio")}</strong></p>
 			</div>
 		</div>
 	</div>
@@ -1427,13 +1424,13 @@
 
 {#if tagContextMenu}
 	{#if isMobile}
-		<button type="button" class="context-menu-backdrop" aria-label="Close tag actions" onclick={() => tagContextMenu = null}></button>
+		<button type="button" class="context-menu-backdrop" aria-label={$ui("ui.close_tag_actions")} onclick={() => tagContextMenu = null}></button>
 	{/if}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div class="context-menu" class:mobile={isMobile} style="left: {tagContextMenu.x}px; top: {tagContextMenu.y}px" onmousedown={(e) => e.stopPropagation()}>
 		<button onclick={() => openTagStylePicker(tagContextMenu!.tag)}>
 			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10" /><path d="M8 14s1.5 2 4 2 4-2 4-2" /><line x1="9" y1="9" x2="9.01" y2="9" /><line x1="15" y1="9" x2="15.01" y2="9" /></svg>
-			Customize...
+			{$ui("ui.customize")}
 		</button>
 	</div>
 {/if}
@@ -1444,7 +1441,7 @@
 
 {#if trashContextMenu}
 	{#if isMobile}
-		<button type="button" class="context-menu-backdrop" aria-label="Close trash actions" onclick={() => trashContextMenu = null}></button>
+		<button type="button" class="context-menu-backdrop" aria-label={$ui("ui.close_trash_actions")} onclick={() => trashContextMenu = null}></button>
 	{/if}
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div class="context-menu" class:mobile={isMobile} style="left: {trashContextMenu.x}px; top: {trashContextMenu.y}px" onmousedown={(e) => e.stopPropagation()}>
@@ -1452,7 +1449,7 @@
 			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 				<polyline points="3 6 5 6 21 6" /><path d="M19 6v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2" /><line x1="10" y1="11" x2="10" y2="17" /><line x1="14" y1="11" x2="14" y2="17" />
 			</svg>
-			Empty Trash
+			{$ui("ui.empty_trash")}
 		</button>
 	</div>
 {/if}
@@ -1461,95 +1458,11 @@
 	<!-- svelte-ignore a11y_no_static_element_interactions -->
 	<div class="delete-confirm-overlay" onclick={dismissDeleteConfirm} onkeydown={(e) => { if (e.key === 'Escape') deleteConfirm = null; }}>
 		<div class="delete-confirm" class:mobile={isMobile} role="alertdialog" aria-modal="true" aria-labelledby="delete-confirm-title" tabindex="-1">
-			<h4 id="delete-confirm-title">Delete "{deleteConfirm.name}"?</h4>
-			<p>This notebook contains {countNotesRecursive(deleteConfirm)} note{countNotesRecursive(deleteConfirm) === 1 ? '' : 's'} that will be permanently deleted.</p>
+			<h4 id="delete-confirm-title">{$ui("ui.delete", { value0: deleteConfirm.name })}</h4>
+			<p>{$ui("ui.this_notebook_contains_note_that_will_be_permanently_deleted", { value0: countNotesRecursive(deleteConfirm), value1: countNotesRecursive(deleteConfirm) === 1 ? '' : 's' })}</p>
 			<div class="delete-confirm-actions">
-				<button class="delete-confirm-cancel" onclick={() => deleteConfirm = null}>Cancel</button>
-				<button class="delete-confirm-btn" onclick={() => confirmDelete(deleteConfirm!)}>Delete</button>
-			</div>
-		</div>
-	</div>
-{/if}
-
-{#if recordingContextMenu}
-	{#if isMobile}
-		<button type="button" class="context-menu-backdrop" aria-label="Close recording actions" onclick={() => recordingContextMenu = null}></button>
-	{/if}
-	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="context-menu" class:mobile={isMobile} style="left: {recordingContextMenu.x}px; top: {recordingContextMenu.y}px" onmousedown={(e) => e.stopPropagation()}>
-		<button onclick={() => startNewSubRecording(recordingContextMenu!.recording)}>
-			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-				<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-				<path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-				<line x1="12" y1="19" x2="12" y2="23"/>
-				<line x1="8" y1="23" x2="16" y2="23"/>
-			</svg>
-			New Sub-recording
-		</button>
-		<button onclick={() => startRenameRecording(recordingContextMenu!.recording)}>
-			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" /><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" /></svg>
-			Rename
-		</button>
-		<button onclick={() => openRecordingIconPicker(recordingContextMenu!.recording)}>
-			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10" /><path d="M8 14s1.5 2 4 2 4-2 4-2" /><line x1="9" y1="9" x2="9.01" y2="9" /><line x1="15" y1="9" x2="15.01" y2="9" /></svg>
-			{$recordingIcons[recordingContextMenu.recording.relative_path] ? 'Change Icon...' : 'Set Icon...'}
-		</button>
-		<button class="danger" onclick={() => handleDeleteRecording(recordingContextMenu!.recording)}>
-			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2" /></svg>
-			Delete
-		</button>
-	</div>
-{/if}
-
-{#if iconPickerRecording}
-	<div class="icon-picker-overlay" class:mobile={isMobile}>
-		<button class="icon-picker-backdrop" aria-label="Close icon picker" onclick={() => iconPickerRecording = null}></button>
-		<div class="icon-picker" role="dialog" aria-modal="true" aria-label={`Choose an icon for ${iconPickerRecording.display_name || iconPickerRecording.name}`} tabindex="-1">
-			<header class="icon-picker-header">
-				<div>
-					<h3>Recording icon</h3>
-					<p>{iconPickerRecording.display_name || iconPickerRecording.name}</p>
-				</div>
-				<button class="icon-picker-close" aria-label="Close icon picker" onclick={() => iconPickerRecording = null}>
-					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
-				</button>
-			</header>
-			<div class="icon-picker-grid">
-				{#each NOTEBOOK_ICON_OPTIONS as option}
-					<button
-						type="button"
-						class="icon-picker-option"
-						class:active={$recordingIcons[iconPickerRecording.relative_path] === encodeBuiltinNotebookIcon(option.id)}
-						aria-label={option.label}
-						title={option.label}
-						onclick={() => selectRecordingIcon(iconPickerRecording!, option.id)}
-					>
-						<NotebookGlyph icon={option.id} size={20} />
-						<span>{option.label}</span>
-					</button>
-				{/each}
-			</div>
-			<div class="icon-picker-actions">
-				{#if $recordingIcons[iconPickerRecording.relative_path]}
-					<button class="remove" onclick={() => removeRecordingIcon(iconPickerRecording!)}>
-						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13" /></svg>
-						Use default
-					</button>
-				{/if}
-			</div>
-		</div>
-	</div>
-{/if}
-
-{#if deleteConfirmRecording}
-	<!-- svelte-ignore a11y_no_static_element_interactions -->
-	<div class="delete-confirm-overlay" onclick={(e) => { if (e.target === e.currentTarget) deleteConfirmRecording = null; }} onkeydown={(e) => { if (e.key === 'Escape') deleteConfirmRecording = null; }}>
-		<div class="delete-confirm" class:mobile={isMobile} role="alertdialog" aria-modal="true" aria-labelledby="delete-recording-title" tabindex="-1">
-			<h4 id="delete-recording-title">Delete "{deleteConfirmRecording.display_name || deleteConfirmRecording.name}"?</h4>
-			<p>This recording {deleteConfirmRecording.children && deleteConfirmRecording.children.length > 0 ? `and its ${deleteConfirmRecording.children.length} sub-recording(s)` : ''} will be permanently deleted from the vault.</p>
-			<div class="delete-confirm-actions">
-				<button class="delete-confirm-cancel" onclick={() => deleteConfirmRecording = null}>Cancel</button>
-				<button class="delete-confirm-btn" onclick={() => confirmDeleteRecording(deleteConfirmRecording!)}>Delete</button>
+				<button class="delete-confirm-cancel" onclick={() => deleteConfirm = null}>{$ui("ui.cancel")}</button>
+				<button class="delete-confirm-btn" onclick={() => confirmDelete(deleteConfirm!)}>{$ui('ui.delete_action')}</button>
 			</div>
 		</div>
 	</div>
@@ -1572,7 +1485,7 @@
 			<button
 				type="button"
 				class="notebook-actions-btn"
-				aria-label={`Customize ${tag}`}
+				aria-label={$ui("ui.customize_203d6f", { value0: tag })}
 				onclick={(e) => openTagMenu(e, tag)}
 			>
 				<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
@@ -1699,7 +1612,7 @@
 				<!-- svelte-ignore a11y_no_static_element_interactions -->
 				<span
 					class="nb-drag-handle"
-					title="Drag to reorder"
+					title={$ui("ui.drag_to_reorder")}
 					onpointerdown={(e) => nbHandleDown(e, nb)}
 				>
 					<svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="5" r="1.6"/><circle cx="15" cy="5" r="1.6"/><circle cx="9" cy="12" r="1.6"/><circle cx="15" cy="12" r="1.6"/><circle cx="9" cy="19" r="1.6"/><circle cx="15" cy="19" r="1.6"/></svg>
@@ -1710,7 +1623,7 @@
 			<button
 				type="button"
 				class="notebook-actions-btn"
-				aria-label={`Actions for ${nb.name}`}
+				aria-label={$ui("ui.actions_for", { value0: nb.name })}
 				onclick={(e) => openNotebookMenu(e, nb)}
 			>
 				<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
@@ -1772,7 +1685,7 @@
 					{#if builtinIcon}
 						<NotebookGlyph icon={builtinIcon} size={16} />
 					{:else}
-						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="opacity: 0.7;">
+						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
 							<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
 							<path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
 							<line x1="12" y1="19" x2="12" y2="23"/>
@@ -1786,16 +1699,15 @@
 					<span class="recording-meta">{formatDuration(rec.duration)}</span>
 				{/if}
 			</button>
+
 			{#if isMobile}
 				<button
 					type="button"
 					class="notebook-actions-btn"
-					aria-label={`Actions for ${rec.display_name || rec.name}`}
+					aria-label={`Recording actions for ${rec.display_name || rec.name}`}
 					onclick={(e) => openRecordingActionsMenu(e, rec)}
 				>
-					<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-						<circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/>
-					</svg>
+					<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.8"/><circle cx="12" cy="12" r="1.8"/><circle cx="19" cy="12" r="1.8"/></svg>
 				</button>
 			{/if}
 		</div>
@@ -1806,6 +1718,90 @@
 		{/each}
 	{/if}
 {/snippet}
+
+{#if recordingContextMenu}
+	{#if isMobile}
+		<button type="button" class="context-menu-backdrop" aria-label="Close recording actions" onclick={() => recordingContextMenu = null}></button>
+	{/if}
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="context-menu" class:mobile={isMobile} style="left: {recordingContextMenu.x}px; top: {recordingContextMenu.y}px" onmousedown={(e) => e.stopPropagation()}>
+		<button onclick={() => startNewSubRecording(recordingContextMenu!.recording)}>
+			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+				<path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+				<path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+				<line x1="12" y1="19" x2="12" y2="23"/>
+				<line x1="8" y1="23" x2="16" y2="23"/>
+			</svg>
+			{'New Sub-recording'}
+		</button>
+		<button onclick={() => startRenameRecording(recordingContextMenu!.recording)}>
+			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" /><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" /></svg>
+			{$ui('ui.rename')}
+		</button>
+		<button onclick={() => openRecordingIconPicker(recordingContextMenu!.recording)}>
+			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10" /><path d="M8 14s1.5 2 4 2 4-2 4-2" /><line x1="9" y1="9" x2="9.01" y2="9" /><line x1="15" y1="9" x2="15.01" y2="9" /></svg>
+			{$recordingIcons[recordingContextMenu.recording.relative_path] ? $ui('ui.change_icon') : $ui('ui.set_icon')}
+		</button>
+		<button class="danger" onclick={() => handleDeleteRecording(recordingContextMenu!.recording)}>
+			<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2" /></svg>
+			{$ui('ui.delete_action')}
+		</button>
+	</div>
+{/if}
+
+{#if iconPickerRecording}
+	<div class="icon-picker-overlay" class:mobile={isMobile}>
+		<button class="icon-picker-backdrop" aria-label="Close icon picker" onclick={() => iconPickerRecording = null}></button>
+		<div class="icon-picker" role="dialog" aria-modal="true" aria-label={`Choose an icon for ${iconPickerRecording.display_name || iconPickerRecording.name}`} tabindex="-1">
+			<header class="icon-picker-header">
+				<div>
+					<h3>{'Recording icon'}</h3>
+					<p>{iconPickerRecording.display_name || iconPickerRecording.name}</p>
+				</div>
+				<button class="icon-picker-close" aria-label="Close icon picker" onclick={() => iconPickerRecording = null}>
+					<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12" /></svg>
+				</button>
+			</header>
+			<div class="icon-picker-grid">
+				{#each NOTEBOOK_ICON_OPTIONS as option}
+					<button
+						type="button"
+						class="icon-picker-option"
+						class:active={$recordingIcons[iconPickerRecording.relative_path] === encodeBuiltinNotebookIcon(option.id)}
+						aria-label={option.label}
+						title={option.label}
+						onclick={() => selectRecordingIcon(iconPickerRecording!, option.id)}
+					>
+						<NotebookGlyph icon={option.id} size={20} />
+						<span>{option.label}</span>
+					</button>
+				{/each}
+			</div>
+			<div class="icon-picker-actions">
+				{#if $recordingIcons[iconPickerRecording.relative_path]}
+					<button class="remove" onclick={() => removeRecordingIcon(iconPickerRecording!)}>
+						<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13" /></svg>
+						{'Use default'}
+					</button>
+				{/if}
+			</div>
+		</div>
+	</div>
+{/if}
+
+{#if deleteConfirmRecording}
+	<!-- svelte-ignore a11y_no_static_element_interactions -->
+	<div class="delete-confirm-overlay" onclick={(e) => { if (e.target === e.currentTarget) deleteConfirmRecording = null; }} onkeydown={(e) => { if (e.key === 'Escape') deleteConfirmRecording = null; }}>
+		<div class="delete-confirm" class:mobile={isMobile} role="alertdialog" aria-modal="true" aria-labelledby="delete-recording-title" tabindex="-1">
+			<h4 id="delete-recording-title">{`Delete "${deleteConfirmRecording.display_name || deleteConfirmRecording.name}"?`}</h4>
+			<p>{`This recording ${deleteConfirmRecording.children && deleteConfirmRecording.children.length > 0 ? `and its ${deleteConfirmRecording.children.length} sub-recording(s)` : ''} will be permanently deleted from the vault.`}</p>
+			<div class="delete-confirm-actions">
+				<button class="delete-confirm-cancel" onclick={() => deleteConfirmRecording = null}>{$ui('ui.cancel')}</button>
+				<button class="delete-confirm-btn" onclick={() => confirmDeleteRecording(deleteConfirmRecording!)}>{$ui('ui.delete_action')}</button>
+			</div>
+		</div>
+	</div>
+{/if}
 
 <style>
 	.sidebar-error {
@@ -2778,7 +2774,6 @@
 		font-size: 14px;
 		min-height: 44px;
 	}
-
 	.recordings-section {
 		border-top: 1px solid var(--border-light);
 		padding: 4px 0;

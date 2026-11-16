@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { t as ui, tr as uiText } from '$lib/i18n';
 	import { tick } from 'svelte';
 	import SnapshotDocument from './SnapshotDocument.svelte';
 	import { comparableBody, compareHistory, splitSnapshot, type HistoryComparison, type HistoryRow } from '$lib/utils/history-comparison';
@@ -44,7 +45,7 @@
 				if (generation !== request) return;
 				comparison = result;
 			}).catch((cause) => {
-				if (generation === request) comparisonError = `Could not compare this version: ${String(cause)}`;
+				if (generation === request) comparisonError = uiText("ui.could_not_compare_this_version", { value0: String(cause) });
 			}).finally(() => {
 				if (generation === request) comparing = false;
 			});
@@ -64,50 +65,50 @@
 {#snippet lines(rows: HistoryRow[])}
 	{#each rows as row}
 		<div class="diff-line {row.kind}">
-			<span class="line-number" aria-label="Current note line">{row.currentLine ?? ''}</span>
-			<span class="line-number" aria-label="Snapshot line">{row.snapshotLine ?? ''}</span>
-			<span class="line-sign" aria-label={row.kind === 'added' ? 'Added by restoring' : row.kind === 'removed' ? 'Removed by restoring' : 'Unchanged'}>{row.kind === 'added' ? '+' : row.kind === 'removed' ? '−' : ' '}</span>
-			<span class="line-text">{row.text || ' '}{#if !row.newline}<span class="line-ending">No final newline</span>{/if}</span>
+			<span class="line-number" aria-label={$ui("ui.current_note_line")}>{row.currentLine ?? ''}</span>
+			<span class="line-number" aria-label={$ui("ui.snapshot_line")}>{row.snapshotLine ?? ''}</span>
+			<span class="line-sign" aria-label={row.kind === 'added' ? $ui("ui.added_by_restoring") : row.kind === 'removed' ? $ui("ui.removed_by_restoring") : $ui("ui.unchanged")}>{row.kind === 'added' ? '+' : row.kind === 'removed' ? '−' : ' '}</span>
+			<span class="line-text">{row.text || ' '}{#if !row.newline}<span class="line-ending">{$ui("ui.no_final_newline")}</span>{/if}</span>
 		</div>
 	{/each}
 {/snippet}
 
-<section class="history-review" aria-label="Version review">
+<section class="history-review" aria-label={$ui("ui.version_review")}>
 	<div class="review-header">
 		<div class="review-heading">
 			<strong>{selected ?? 'Version History'}</strong>
-			<span>Read-only. Your current note stays unchanged.</span>
+			<span>{$ui("ui.read_only_your_current_note_stays_unchanged")}</span>
 		</div>
-		<div class="review-tabs" role="tablist" aria-label="Version view" tabindex="-1" onkeydown={navigateTabs}>
-			<button id="history-tab-changes" role="tab" aria-selected={view === 'changes'} aria-controls="history-changes" tabindex={view === 'changes' ? 0 : -1} onclick={() => view = 'changes'}>Changes</button>
-			<button id="history-tab-snapshot" role="tab" aria-selected={view === 'snapshot'} aria-controls="history-snapshot" tabindex={view === 'snapshot' ? 0 : -1} onclick={() => view = 'snapshot'}>Snapshot</button>
+		<div class="review-tabs" role="tablist" aria-label={$ui("ui.version_view")} tabindex="-1" onkeydown={navigateTabs}>
+			<button id="history-tab-changes" role="tab" aria-selected={view === 'changes'} aria-controls="history-changes" tabindex={view === 'changes' ? 0 : -1} onclick={() => view = 'changes'}>{$ui("ui.changes")}</button>
+			<button id="history-tab-snapshot" role="tab" aria-selected={view === 'snapshot'} aria-controls="history-snapshot" tabindex={view === 'snapshot' ? 0 : -1} onclick={() => view = 'snapshot'}>{$ui("ui.snapshot")}</button>
 		</div>
 	</div>
 
 	{#if loading}
-		<p class="review-status" role="status">Loading version…</p>
+		<p class="review-status" role="status">{$ui("ui.loading_version")}</p>
 	{:else if error}
-		<div class="review-status" role="alert"><p>{error}</p><button class="review-button" onclick={onRetry}>Retry</button></div>
+		<div class="review-status" role="alert"><p>{error}</p><button class="review-button" onclick={onRetry}>{$ui("ui.retry")}</button></div>
 	{:else if raw === null}
-		<p class="review-status">Select a version to review.</p>
+		<p class="review-status">{$ui("ui.select_a_version_to_review")}</p>
 	{:else if view === 'changes'}
 		<div id="history-changes" class="review-panel" role="tabpanel" aria-labelledby="history-tab-changes" tabindex="0">
 			<div class="comparison-heading">
-				<span>Current note → selected version</span>
-				{#if comparison}<span class="comparison-count"><span class="added-count">+{comparison.added}</span> <span class="removed-count">−{comparison.removed}</span> lines</span>{/if}
+				<span>{$ui("ui.current_note_selected_version")}</span>
+				{#if comparison}<span class="comparison-count"><span class="added-count">+{comparison.added}</span> <span class="removed-count">−{comparison.removed}</span> {$ui("ui.lines")}</span>{/if}
 			</div>
 			{#if comparing}
-				<p class="review-status" role="status">Comparing…</p>
+				<p class="review-status" role="status">{$ui("ui.comparing")}</p>
 			{:else if comparisonError}
 				<p class="review-status" role="alert">{comparisonError}</p>
 			{:else if comparison && comparison.added === 0 && comparison.removed === 0}
-				<p class="review-status">No content changes. Metadata is not restored.</p>
+				<p class="review-status">{$ui("ui.no_content_changes_metadata_is_not_restored")}</p>
 			{:else if comparison}
 				<div class="history-diff">
 					{#key raw}
 						{#each comparison.chunks as chunk}
 							{#if chunk.kind === 'unchanged'}
-								<details class="unchanged-lines"><summary>{chunk.rows.length} unchanged {chunk.rows.length === 1 ? 'line' : 'lines'}</summary>{@render lines(chunk.rows)}</details>
+								<details class="unchanged-lines"><summary>{$ui("ui.unchanged_9bc74a", { value0: chunk.rows.length, value1: chunk.rows.length === 1 ? 'line' : 'lines' })}</summary>{@render lines(chunk.rows)}</details>
 							{:else}
 								{@render lines(chunk.rows)}
 							{/if}
@@ -118,13 +119,13 @@
 		</div>
 	{:else}
 		<div id="history-snapshot" class="review-panel" role="tabpanel" aria-labelledby="history-tab-snapshot" tabindex="0">
-			<div class="snapshot-heading"><span>Selected snapshot</span><button class="source-toggle" aria-pressed={source} onclick={() => source = !source}>{source ? 'Rendered view' : 'View source'}</button></div>
+			<div class="snapshot-heading"><span>{$ui("ui.selected_snapshot")}</span><button class="source-toggle" aria-pressed={source} onclick={() => source = !source}>{source ? $ui("ui.rendered_view") : $ui("ui.view_source")}</button></div>
 			{#if snapshot.body === ''}
-				<p class="review-status">This snapshot is empty.</p>
+				<p class="review-status">{$ui("ui.this_snapshot_is_empty")}</p>
 			{:else if source}
-				<textarea class="snapshot-source" readonly aria-label="Snapshot Markdown, read-only" value={snapshot.body}></textarea>
+				<textarea class="snapshot-source" readonly aria-label={$ui("ui.snapshot_markdown_read_only")} value={snapshot.body}></textarea>
 			{:else if rendered.error}
-				<p class="review-status" role="alert">{rendered.error} View source to inspect the stored body.</p>
+				<p class="review-status" role="alert">{$ui("ui.view_source_to_inspect_the_stored_body", { value0: rendered.error })}</p>
 			{:else}
 				<SnapshotDocument html={rendered.html} />
 			{/if}
@@ -132,10 +133,10 @@
 	{/if}
 
 	{#if raw !== null && snapshot.metadata}
-		<details class="history-metadata"><summary>Metadata (not restored)</summary><pre>{snapshot.metadata}</pre></details>
+		<details class="history-metadata"><summary>{$ui("ui.metadata_not_restored")}</summary><pre>{snapshot.metadata}</pre></details>
 	{/if}
 	{#if selected}
-		<div class="review-actions"><span>Restore replaces the current note’s content only.</span><button class="history-restore-btn" disabled={!canRestore} onclick={onRestore}>Restore this version</button></div>
+		<div class="review-actions"><span>{$ui("ui.restore_replaces_the_current_note_s_content_only")}</span><button class="history-restore-btn" disabled={!canRestore} onclick={onRestore}>{$ui("ui.restore_this_version")}</button></div>
 	{/if}
 </section>
 

@@ -3,10 +3,71 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter};
 
 use crate::types::AiStreamEvent;
+pub mod images;
+pub mod models;
+use images::AiImage;
+mod sse;
+mod stream;
+
+async fn receive_stream(
+    app: &AppHandle,
+    response: reqwest::Response,
+    request_id: &str,
+    protocol: stream::Protocol,
+) -> Result<(), String> {
+    stream::receive(response, protocol, |text| {
+        let _ = app.emit(
+            "ai-stream",
+            AiStreamEvent {
+                request_id: request_id.to_owned(),
+                event_type: "text".into(),
+                text: Some(text),
+                error: None,
+            },
+        );
+    })
+    .await?;
+    // This is the only success event; errors are emitted once by ai_request.
+    let _ = app.emit(
+        "ai-stream",
+        AiStreamEvent {
+            request_id: request_id.to_owned(),
+            event_type: "done".into(),
+            text: None,
+            error: None,
+        },
+    );
+    Ok(())
+}
 
 const ANTHROPIC_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const OPENAI_API_URL: &str = "https://api.openai.com/v1/chat/completions";
 const OLLAMA_DEFAULT_URL: &str = "http://localhost:11434";
+
+fn request_client() -> Result<Client, String> {
+    Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(180))
+        .build()
+        .map_err(|_| "Could not initialize AI connection".into())
+}
+
+fn connection_error(_: reqwest::Error) -> String {
+    // reqwest errors may contain configured URLs, including credentials or query secrets.
+    "AI connection failed. Check the connection and configured server.".into()
+}
+
+fn http_error(status: reqwest::StatusCode) -> String {
+    let hint = match status.as_u16() {
+        401 | 403 => "Check the API key and account permissions.",
+        429 => "Check rate limits and account quota.",
+        400 | 404 => "Check the model ID and its support for this request, including images.",
+        _ => "The provider or configured server could not complete the request.",
+    };
+    // Error bodies can echo credentials or image data. Do not broadcast them.
+    format!("AI API returned HTTP {}. {hint}", status.as_u16())
+}
 
 #[allow(clippy::too_many_arguments)]
 pub fn ai_request(
@@ -18,6 +79,7 @@ pub fn ai_request(
     user_message: String,
     request_id: String,
     base_url: Option<String>,
+    images: Vec<AiImage>,
 ) {
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
@@ -38,6 +100,7 @@ pub fn ai_request(
                         &system_prompt,
                         &user_message,
                         &request_id,
+                        &images,
                     )
                     .await
                 }
@@ -52,6 +115,7 @@ pub fn ai_request(
                         &system_prompt,
                         &user_message,
                         &request_id,
+                        &images,
                     )
                     .await
                 }
@@ -69,6 +133,7 @@ pub fn ai_request(
                             &system_prompt,
                             &user_message,
                             &request_id,
+                            &images,
                         )
                         .await
                     }
@@ -81,6 +146,7 @@ pub fn ai_request(
                         &system_prompt,
                         &user_message,
                         &request_id,
+                        &images,
                     )
                     .await
                 }
@@ -118,7 +184,14 @@ fn openai_request_body(
     max_tokens: u32,
 ) -> serde_json::Value {
     // GPT-5/6 reject legacy output limits and sampling with their default reasoning.
-    let reasoning = model.starts_with("gpt-5") || model.starts_with("gpt-6");
+    let family = model.strip_prefix("ft:").unwrap_or(model);
+    let reasoning = family
+        .strip_prefix("gpt-")
+        .and_then(|s| s.split(['.', '-']).next()?.parse::<u32>().ok())
+        .is_some_and(|version| version >= 5)
+        || family
+            .strip_prefix('o')
+            .is_some_and(|s| s.starts_with(|c: char| c.is_ascii_digit()));
     let token_key = if reasoning {
         "max_completion_tokens"
     } else {
@@ -137,6 +210,22 @@ fn openai_request_body(
     body
 }
 
+fn user_content(provider: &str, text: &str, images: &[AiImage]) -> serde_json::Value {
+    if images.is_empty() {
+        return json!(text);
+    }
+    let mut blocks = vec![json!({"type":"text","text":text})];
+    for image in images {
+        if provider == "anthropic" {
+            blocks.push(json!({"type":"image","source":{"type":"base64","media_type":image.media_type,"data":image.data}}));
+        } else {
+            blocks.push(json!({"type":"image_url","image_url":{"url":format!("data:{};base64,{}",image.media_type,image.data)}}));
+        }
+    }
+    json!(blocks)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn stream_anthropic(
     app: &AppHandle,
     api_key: &str,
@@ -144,8 +233,9 @@ async fn stream_anthropic(
     system_prompt: &str,
     user_message: &str,
     request_id: &str,
+    images: &[AiImage],
 ) -> Result<(), String> {
-    let client = Client::new();
+    let client = request_client()?;
 
     let body = json!({
         "model": model,
@@ -155,7 +245,7 @@ async fn stream_anthropic(
         "messages": [
             {
                 "role": "user",
-                "content": user_message
+                "content": user_content("anthropic", user_message, images)
             }
         ]
     });
@@ -168,108 +258,16 @@ async fn stream_anthropic(
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+        .map_err(connection_error)?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-        return Err(format!("API error {}: {}", status, body_text));
+        return Err(http_error(response.status()));
     }
 
-    // Parse SSE stream
-    use futures::StreamExt;
-    let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Stream error: {}", e))?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-        // Process complete SSE events from buffer
-        while let Some(event_end) = buffer.find("\n\n") {
-            let event_str = buffer[..event_end].to_string();
-            buffer = buffer[event_end + 2..].to_string();
-
-            for line in event_str.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data == "[DONE]" {
-                        let _ = app.emit(
-                            "ai-stream",
-                            AiStreamEvent {
-                                request_id: request_id.to_owned(),
-                                event_type: "done".to_string(),
-                                text: None,
-                                error: None,
-                            },
-                        );
-                        return Ok(());
-                    }
-
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                        let event_type = parsed["type"].as_str().unwrap_or("");
-
-                        match event_type {
-                            "content_block_delta" => {
-                                if let Some(text) = parsed["delta"]["text"].as_str() {
-                                    let _ = app.emit(
-                                        "ai-stream",
-                                        AiStreamEvent {
-                                            request_id: request_id.to_owned(),
-                                            event_type: "text".to_string(),
-                                            text: Some(text.to_string()),
-                                            error: None,
-                                        },
-                                    );
-                                }
-                            }
-                            "message_stop" => {
-                                let _ = app.emit(
-                                    "ai-stream",
-                                    AiStreamEvent {
-                                        request_id: request_id.to_owned(),
-                                        event_type: "done".to_string(),
-                                        text: None,
-                                        error: None,
-                                    },
-                                );
-                                return Ok(());
-                            }
-                            "error" => {
-                                let msg = parsed["error"]["message"]
-                                    .as_str()
-                                    .unwrap_or("Unknown API error");
-                                let _ = app.emit(
-                                    "ai-stream",
-                                    AiStreamEvent {
-                                        request_id: request_id.to_owned(),
-                                        event_type: "error".to_string(),
-                                        text: None,
-                                        error: Some(msg.to_string()),
-                                    },
-                                );
-                                return Err(msg.to_string());
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let _ = app.emit(
-        "ai-stream",
-        AiStreamEvent {
-            request_id: request_id.to_owned(),
-            event_type: "done".to_string(),
-            text: None,
-            error: None,
-        },
-    );
-
-    Ok(())
+    receive_stream(app, response, request_id, stream::Protocol::Anthropic).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_openai(
     app: &AppHandle,
     url: &str,
@@ -278,10 +276,12 @@ async fn stream_openai(
     system_prompt: &str,
     user_message: &str,
     request_id: &str,
+    images: &[AiImage],
 ) -> Result<(), String> {
-    let client = Client::new();
+    let client = request_client()?;
 
-    let body = openai_request_body(model, Some(system_prompt), user_message, true, 4096);
+    let mut body = openai_request_body(model, Some(system_prompt), user_message, true, 4096);
+    body["messages"][1]["content"] = user_content("openai", user_message, images);
 
     let mut req = client.post(url).header("content-type", "application/json");
 
@@ -289,107 +289,13 @@ async fn stream_openai(
         req = req.header("Authorization", format!("Bearer {}", key));
     }
 
-    let response = req
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Request failed: {}", e))?;
+    let response = req.json(&body).send().await.map_err(connection_error)?;
 
     if !response.status().is_success() {
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-        return Err(format!("API error {}: {}", status, body_text));
+        return Err(http_error(response.status()));
     }
 
-    use futures::StreamExt;
-    let mut stream = response.bytes_stream();
-    let mut buffer = String::new();
-
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Stream error: {}", e))?;
-        buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-        while let Some(event_end) = buffer.find("\n\n") {
-            let event_str = buffer[..event_end].to_string();
-            buffer = buffer[event_end + 2..].to_string();
-
-            for line in event_str.lines() {
-                if let Some(data) = line.strip_prefix("data: ") {
-                    if data == "[DONE]" {
-                        let _ = app.emit(
-                            "ai-stream",
-                            AiStreamEvent {
-                                request_id: request_id.to_owned(),
-                                event_type: "done".to_string(),
-                                text: None,
-                                error: None,
-                            },
-                        );
-                        return Ok(());
-                    }
-
-                    if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(data) {
-                        // OpenAI streaming: choices[0].delta.content
-                        if let Some(content) = parsed["choices"][0]["delta"]["content"].as_str() {
-                            if !content.is_empty() {
-                                let _ = app.emit(
-                                    "ai-stream",
-                                    AiStreamEvent {
-                                        request_id: request_id.to_owned(),
-                                        event_type: "text".to_string(),
-                                        text: Some(content.to_string()),
-                                        error: None,
-                                    },
-                                );
-                            }
-                        }
-
-                        // Check finish_reason
-                        if let Some(reason) = parsed["choices"][0]["finish_reason"].as_str() {
-                            if reason == "stop" || reason == "length" {
-                                let _ = app.emit(
-                                    "ai-stream",
-                                    AiStreamEvent {
-                                        request_id: request_id.to_owned(),
-                                        event_type: "done".to_string(),
-                                        text: None,
-                                        error: None,
-                                    },
-                                );
-                                return Ok(());
-                            }
-                        }
-
-                        // Check for error in stream
-                        if let Some(err) = parsed["error"]["message"].as_str() {
-                            let _ = app.emit(
-                                "ai-stream",
-                                AiStreamEvent {
-                                    request_id: request_id.to_owned(),
-                                    event_type: "error".to_string(),
-                                    text: None,
-                                    error: Some(err.to_string()),
-                                },
-                            );
-                            return Err(err.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let _ = app.emit(
-        "ai-stream",
-        AiStreamEvent {
-            request_id: request_id.to_owned(),
-            event_type: "done".to_string(),
-            text: None,
-            error: None,
-        },
-    );
-
-    Ok(())
+    receive_stream(app, response, request_id, stream::Protocol::OpenAi).await
 }
 
 pub async fn test_connection(
@@ -423,7 +329,7 @@ pub async fn test_connection(
 }
 
 async fn test_anthropic(api_key: &str, model: &str) -> Result<String, String> {
-    let client = Client::new();
+    let client = request_client()?;
 
     let body = json!({
         "model": model,
@@ -444,19 +350,17 @@ async fn test_anthropic(api_key: &str, model: &str) -> Result<String, String> {
         .json(&body)
         .send()
         .await
-        .map_err(|e| format!("Connection failed: {}", e))?;
+        .map_err(connection_error)?;
 
     if response.status().is_success() {
         Ok("Connection successful".to_string())
     } else {
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-        Err(format!("API error {}: {}", status, body_text))
+        Err(http_error(response.status()))
     }
 }
 
 async fn test_openai(url: &str, api_key: Option<&str>, model: &str) -> Result<String, String> {
-    let client = Client::new();
+    let client = request_client()?;
     let body = openai_request_body(model, None, "Hi", false, 20);
 
     let mut req = client.post(url).header("content-type", "application/json");
@@ -465,24 +369,66 @@ async fn test_openai(url: &str, api_key: Option<&str>, model: &str) -> Result<St
         req = req.header("Authorization", format!("Bearer {}", key));
     }
 
-    let response = req
-        .json(&body)
-        .send()
-        .await
-        .map_err(|e| format!("Connection failed: {}", e))?;
+    let response = req.json(&body).send().await.map_err(connection_error)?;
 
     if response.status().is_success() {
         Ok("Connection successful".to_string())
     } else {
-        let status = response.status();
-        let body_text = response.text().await.unwrap_or_default();
-        Err(format!("API error {}: {}", status, body_text))
+        Err(http_error(response.status()))
     }
 }
 
 #[cfg(test)]
 mod request_tests {
     use super::*;
+
+    #[test]
+    fn vision_blocks_are_provider_specific_and_text_only_stays_a_string() {
+        assert_eq!(user_content("openai", "Text only", &[]), json!("Text only"));
+        let images = vec![AiImage {
+            media_type: "image/png",
+            data: "PIXELS".into(),
+        }];
+        let openai = user_content("openai", "Describe", &images);
+        assert_eq!(
+            openai[1]["image_url"]["url"],
+            "data:image/png;base64,PIXELS"
+        );
+        let anthropic = user_content("anthropic", "Describe", &images);
+        assert_eq!(anthropic[1]["source"]["type"], "base64");
+        assert_eq!(anthropic[1]["source"]["media_type"], "image/png");
+        assert_eq!(anthropic[1]["source"]["data"], "PIXELS");
+    }
+
+    #[test]
+    fn connection_and_http_errors_never_include_urls_or_provider_payloads() {
+        let url =
+            reqwest::Url::parse("https://user:private-password@example.invalid/?key=private-key")
+                .unwrap();
+        let error = Client::new()
+            .get("not a URL")
+            .build()
+            .unwrap_err()
+            .with_url(url);
+        assert!(error.to_string().contains("private-key"));
+        let safe = connection_error(error);
+        assert!(!safe.contains("private"));
+        assert!(!safe.contains("example.invalid"));
+        for code in [400, 401, 403, 404, 429, 500] {
+            let safe = http_error(reqwest::StatusCode::from_u16(code).unwrap());
+            assert!(safe.contains(&code.to_string()));
+            assert!(safe.len() < 256);
+        }
+    }
+
+    #[test]
+    fn future_gpt_and_reasoning_ids_use_modern_output_limits() {
+        for model in ["gpt-99-next", "o3", "o12-mini"] {
+            let body = openai_request_body(model, None, "Hi", true, 4096);
+            assert!(body.get("max_completion_tokens").is_some());
+            assert!(body.get("temperature").is_none());
+        }
+    }
 
     #[test]
     fn gpt6_streaming_requests_use_supported_parameters() {

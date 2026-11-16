@@ -1,4 +1,5 @@
 <script lang="ts">
+	import { t as ui, label as uiLabel, locale } from '$lib/i18n';
 	import { onMount } from 'svelte';
 	import { listen } from '@tauri-apps/api/event';
 	import { getTasks } from '$lib/api';
@@ -191,10 +192,10 @@
 	let calYear = $state(calNow.getFullYear());
 	let selectedDate = $state(formatLocalDate(calNow));
 
-	const calMonthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+	const calMonthNames = $derived(Array.from({ length: 12 }, (_, month) => new Intl.DateTimeFormat($locale, { month: 'long' }).format(new Date(2024, month, 1))));
 	// 0 = Sunday, 1 = Monday (default). Day names + grid offset follow the setting.
 	const weekStartsOn = $derived($appConfig?.week_start === 'sunday' ? 0 : 1);
-	const DOW = ['Su', 'Mo', 'Tu', 'We', 'Th', 'Fr', 'Sa'];
+	const DOW = $derived(Array.from({ length: 7 }, (_, day) => new Intl.DateTimeFormat($locale, { weekday: 'short' }).format(new Date(2024, 0, 7 + day))));
 	const calDayNames = $derived([...DOW.slice(weekStartsOn), ...DOW.slice(0, weekStartsOn)]);
 
 	const tasksByDate = $derived.by(() => {
@@ -246,9 +247,9 @@
 	}
 
 	function agendaTitle(date: string): string {
-		if (date === today) return 'Today';
+		if (date === today) return $ui("ui.today");
 		const [y, mo, d] = date.split('-').map(Number);
-		return new Date(y, mo - 1, d).toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+		return new Date(y, mo - 1, d).toLocaleDateString($locale, { weekday: 'short', month: 'short', day: 'numeric' });
 	}
 
 	// Drag a task (from the agenda or "No due date") onto a day to (re)schedule it.
@@ -268,24 +269,24 @@
 <div class="tasks-view" class:mobile={isMobile}>
 	{#if prioMenuFor || dueMenuFor}
 		<!-- svelte-ignore a11y_consider_explicit_label -->
-		<button class="prio-backdrop" onclick={() => { prioMenuFor = null; dueMenuFor = null; }} aria-label="Close menu"></button>
+		<button class="prio-backdrop" onclick={() => { prioMenuFor = null; dueMenuFor = null; }} aria-label={$ui("ui.close_menu")}></button>
 	{/if}
 	<div class="tasks-controls">
-		<input class="tasks-filter" type="text" placeholder="Filter tasks…" bind:value={taskQuery} onkeydown={(e) => { if (e.key === 'Escape') taskQuery = ''; }} aria-label="Filter tasks by text" />
-		<button class="tasks-ctl" class:active={dueFilter === 'today'} aria-pressed={dueFilter === 'today'} onclick={() => { dueFilter = dueFilter === 'today' ? 'all' : 'today'; if (dueFilter === 'today') calToday(); }} title="Show tasks due today">Today</button>
-		<button class="tasks-ctl" class:active={dueFilter === 'overdue'} aria-pressed={dueFilter === 'overdue'} onclick={() => { dueFilter = dueFilter === 'overdue' ? 'all' : 'overdue'; }} title="Show tasks due before today">Overdue</button>
-		<button class="tasks-ctl" class:active={$tasksHideCompleted} onclick={() => ($tasksHideCompleted = !$tasksHideCompleted)} title="Hide completed tasks">Hide done</button>
-		<button class="tasks-ctl" class:active={$tasksOnlyFlagged} onclick={() => ($tasksOnlyFlagged = !$tasksOnlyFlagged)} title="Only show tasks with a due date or priority">Flagged</button>
+		<input class="tasks-filter" type="text" placeholder={$ui("ui.filter_tasks")} bind:value={taskQuery} onkeydown={(e) => { if (e.key === 'Escape') taskQuery = ''; }} aria-label={$ui("ui.filter_tasks_by_text")} />
+		<button class="tasks-ctl" class:active={dueFilter === 'today'} aria-pressed={dueFilter === 'today'} onclick={() => { dueFilter = dueFilter === 'today' ? 'all' : 'today'; if (dueFilter === 'today') calToday(); }} title={$ui("ui.show_tasks_due_today")}>{$ui("ui.today")}</button>
+		<button class="tasks-ctl" class:active={dueFilter === 'overdue'} aria-pressed={dueFilter === 'overdue'} onclick={() => { dueFilter = dueFilter === 'overdue' ? 'all' : 'overdue'; }} title={$ui("ui.show_tasks_due_before_today")}>{$ui("ui.overdue")}</button>
+		<button class="tasks-ctl" class:active={$tasksHideCompleted} onclick={() => ($tasksHideCompleted = !$tasksHideCompleted)} title={$ui("ui.hide_completed_tasks")}>{$ui("ui.hide_done")}</button>
+		<button class="tasks-ctl" class:active={$tasksOnlyFlagged} onclick={() => ($tasksOnlyFlagged = !$tasksOnlyFlagged)} title={$ui("ui.only_show_tasks_with_a_due_date_or_priority")}>{$ui("ui.flagged")}</button>
 		{#if !isAndroid}
 			<div class="tasks-layout">
-				<button class="tasks-ctl" class:active={viewLayout === 'list'} onclick={() => ($tasksLayout = 'list')} title="List view">List</button>
-				<button class="tasks-ctl" class:active={viewLayout === 'calendar'} onclick={() => ($tasksLayout = 'calendar')} title="Calendar view">Calendar</button>
+				<button class="tasks-ctl" class:active={viewLayout === 'list'} onclick={() => ($tasksLayout = 'list')} title={$ui("ui.list_view")}>{$ui("ui.list")}</button>
+				<button class="tasks-ctl" class:active={viewLayout === 'calendar'} onclick={() => ($tasksLayout = 'calendar')} title={$ui("ui.calendar_view")}>{$ui("ui.calendar")}</button>
 			</div>
 		{/if}
 		{#if viewLayout === 'list'}
 			<div class="tasks-sort">
 				{#each [['due', 'Due'], ['priority', 'Priority'], ['note', 'Note']] as [v, label]}
-					<button class="tasks-ctl" class:active={$tasksSort === v} onclick={() => ($tasksSort = v as 'due' | 'priority' | 'note')}>{label}</button>
+					<button class="tasks-ctl" class:active={$tasksSort === v} onclick={() => ($tasksSort = v as 'due' | 'priority' | 'note')}>{$ui(v === 'due' ? 'tasks.sort.due' : v === 'priority' ? 'tasks.sort.priority' : 'tasks.sort.note')}</button>
 				{/each}
 			</div>
 		{/if}
@@ -301,7 +302,7 @@
 			ondragstart={(e) => { if (!dragMode) return; draggedTask = t; if (e.dataTransfer) { e.dataTransfer.effectAllowed = 'move'; e.dataTransfer.setData('text/plain', rowKey(t)); } }}
 			ondragend={() => { draggedTask = null; dragOverDate = null; }}
 		>
-			<button class="task-check" class:checked={t.completed} onclick={(e) => { e.stopPropagation(); toggle(t); }} title={t.completed ? 'Mark not done' : 'Mark done'} aria-label="toggle done"></button>
+			<button class="task-check" class:checked={t.completed} onclick={(e) => { e.stopPropagation(); toggle(t); }} title={t.completed ? $ui("ui.mark_not_done") : $ui("ui.mark_done")} aria-label={$ui("ui.toggle_done")}></button>
 			<!-- svelte-ignore a11y_no_static_element_interactions -->
 			<!-- svelte-ignore a11y_click_events_have_key_events -->
 			<div class="task-main" onclick={() => onOpenTask(t)}>
@@ -310,16 +311,16 @@
 						<button
 							class="task-prio prio-{t.priority ?? 'none'}"
 							class:set={!!t.priority}
-							title="Set priority"
-							aria-label="Set priority"
+							title={$ui("ui.set_priority")}
+							aria-label={$ui("ui.set_priority")}
 							onclick={(e) => { e.stopPropagation(); dueMenuFor = null; prioMenuFor = prioMenuFor === rowKey(t) ? null : rowKey(t); }}
 						>{t.priority ?? '!'}</button>
 						{#if prioMenuFor === rowKey(t)}
 							<div class="prio-menu" role="menu">
-								<button class="prio-opt prio-high" onclick={(e) => { e.stopPropagation(); choosePriority(t, 'high'); }}>High</button>
-								<button class="prio-opt prio-med" onclick={(e) => { e.stopPropagation(); choosePriority(t, 'med'); }}>Med</button>
-								<button class="prio-opt prio-low" onclick={(e) => { e.stopPropagation(); choosePriority(t, 'low'); }}>Low</button>
-								<button class="prio-opt prio-clear" onclick={(e) => { e.stopPropagation(); choosePriority(t, null); }}>None</button>
+								<button class="prio-opt prio-high" onclick={(e) => { e.stopPropagation(); choosePriority(t, 'high'); }}>{$ui("ui.high")}</button>
+								<button class="prio-opt prio-med" onclick={(e) => { e.stopPropagation(); choosePriority(t, 'med'); }}>{$ui("ui.med")}</button>
+								<button class="prio-opt prio-low" onclick={(e) => { e.stopPropagation(); choosePriority(t, 'low'); }}>{$ui("ui.low")}</button>
+								<button class="prio-opt prio-clear" onclick={(e) => { e.stopPropagation(); choosePriority(t, null); }}>{$ui("ui.none")}</button>
 							</div>
 						{/if}
 					</span>
@@ -328,8 +329,8 @@
 						<button
 							class="task-due {dueClass(t.due, t.completed)}"
 							class:set={!!t.due}
-							title="Set due date"
-							aria-label="Set due date"
+							title={$ui("ui.set_due_date")}
+							aria-label={$ui("ui.set_due_date")}
 							onclick={(e) => { e.stopPropagation(); prioMenuFor = null; dueMenuFor = dueMenuFor === rowKey(t) ? null : rowKey(t); }}
 						>{t.due ?? 'due'}</button>
 						{#if dueMenuFor === rowKey(t)}
@@ -341,7 +342,7 @@
 									onclick={(e) => e.stopPropagation()}
 									onchange={(e) => { e.stopPropagation(); chooseDue(t, (e.target as HTMLInputElement).value || null); }}
 								/>
-								{#if t.due}<button class="prio-opt prio-clear" onclick={(e) => { e.stopPropagation(); chooseDue(t, null); }}>Clear</button>{/if}
+								{#if t.due}<button class="prio-opt prio-clear" onclick={(e) => { e.stopPropagation(); chooseDue(t, null); }}>{$ui("ui.clear")}</button>{/if}
 							</div>
 						{/if}
 					</span>
@@ -352,16 +353,16 @@
 	{/snippet}
 
 	{#if loading}
-		<div class="tasks-empty">Loading...</div>
+		<div class="tasks-empty">{$ui("ui.loading")}</div>
 	{:else if viewLayout === 'calendar'}
 		<div class="tasks-cal-pane">
 			<div class="cal">
 				<div class="cal-nav">
-					<button class="cal-nav-btn" onclick={calPrev} title="Previous month" aria-label="Previous month">
+					<button class="cal-nav-btn" onclick={calPrev} title={$ui("ui.previous_month")} aria-label={$ui("ui.previous_month")}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
 					</button>
-					<button class="cal-title" onclick={calToday} title="Jump to today">{calMonthNames[calMonth]} {calYear}</button>
-					<button class="cal-nav-btn" onclick={calNext} title="Next month" aria-label="Next month">
+					<button class="cal-title" onclick={calToday} title={$ui("ui.jump_to_today")}>{$uiLabel(calMonthNames[calMonth])} {calYear}</button>
+					<button class="cal-nav-btn" onclick={calNext} title={$ui("ui.next_month")} aria-label={$ui("ui.next_month")}>
 						<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
 					</button>
 				</div>
@@ -394,14 +395,14 @@
 				<div class="agenda-section">
 					<div class="agenda-head" class:overdue={selectedDate < today}>{agendaTitle(selectedDate)}</div>
 					{#if selectedDayTasks.length === 0}
-						<div class="tasks-empty-sm">Nothing due.</div>
+						<div class="tasks-empty-sm">{$ui("ui.nothing_due")}</div>
 					{:else}
 						{#each selectedDayTasks as t (rowKey(t))}{@render taskRow(t, true)}{/each}
 					{/if}
 				</div>
 				{#if undatedTasks.length}
 					<div class="agenda-section">
-						<div class="agenda-head">No due date ({undatedTasks.length})</div>
+						<div class="agenda-head">{$ui("ui.no_due_date", { value0: undatedTasks.length })}</div>
 						{#each undatedTasks as t (rowKey(t))}{@render taskRow(t, true)}{/each}
 					</div>
 				{/if}
@@ -410,11 +411,11 @@
 	{:else if filtered.length === 0}
 		<div class="tasks-empty">
 			{#if tasks.length === 0}
-				No tasks. Add <code>- [ ] something</code> to any note.
+				{$ui("ui.no_tasks_add")} <code>- [ ] {$ui('tasks.example')}</code> {$ui("ui.to_any_note")}
 			{:else if $tasksHideCompleted && openCount === 0}
-				All tasks are complete.
+				{$ui("ui.all_tasks_are_complete")}
 			{:else}
-				No tasks match these filters.
+				{$ui("ui.no_tasks_match_these_filters")}
 			{/if}
 		</div>
 	{:else}

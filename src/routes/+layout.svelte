@@ -1,8 +1,10 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { listen } from '@tauri-apps/api/event';
+	import { applyLanguage, locale, normalizeLanguage, type Language } from '$lib/i18n';
 	import '../app.css';
 	import { resolvedTheme, appConfig, activeNotePath, installType, platformIsMobile, checkForUpdate, checkForUpdateMobile, isManagedInstall, customThemes } from '$lib/stores/app';
-	import { openFile, openUrl, getInstallType, isMobilePlatform, syncNativeTheme } from '$lib/api';
+	import { openFile, openUrl, getInstallType, isMobilePlatform } from '$lib/api';
 	import { get } from 'svelte/store';
 	import { darkThemes, isMobile, isAndroid } from '$lib/platform';
 	import type { CustomTheme } from '$lib/types';
@@ -10,6 +12,22 @@
 	import { noteAssetRoot, resolveFileReference } from '$lib/utils/paths';
 
 	let { children } = $props();
+
+	let lastLanguageEvent = $state<Language | null>(null);
+	// A config request started before another window changed language may finish afterward.
+	$effect(() => { if ($appConfig) applyLanguage(lastLanguageEvent ?? $appConfig.language); });
+	$effect(() => { document.documentElement.lang = $locale; });
+	onMount(() => {
+		let disposed = false;
+		let unlisten: (() => void) | undefined;
+		listen<string>('language-changed', ({ payload }) => {
+			const next = normalizeLanguage(payload);
+			lastLanguageEvent = next;
+			applyLanguage(next);
+			appConfig.update(config => config ? { ...config, language: next } : config);
+		}).then(stop => { if (disposed) stop(); else unlisten = stop; });
+		return () => { disposed = true; unlisten?.(); };
+	});
 
 	// Reactively apply theme class to <html> whenever the resolved theme or custom themes change.
 	// $resolvedTheme already maps "system" onto the configured light/dark pair, so flipping the OS
@@ -72,7 +90,6 @@
 		} else if (t === 'dark' || (t === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
 			root.classList.add('dark');
 		}
-		syncNativeTheme();
 	}
 
 	function openLocalFile(path: string) {
