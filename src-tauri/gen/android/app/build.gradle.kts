@@ -14,8 +14,13 @@ val tauriProperties = Properties().apply {
 }
 
 val keystoreProperties = Properties().apply {
-    val propFile = rootProject.file("keystore.properties")
-    if (propFile.exists()) {
+    val propFile = sequenceOf(
+        rootProject.file("keystore.properties"),
+        rootProject.file("../../keystore.properties"),
+        file("keystore.properties")
+    ).firstOrNull { it.exists() }
+
+    if (propFile != null && propFile.exists()) {
         propFile.inputStream().use { load(it) }
     }
 }
@@ -24,13 +29,23 @@ android {
     compileSdk = 37
     namespace = "com.cuelm.app"
 
-    if (keystoreProperties.containsKey("storeFile")) {
+    val hasKeystore = keystoreProperties.containsKey("storeFile")
+    if (hasKeystore) {
         signingConfigs {
             create("release") {
-                storeFile = file(keystoreProperties["storeFile"] as String)
-                storePassword = keystoreProperties["storePassword"] as String
-                keyAlias = keystoreProperties["keyAlias"] as String
-                keyPassword = keystoreProperties["keyPassword"] as String
+                val storePath = keystoreProperties.getProperty("storeFile")
+                val resolvedStore = sequenceOf(
+                    file(storePath),
+                    rootProject.file(storePath),
+                    rootProject.file("../../$storePath")
+                ).firstOrNull { it.exists() } ?: rootProject.file(storePath)
+
+                storeFile = resolvedStore
+                storePassword = keystoreProperties.getProperty("storePassword")
+                keyAlias = keystoreProperties.getProperty("keyAlias")
+                keyPassword = keystoreProperties.getProperty("keyPassword")
+                enableV1Signing = true
+                enableV2Signing = true
             }
         }
     }
@@ -64,6 +79,8 @@ android {
             )
             if (signingConfigs.names.contains("release")) {
                 signingConfig = signingConfigs.getByName("release")
+            } else {
+                logger.warn("WARNING: No release signingConfig configured! The release APK will be unsigned.")
             }
         }
     }
